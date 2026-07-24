@@ -2796,6 +2796,28 @@ def status_file(cfg, node):
     return os.path.join(cfg["_dir"], STATUS_NAME.format(node))
 
 
+PROCESS_POSTURES = ("watch", "hook", "mcp-serve", "mcp", "worker")
+_process_posture = None
+
+
+def _set_process_posture(posture):
+    """#122: which long-running receive context this process is. Rides
+    outbound pong/ack control frames so the fleet can observe WHAT is
+    listening on a node, not merely that it was seen -- process-state vs
+    install-state, the #86/#90 blind spot. Evidence only: nothing may
+    ever gate on a peer's asserted posture (a lying posture buys
+    nothing)."""
+    global _process_posture
+    _process_posture = posture if posture in PROCESS_POSTURES else None
+
+
+def _stamp_posture(ctl):
+    """Add this process's posture to an outbound control dict, when set."""
+    if _process_posture:
+        ctl["posture"] = _process_posture
+    return ctl
+
+
 def local_status(cfg, node):
     try:
         with open(status_file(cfg, node), "r", encoding="utf-8") as f:
@@ -2869,7 +2891,7 @@ def _prune_peers(cfg, peers, keep_node, now=None):
     return kept
 
 
-def note_peer(cfg, node, via, status=None):
+def note_peer(cfg, node, via, status=None, posture=None):
     """Record a live sighting of `node`; learn unknown nodes into the config.
 
     Membership is dynamic: any authenticated message teaches us its sender.
@@ -2908,6 +2930,9 @@ def note_peer(cfg, node, via, status=None):
     peer.update({"seen": now, "via": via})
     if status in PRESENCE_STATES:
         peer.update({"status": status, "status_seen": now})
+    if isinstance(posture, str) and posture:
+        # #122: untrusted wire input -- flatten and bound before storing.
+        peer.update({"posture": _single_line(posture)[:24]})
     peers[node] = peer
     peers = _prune_peers(cfg, peers, node, now)  # #106: bound on write
     with open(peers_file(cfg), "w", encoding="utf-8") as f:
@@ -7131,7 +7156,8 @@ def _handle_control(cfg, me, frm, ctl, verdict=None, ev=None):
     useful MESH_NODE_JOINED)."""
     kind = ctl.get("mw")
     if kind == "announce":
-        note_peer(cfg, frm, "announce", ctl.get("status"))
+        note_peer(cfg, frm, "announce", ctl.get("status"),
+                  posture=ctl.get("posture"))
         return f"MESH_NODE_JOINED node={_single_line(frm)}"
     if kind == "rename":
         # #93/#76 slice 2, LOG-ONLY: a node announces old->new signed by its
@@ -7172,9 +7198,9 @@ def _handle_control(cfg, me, frm, ctl, verdict=None, ev=None):
         note_peer(cfg, frm, "message", ctl.get("status"))
         try:
             send_raw(cfg, me, frm, "pong",
-                     ctl={"mw": "pong", "n": ctl.get("n"),
-                          "ts": ctl.get("ts"),
-                          "status": local_status(cfg, me)})
+                     ctl=_stamp_posture({"mw": "pong", "n": ctl.get("n"),
+                                         "ts": ctl.get("ts"),
+                                         "status": local_status(cfg, me)}))
             print(f"MESH_PING from={_single_line(frm)} (answered)",
                   file=sys.stderr)
         except (urllib.error.URLError, socket.timeout):
@@ -7182,10 +7208,12 @@ def _handle_control(cfg, me, frm, ctl, verdict=None, ev=None):
                   file=sys.stderr)
         return None
     if kind == "pong":
-        note_peer(cfg, frm, "pong", ctl.get("status"))
+        note_peer(cfg, frm, "pong", ctl.get("status"),
+                  posture=ctl.get("posture"))
         return None
     if kind == "ack":
-        note_peer(cfg, frm, "ack", ctl.get("status"))
+        note_peer(cfg, frm, "ack", ctl.get("status"),
+                  posture=ctl.get("posture"))
         return None
     if kind == "presence" and ctl.get("status") in PRESENCE_STATES:
         note_peer(cfg, frm, "presence", ctl["status"])
@@ -7202,8 +7230,8 @@ def _send_ack(cfg, me, frm, ev):
         return
     try:
         send_raw(cfg, me, frm, "ack",
-                 ctl={"mw": "ack", "of": ev.get("id"),
-                      "status": local_status(cfg, me)})
+                 ctl=_stamp_posture({"mw": "ack", "of": ev.get("id"),
+                                     "status": local_status(cfg, me)}))
     except (urllib.error.URLError, socket.timeout, UnicodeError, ValueError):
         pass
 
@@ -7229,7 +7257,8 @@ def _await_acks(cfg, me, msg_id, t0, timeout, first=None, want_all=False):
                 continue
             if frm not in [n for n, _ in got]:
                 got.append((frm, int((time.monotonic() - t0) * 1000)))
-                note_peer(cfg, frm, "ack", ctl.get("status"))
+                note_peer(cfg, frm, "ack", ctl.get("status"),
+                          posture=ctl.get("posture"))
             if not want_all:
                 return got
     except Exception:
@@ -7255,6 +7284,7 @@ def _agent_session_without_wake():
 
 
 def cmd_watch(args):
+    _set_process_posture("watch")
     cfg = load_config()
     me = my_node(cfg, args.as_node)
     if args.follow or args.timeout is None:  # long-running watch
@@ -8157,6 +8187,7 @@ def _run_mcp_server(args, label, idle_hint):
     both. Sampling (idle-session wake) only activates if the MCP client
     advertises the capability; clients that don't (Claude Desktop, Cursor, …)
     get plain pull-mode tools and pull deliveries via mesh_pending."""
+    _set_process_posture(label)
     path, how = _mcp_config_path(args)
     if not path:
         print(f"a2acast {label}: no mesh node found (tried {how}; "
@@ -9003,6 +9034,7 @@ def _emit_continuation_hook(args, harness):
 
 def _run_harness_delivery_hook(args, harness):
     """Route a delivery through the prompt contract declared by its spec."""
+    _set_process_posture("hook")
     spec = HARNESS_SPECS[harness]
     if spec.delivery_prompt == "continuation-json":
         _emit_continuation_hook(args, harness)
@@ -9200,9 +9232,12 @@ def cmd_status(args):
         if n == me:
             print(f"  {n}  (this machine)")
         elif n in peers:
+            posture = peers[n].get("posture")
+            shown = (f", posture={_single_line(str(posture))[:24]}"
+                     if isinstance(posture, str) and posture else "")
             print(f"  {n}  (last seen {_ago(peers[n]['seen'])}, "
                   f"via {peers[n]['via']}, "
-                  f"status={peers[n].get('status', 'unknown')})")
+                  f"status={peers[n].get('status', 'unknown')}{shown})")
         else:
             print(f"  {n}  (never seen)")
     print(f"me:     {me or '(unset — run `mesh iam <node>`)'}")
@@ -9248,7 +9283,8 @@ def cmd_ping(args):
             continue
         if ctl.get("mw") == "pong" and ctl.get("n") == nonce:
             rtt = int((time.monotonic() - t0) * 1000)
-            note_peer(cfg, frm or to, "pong", ctl.get("status"))
+            note_peer(cfg, frm or to, "pong", ctl.get("status"),
+                      posture=ctl.get("posture"))
             print(f"MESH_PONG node={frm or to} rtt={rtt}ms")
             return
     print(f"MESH_PING_TIMEOUT node={to} after {args.timeout}s -- no watcher "
@@ -11331,6 +11367,7 @@ def _update_worker_health_after_task(
 
 def _run_worker_supervisor(args):
     """Run one configured worker without consuming another node's tasks."""
+    _set_process_posture("worker")
     backend = getattr(args, "backend", None)
     if backend not in WORKER_BACKENDS:
         sys.exit(f"error: invalid backend '{backend}'")

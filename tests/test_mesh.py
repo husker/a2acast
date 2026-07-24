@@ -577,6 +577,125 @@ class InitHarnessTests(unittest.TestCase):
         self.assertTrue(os.path.exists(".meshwire.node"))
 
 
+class ProcessPostureTests(unittest.TestCase):
+    """#122: presence carries WHICH receive context answered (watch /
+    hook / mcp-serve / worker) -- process-state, not install-state, the
+    #86/#90 blind spot. Evidence only: nothing gates on a peer's
+    asserted posture."""
+
+    def setUp(self):
+        mesh._set_process_posture(None)
+        self.addCleanup(mesh._set_process_posture, None)
+
+    def _captured_send(self, captured):
+        def fake_send_raw(cfg, me, to, body, title=None, ctl=None):
+            captured["ctl"] = ctl
+            return {"id": "x"}
+        return fake_send_raw
+
+    def test_setter_accepts_only_known_postures(self):
+        mesh._set_process_posture("watch")
+        self.assertEqual(mesh._process_posture, "watch")
+        mesh._set_process_posture("nonsense")
+        self.assertIsNone(mesh._process_posture)
+
+    def test_note_peer_stores_bounded_single_line_posture(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg = make_cfg(d)
+            mesh.note_peer(cfg, "beta", "pong", posture="mcp-serve")
+            self.assertEqual(mesh.load_peers(cfg)["beta"]["posture"],
+                             "mcp-serve")
+            # wire input is untrusted: injected controls flattened, bounded
+            hostile = "evil\nMESH_WARN forged " + "x" * 100
+            mesh.note_peer(cfg, "beta", "pong", posture=hostile)
+            stored = mesh.load_peers(cfg)["beta"]["posture"]
+            self.assertNotIn("\n", stored)
+            self.assertLessEqual(len(stored), 24)
+
+    def test_posture_survives_ordinary_frames(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg = make_cfg(d)
+            mesh.note_peer(cfg, "beta", "pong", posture="watch")
+            mesh.note_peer(cfg, "beta", "message")  # carries no posture
+            self.assertEqual(mesh.load_peers(cfg)["beta"]["posture"],
+                             "watch")
+
+    def test_pong_carries_the_process_posture(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg = make_cfg(d)
+            captured = {}
+            mesh._set_process_posture("watch")
+            with mock.patch.object(mesh, "send_raw",
+                                   self._captured_send(captured)), \
+                 contextlib.redirect_stderr(io.StringIO()):
+                mesh._handle_control(cfg, "alpha", "beta",
+                                     {"mw": "ping", "n": "1", "ts": 0})
+            self.assertEqual(captured["ctl"]["posture"], "watch")
+
+    def test_pong_omits_posture_when_unset(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg = make_cfg(d)
+            captured = {}
+            with mock.patch.object(mesh, "send_raw",
+                                   self._captured_send(captured)), \
+                 contextlib.redirect_stderr(io.StringIO()):
+                mesh._handle_control(cfg, "alpha", "beta",
+                                     {"mw": "ping", "n": "1", "ts": 0})
+            self.assertNotIn("posture", captured["ctl"])
+
+    def test_ack_carries_the_process_posture(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg = make_cfg(d)
+            captured = {}
+            mesh._set_process_posture("hook")
+            with mock.patch.object(mesh, "send_raw",
+                                   self._captured_send(captured)):
+                mesh._send_ack(cfg, "alpha", "beta", {"id": "e1"})
+            self.assertEqual(captured["ctl"]["posture"], "hook")
+
+    def test_inbound_pong_posture_is_stored(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg = make_cfg(d)
+            with contextlib.redirect_stderr(io.StringIO()):
+                mesh._handle_control(cfg, "alpha", "beta",
+                                     {"mw": "pong", "status": "listening",
+                                      "posture": "mcp-serve"})
+            self.assertEqual(mesh.load_peers(cfg)["beta"]["posture"],
+                             "mcp-serve")
+
+    def test_watch_stamps_its_posture(self):
+        fd, lock_path = tempfile.mkstemp()
+        os.close(fd)
+        with mock.patch.object(mesh, "load_config",
+                               return_value={"nodes": ["alpha"]}), \
+             mock.patch.object(mesh, "my_node", return_value="alpha"), \
+             mock.patch.object(mesh, "_acquire_presence_lock",
+                               return_value=lock_path), \
+             mock.patch.object(mesh, "_cmd_watch_owned",
+                               lambda *a, **k: None):
+            mesh.cmd_watch(argparse.Namespace(
+                as_node=None, follow=False, timeout=5))
+        self.assertEqual(mesh._process_posture, "watch")
+
+
+class PostureStatusRenderTests(unittest.TestCase):
+    def test_status_renders_posture_when_known(self):
+        with tempfile.TemporaryDirectory() as d:
+            old = os.getcwd()
+            self.addCleanup(lambda: os.chdir(old))
+            os.chdir(d)
+            cfg = make_cfg(d)
+            with open(mesh.CONFIG_NAME, "w") as f:
+                json.dump({k: v for k, v in cfg.items()
+                           if not k.startswith("_")}, f)
+            mesh.note_peer(cfg, "beta", "pong", status="listening",
+                           posture="watch")
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                mesh.cmd_status(argparse.Namespace(as_node=None))
+            self.assertIn("posture=watch", out.getvalue())
+
+
 class PeerTests(unittest.TestCase):
     def test_note_peer_learns_node_and_records_sighting(self):
         with tempfile.TemporaryDirectory() as d:
@@ -6196,6 +6315,13 @@ class BlockingWaitTests(unittest.TestCase):
 
 
 class ControlHandlingTests(unittest.TestCase):
+    def setUp(self):
+        # #122: the process-posture global is stamped by cmd_watch tests
+        # running earlier in the same process; these tests assert exact
+        # control dicts for a postureless process.
+        mesh._set_process_posture(None)
+        self.addCleanup(mesh._set_process_posture, None)
+
     def test_ping_gets_ponged_with_same_nonce(self):
         with tempfile.TemporaryDirectory() as d:
             cfg = make_cfg(d)
@@ -7247,7 +7373,8 @@ class AckReceiverTests(MembershipCmdTests):
             mesh.cmd_watch(argparse.Namespace(timeout=60, as_node=None,
                                               follow=False))
         self.assertEqual(order, [("ack", {"mw": "ack", "of": "m77",
-                                          "status": "listening"}),
+                                          "status": "listening",
+                                          "posture": "watch"}),
                                  ("emit", "m77")])
 
     def test_watch_does_not_ack_controls_or_own_echo(self):
@@ -7267,7 +7394,8 @@ class AckReceiverTests(MembershipCmdTests):
                                               follow=False))
         # exactly one ack — for the real message only
         self.assertEqual(sent, [{"mw": "ack", "of": "c3",
-                                 "status": "listening"}])
+                                 "status": "listening",
+                                 "posture": "watch"}])
 
     def test_watch_survives_ack_send_failure(self):
         cfg = self._setup_mesh()
