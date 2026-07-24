@@ -7190,6 +7190,17 @@ def _handle_control(cfg, me, frm, ctl, verdict=None, ev=None):
     if kind == "presence" and ctl.get("status") in PRESENCE_STATES:
         note_peer(cfg, frm, "presence", ctl["status"])
         return None
+    if kind == "crash":
+        # #123 log-only: a peer's receive loop announced its own death.
+        # Evidence for the #62 soak bar ("zero silent delivery losses"
+        # is only auditable when a death is observable); mutates nothing
+        # and never wakes an agent.
+        exc_name = _single_line(str(ctl.get("exc") or "?"))[:40]
+        note_peer(cfg, frm, "crash")
+        print(f"MESH_CRASH from={_single_line(frm)} exc={exc_name} "
+              f"(its receive loop died -- deliveries there will sit "
+              f"until something re-arms)", file=sys.stderr)
+        return None
     print(f"MESH_CTL from={_single_line(frm)} kind={kind!r} (ignored)",
           file=sys.stderr)
     return None
@@ -7206,6 +7217,26 @@ def _send_ack(cfg, me, frm, ev):
                       "status": local_status(cfg, me)})
     except (urllib.error.URLError, socket.timeout, UnicodeError, ValueError):
         pass
+
+
+def _emit_crash_frame(cfg, me, exc):
+    """#123: a dying receive loop says so. Local warn FIRST (the local
+    log must record the death even when the relay is the problem), then
+    a best-effort broadcast carrying the exception CLASS only --
+    messages can carry paths and config fragments; the class is bounded
+    and safe. Never raises: the last gasp must not mask the original
+    traceback or hang the dying process."""
+    exc_name = type(exc).__name__
+    print(f"MESH_WARN: receive loop died: {exc_name} "
+          f"(emitting crash frame)", file=sys.stderr)
+    try:
+        send_raw(cfg, me, BROADCAST, "receive loop died",
+                 ctl={"mw": "crash", "exc": exc_name})
+    except Exception as gasp:
+        # Even the last gasp can fail (relay down, encrypt error). Record
+        # locally and move on -- the original traceback must survive.
+        print(f"MESH_WARN: crash frame not sent "
+              f"({type(gasp).__name__})", file=sys.stderr)
 
 
 def _await_acks(cfg, me, msg_id, t0, timeout, first=None, want_all=False):
@@ -7280,6 +7311,11 @@ def cmd_watch(args):
                  "refusing a second relay subscription")
     try:
         return _cmd_watch_owned(args, cfg, me)
+    except Exception as exc:
+        # KeyboardInterrupt/SystemExit are BaseException: a clean
+        # shutdown or deliberate exit is not a death notice (#123).
+        _emit_crash_frame(cfg, me, exc)
+        raise
     finally:
         try:
             os.unlink(plock)
@@ -8187,6 +8223,9 @@ def _run_mcp_server(args, label, idle_hint):
               f"'{me}' — serving tools only", file=sys.stderr)
     try:
         _mcp_stdin_loop(server.handle)
+    except Exception as exc:
+        _emit_crash_frame(cfg, me, exc)  # #123: die loudly, not silently
+        raise
     finally:
         server.stop()
         if plock:
@@ -11451,6 +11490,11 @@ def _run_worker_supervisor(args):
             if getattr(args, "once", False):
                 return
             time.sleep(interval)
+    except Exception as exc:
+        # sys.exit paths above are SystemExit (BaseException) and stay
+        # silent: a deliberate refusal is not a crash (#123).
+        _emit_crash_frame(cfg, me, exc)
+        raise
     finally:
         try:
             sys.stdout, sys.stderr = old_stdout, old_stderr

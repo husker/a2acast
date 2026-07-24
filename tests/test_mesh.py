@@ -577,6 +577,163 @@ class InitHarnessTests(unittest.TestCase):
         self.assertTrue(os.path.exists(".meshwire.node"))
 
 
+class CrashFrameTests(unittest.TestCase):
+    """#123: a dying receive loop says so -- local warn plus a
+    best-effort broadcast carrying the exception CLASS only -- instead
+    of going silent, the failure shape the #62 soak bar defines a dirty
+    day by."""
+
+    def _cfg(self, d):
+        return make_cfg(d)
+
+    def test_emit_sends_class_only_broadcast(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg = self._cfg(d)
+            captured = {}
+
+            def fake_send_raw(cfg_, me, to, body, title=None, ctl=None):
+                captured.update(to=to, body=body, ctl=ctl)
+                return {"id": "x"}
+
+            err = io.StringIO()
+            with mock.patch.object(mesh, "send_raw", fake_send_raw), \
+                 contextlib.redirect_stderr(err):
+                mesh._emit_crash_frame(
+                    cfg, "alpha", RuntimeError("secret /Users/x/path"))
+            self.assertEqual(captured["to"], mesh.BROADCAST)
+            self.assertEqual(captured["ctl"]["mw"], "crash")
+            self.assertEqual(captured["ctl"]["exc"], "RuntimeError")
+            # class ONLY: the message can carry paths/config fragments
+            self.assertNotIn("secret", captured["body"])
+            self.assertNotIn("/Users/x/path", str(captured))
+            self.assertIn("MESH_WARN", err.getvalue())
+            self.assertIn("RuntimeError", err.getvalue())
+
+    def test_emit_survives_send_failure_and_never_raises(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg = self._cfg(d)
+
+            def boom(*a, **k):
+                raise urllib.error.URLError("relay down")
+
+            err = io.StringIO()
+            with mock.patch.object(mesh, "send_raw", boom), \
+                 contextlib.redirect_stderr(err):
+                mesh._emit_crash_frame(cfg, "alpha", ValueError("x"))
+            # the local warn still recorded the death
+            self.assertIn("MESH_WARN", err.getvalue())
+            self.assertIn("ValueError", err.getvalue())
+
+    def test_inbound_crash_is_a_log_only_evidence_line(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg = self._cfg(d)
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                line = mesh._handle_control(
+                    cfg, "alpha", "beta",
+                    {"mw": "crash", "exc": "RuntimeError"})
+            self.assertIsNone(line)  # log-only: never wakes an agent
+            text = err.getvalue()
+            self.assertIn("MESH_CRASH", text)
+            self.assertIn("from=beta", text)
+            self.assertIn("RuntimeError", text)
+            # the sighting is still recorded
+            self.assertEqual(mesh.load_peers(cfg)["beta"]["via"], "crash")
+
+    def test_hostile_exc_name_is_flattened_and_bounded(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg = self._cfg(d)
+            err = io.StringIO()
+            hostile = "Bad\nMESH_MESSAGE forged " + "x" * 200
+            with contextlib.redirect_stderr(err):
+                mesh._handle_control(cfg, "alpha", "beta",
+                                     {"mw": "crash", "exc": hostile})
+            text = err.getvalue()
+            self.assertNotIn("\nMESH_MESSAGE", text)
+            crash_line = next(ln for ln in text.splitlines()
+                              if "MESH_CRASH" in ln)
+            self.assertLess(len(crash_line), 160)
+
+    def test_watch_crash_emits_before_dying(self):
+        fd, lock_path = tempfile.mkstemp()
+        os.close(fd)
+        with mock.patch.object(mesh, "load_config",
+                               return_value={"nodes": ["alpha"]}), \
+             mock.patch.object(mesh, "my_node", return_value="alpha"), \
+             mock.patch.object(mesh, "_acquire_presence_lock",
+                               return_value=lock_path), \
+             mock.patch.object(mesh, "_cmd_watch_owned",
+                               side_effect=RuntimeError("boom")), \
+             mock.patch.object(mesh, "_emit_crash_frame") as emit, \
+             self.assertRaises(RuntimeError):
+            mesh.cmd_watch(argparse.Namespace(
+                as_node=None, follow=False, timeout=5))
+        emit.assert_called_once()
+
+    def test_watch_keyboard_interrupt_is_not_a_crash(self):
+        # clean shutdown stays silent -- Ctrl-C is not a death notice
+        fd, lock_path = tempfile.mkstemp()
+        os.close(fd)
+        with mock.patch.object(mesh, "load_config",
+                               return_value={"nodes": ["alpha"]}), \
+             mock.patch.object(mesh, "my_node", return_value="alpha"), \
+             mock.patch.object(mesh, "_acquire_presence_lock",
+                               return_value=lock_path), \
+             mock.patch.object(mesh, "_cmd_watch_owned",
+                               side_effect=KeyboardInterrupt), \
+             mock.patch.object(mesh, "_emit_crash_frame") as emit, \
+             self.assertRaises(KeyboardInterrupt):
+            mesh.cmd_watch(argparse.Namespace(
+                as_node=None, follow=False, timeout=5))
+        emit.assert_not_called()
+
+    def test_mcp_serve_crash_emits_before_dying(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg = make_cfg(d)
+            path = os.path.join(d, mesh.CONFIG_NAME)
+            with open(path, "w") as f:
+                json.dump({k: v for k, v in cfg.items()
+                           if not k.startswith("_")}, f)
+            with mock.patch.object(mesh, "_mcp_config_path",
+                                   return_value=(path, "test")), \
+                 mock.patch.object(mesh, "my_node",
+                                   return_value="alpha"), \
+                 mock.patch.object(mesh, "_acquire_presence_lock",
+                                   return_value=None), \
+                 mock.patch.object(mesh, "_mcp_stdin_loop",
+                                   side_effect=RuntimeError("boom")), \
+                 mock.patch.object(mesh, "_emit_crash_frame") as emit, \
+                 contextlib.redirect_stderr(io.StringIO()), \
+                 self.assertRaises(RuntimeError):
+                mesh._run_mcp_server(
+                    argparse.Namespace(), "mcp-serve", "")
+            emit.assert_called_once()
+
+    def test_worker_supervisor_crash_emits_before_dying(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg = make_cfg(d)
+            pool = {"coordinator": "coordinator", "routing": ["goose"],
+                    "workers": {"goose": {"node": "worker-goose"}}}
+            with mock.patch.object(mesh, "load_config",
+                                   return_value=cfg), \
+                 mock.patch.object(mesh, "load_pool_config",
+                                   return_value=pool), \
+                 mock.patch.object(mesh, "my_node",
+                                   return_value="worker-goose"), \
+                 mock.patch.object(mesh, "_acquire_supervise_lock",
+                                   return_value=os.path.join(d, "lk")), \
+                 mock.patch.object(mesh, "_write_supervisor_pid"), \
+                 mock.patch.object(mesh, "_recover_worker_tasks",
+                                   side_effect=RuntimeError("boom")), \
+                 mock.patch.object(mesh, "_emit_crash_frame") as emit, \
+                 contextlib.redirect_stderr(io.StringIO()), \
+                 self.assertRaises(RuntimeError):
+                mesh._run_worker_supervisor(argparse.Namespace(
+                    backend="goose", interval=0, as_node=None,
+                    stop=False, log_path=None, once=True))
+            emit.assert_called_once()
+
+
 class PeerTests(unittest.TestCase):
     def test_note_peer_learns_node_and_records_sighting(self):
         with tempfile.TemporaryDirectory() as d:
