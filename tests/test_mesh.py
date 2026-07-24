@@ -7365,6 +7365,66 @@ class AckSenderTests(MembershipCmdTests):
         self.assertIn("sent to beta", out.getvalue())
 
 
+class StrictConsoleEchoTests(MembershipCmdTests):
+    """#98: a strict cp1252 stdout (stock Windows console) must never turn
+    a delivered send into exit 1 — the echo degrades, the exit code doesn't."""
+
+    def _setup_mesh(self):
+        cfg = make_cfg()
+        with open(".meshwire.json", "w") as f:
+            json.dump(cfg, f)
+        with open(".meshwire.node", "w") as f:
+            f.write("alpha\n")
+        return cfg
+
+    @staticmethod
+    def _cp1252_stream(errors="strict"):
+        return io.TextIOWrapper(io.BytesIO(), encoding="cp1252",
+                                errors=errors, write_through=True)
+
+    def test_send_survives_non_cp1252_stdout_after_delivery(self):
+        # Through main(), the path a real console hits: the frame must ship
+        # exactly once, the CLI must not raise, and U+2192 degrades to '?'.
+        self._setup_mesh()
+        sent = []
+
+        def fake_send(*a, **k):
+            sent.append(a)
+            return {"id": "m1"}
+
+        out = self._cp1252_stream()
+        argv = ["mesh", "send", "beta",
+                "a -> b as a real arrow: →", "--no-wait"]
+        with mock.patch.object(mesh, "send_raw", fake_send), \
+             mock.patch.object(sys, "argv", argv), \
+             contextlib.redirect_stdout(out), \
+             contextlib.redirect_stderr(io.StringIO()):
+            mesh.main()
+        self.assertEqual(len(sent), 1)
+        text = out.buffer.getvalue().decode("cp1252")
+        self.assertIn("sent to beta", text)
+        self.assertIn("?", text)
+        self.assertNotIn("→", text)
+
+    def test_degrade_rewrites_strict_streams_only(self):
+        # stderr already ships as backslashreplace by default; any stream
+        # with a non-strict policy was tuned deliberately and stays as-is.
+        strict = self._cp1252_stream()
+        tuned = self._cp1252_stream(errors="backslashreplace")
+        with mock.patch.object(sys, "stdout", strict), \
+             mock.patch.object(sys, "stderr", tuned):
+            mesh._degrade_strict_stdio()
+        self.assertEqual(strict.errors, "replace")
+        self.assertEqual(tuned.errors, "backslashreplace")
+
+    def test_degrade_tolerates_streams_without_reconfigure(self):
+        # StringIO (test harnesses) has no reconfigure; pythonw runs with
+        # sys.stdout = None. Neither may crash the CLI at entry.
+        with mock.patch.object(sys, "stdout", io.StringIO()), \
+             mock.patch.object(sys, "stderr", None):
+            mesh._degrade_strict_stdio()
+
+
 class ActivityFileTests(unittest.TestCase):
     def test_activity_file_is_per_node(self):
         cfg = {"_dir": "/tmp/x"}
