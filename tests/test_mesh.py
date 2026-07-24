@@ -8445,6 +8445,111 @@ class ClaudeSetupTests(unittest.TestCase):
             mesh.cmd_claude_setup(argparse.Namespace(dir=None))
 
 
+class HookPathPreflightTests(unittest.TestCase):
+    """#105 (the code half of #90): exec-form plugin hooks spawn `mesh`
+    with the Windows REGISTRY PATH, not the shell-profile PATH that
+    resolved it interactively -- when uv's install dir is only on the
+    latter, hooks never arm and nothing errors. Setup runs at the one
+    moment `mesh` provably resolves, so it preflights the gap."""
+
+    def _preflight(self, dirs, which):
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(mesh, "_registry_path_dirs",
+                               return_value=dirs), \
+             mock.patch.object(mesh.shutil, "which", return_value=which), \
+             contextlib.redirect_stdout(out), \
+             contextlib.redirect_stderr(err):
+            ok = mesh._hook_path_preflight()
+        return ok, out.getvalue(), err.getvalue()
+
+    def test_registry_read_is_none_off_windows(self):
+        if os.name == "nt":
+            self.skipTest("POSIX-only shape")
+        self.assertIsNone(mesh._registry_path_dirs())
+
+    @unittest.skipUnless(os.name == "nt", "reads the live registry")
+    def test_registry_read_returns_dirs_on_windows(self):
+        # The machine PATH always exists, so a healthy runner returns
+        # a non-empty list of expanded strings.
+        dirs = mesh._registry_path_dirs()
+        self.assertIsInstance(dirs, list)
+        self.assertTrue(dirs)
+        self.assertTrue(all(isinstance(d, str) for d in dirs))
+        self.assertFalse(any("%" in d for d in dirs))
+
+    def test_unreadable_registry_means_nothing_to_check(self):
+        ok, _out, err = self._preflight(None, None)
+        self.assertTrue(ok)
+        self.assertEqual(err, "")
+
+    def test_exe_dir_on_registry_path_passes(self):
+        bin_dir = fixture_abs("/users/x/.local/bin")
+        exe = os.path.join(bin_dir, "mesh.exe")
+        # registry entries arrive unnormalized -- keep a trailing sep
+        ok, out, err = self._preflight([bin_dir + os.sep], exe)
+        self.assertTrue(ok)
+        self.assertEqual(err, "")
+        self.assertIn("registry PATH", out)
+
+    def test_exe_dir_missing_warns_with_exact_remediation(self):
+        exe = os.path.join(fixture_abs("/users/x/.local/bin"), "mesh.exe")
+        ok, _out, err = self._preflight(
+            [fixture_abs("/windows/system32")], exe)
+        self.assertFalse(ok)
+        self.assertIn("MESH_WARN", err)
+        self.assertIn("registry PATH", err)
+        self.assertIn("never arm", err)
+        self.assertIn("uv tool update-shell", err)
+        self.assertIn("#90", err)
+
+    def test_cmd_shim_is_refused_even_when_on_path(self):
+        # bastion finding 2: Node's exec-form spawn rejects .cmd/.bat
+        # shims without a shell (CVE-2024-27980) -- a shim on the
+        # registry PATH still never arms.
+        bin_dir = fixture_abs("/users/x/shims")
+        ok, _out, err = self._preflight(
+            [bin_dir], os.path.join(bin_dir, "mesh.CMD"))
+        self.assertFalse(ok)
+        self.assertIn("MESH_WARN", err)
+        self.assertIn("shim", err)
+
+    def test_unresolvable_mesh_warns(self):
+        ok, _out, err = self._preflight([fixture_abs("/x")], None)
+        self.assertFalse(ok)
+        self.assertIn("MESH_WARN", err)
+        self.assertIn("never arm", err)
+
+
+class HookPathPreflightWiringTests(unittest.TestCase):
+    """Both workspace-MCP setups run the preflight -- the copilot plugin
+    spawns `mesh` by name the same way the claude one does."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self._old = os.getcwd()
+        self.addCleanup(lambda: os.chdir(self._old))
+        os.chdir(self._tmp.name)
+        cfg = make_cfg(self._tmp.name)
+        with open(mesh.CONFIG_NAME, "w") as f:
+            json.dump({k: v for k, v in cfg.items()
+                       if not k.startswith("_")}, f)
+
+    def _run_setup(self, fn):
+        with mock.patch.object(mesh, "_hook_path_preflight") as pf, \
+             contextlib.redirect_stdout(io.StringIO()):
+            fn(argparse.Namespace(dir=None))
+        return pf
+
+    def test_claude_setup_runs_the_preflight(self):
+        self.assertEqual(
+            self._run_setup(mesh.cmd_claude_setup).call_count, 1)
+
+    def test_copilot_setup_runs_the_preflight(self):
+        self.assertEqual(
+            self._run_setup(mesh.cmd_copilot_setup).call_count, 1)
+
+
 class CodexSetupTests(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()

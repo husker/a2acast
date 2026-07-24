@@ -8237,6 +8237,76 @@ def cmd_copilot_activity(args):
     print(json.dumps({"additionalContext": context}))
 
 
+def _registry_path_dirs():
+    """The PATH exec-form hook spawns actually resolve against on
+    Windows: the registry machine + user values, NOT this shell's
+    profile PATH (#90 round-2 root cause). None off Windows or when
+    the registry is unreadable -- meaning: nothing to check."""
+    if os.name != "nt":
+        return None
+    try:
+        import winreg
+    except ImportError:
+        return None
+    dirs = []
+    for root, sub in (
+            (winreg.HKEY_LOCAL_MACHINE,
+             (r"SYSTEM\CurrentControlSet\Control\Session Manager"
+              r"\Environment")),
+            (winreg.HKEY_CURRENT_USER, "Environment")):
+        try:
+            with winreg.OpenKey(root, sub) as key:
+                raw, _kind = winreg.QueryValueEx(key, "Path")
+        except OSError:
+            continue
+        for entry in str(raw).split(os.pathsep):
+            entry = winreg.ExpandEnvironmentStrings(entry).strip().strip('"')
+            if entry:
+                dirs.append(entry)
+    return dirs
+
+
+def _hook_path_preflight():
+    """#105, the code half of #90: the plugin's hooks say
+    `"command": "mesh"` in exec form, and the harness resolves that
+    against the REGISTRY PATH -- when uv's install dir is only on the
+    shell-profile PATH, hooks never arm and nothing errors. Setup is
+    the one moment `mesh` provably resolves interactively, so diagnose
+    the gap here and print the exact remediation. Never writes the
+    registry. True = resolvable or nothing to check; False = hooks
+    will not arm until the operator acts."""
+    dirs = _registry_path_dirs()
+    if dirs is None:
+        return True
+    exe = shutil.which("mesh")
+    if not exe:
+        print("MESH_WARN: `mesh` did not resolve on this shell's PATH -- "
+              "plugin hooks spawn `mesh` by name, so they will never arm "
+              "(#90). Install it (`uv tool install a2acast`), then re-run "
+              "this setup.", file=sys.stderr)
+        return False
+    if os.path.splitext(exe)[1].lower() in (".cmd", ".bat"):
+        print(f"MESH_WARN: `mesh` resolves to a shell shim ({exe}) -- "
+              "exec-form hook spawns refuse .cmd/.bat without a shell "
+              "(CVE-2024-27980), so hooks will never arm (#90). Install "
+              "a real executable (`uv tool install a2acast`), then re-run "
+              "this setup.", file=sys.stderr)
+        return False
+    exe_dir = os.path.dirname(exe)
+    have = {os.path.normcase(os.path.normpath(d)) for d in dirs}
+    if os.path.normcase(os.path.normpath(exe_dir)) in have:
+        print(f"  hook PATH preflight: {exe_dir} is on the registry PATH")
+        return True
+    print(f"MESH_WARN: {exe_dir} is not on the Windows registry PATH -- "
+          "the harness spawns plugin hooks with the registry PATH, not "
+          "this shell's profile, so `mesh` will not resolve and hooks "
+          "never arm (#90). Fix: run `uv tool update-shell` (or add the "
+          "directory under Settings > Environment Variables > Path), "
+          "restart the harness, then re-run this setup to verify.",
+          file=sys.stderr)
+    return False
+
+
 def _setup_workspace_mcp(args, harness):
     """Apply a workspace-MCP HarnessSpec without clobbering other servers."""
     spec = HARNESS_SPECS[harness]
@@ -8289,6 +8359,10 @@ def _setup_workspace_mcp(args, harness):
           f"The path is machine-specific (added to .gitignore); run "
           f"`{spec.setup_command}` again on each machine and whenever the "
           "node moves.")
+    # #105: the MCP entry above and the plugin's hooks both say
+    # `"command": "mesh"` -- verify the PATH the harness actually
+    # spawns with can resolve it.
+    _hook_path_preflight()
 
 
 def cmd_copilot_setup(args):
