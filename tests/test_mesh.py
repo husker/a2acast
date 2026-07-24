@@ -8397,6 +8397,140 @@ class IdentityMigrationTests(unittest.TestCase):
             self.assertEqual(f.read().strip(), "desktop")
 
 
+class PinsAuditTests(unittest.TestCase):
+    """#116: pairwise key-collision scan over the local pin store. One
+    key signing under two identities is the shape rename verification
+    (#93) polices. Aliases acknowledging a rename are OPERATOR-LOCAL
+    (never node-asserted, or the audit would certify exactly the
+    silence it had been told to keep)."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self._old = os.getcwd()
+        self.addCleanup(lambda: os.chdir(self._old))
+        os.chdir(self._tmp.name)
+        cfg = make_cfg(self._tmp.name)
+        with open(mesh.CONFIG_NAME, "w") as f:
+            json.dump({k: v for k, v in cfg.items()
+                       if not k.startswith("_")}, f)
+
+    def _write_pins(self, pins):
+        mesh._write_json_secure(mesh.pins_file(mesh.load_config()), pins)
+
+    @staticmethod
+    def _fake_pub(fill):
+        # Structurally valid ed25519 wire blob (type-tagged, 32-byte key)
+        # so _normalize_pubkey/_cert_for_key accept it -- no keygen spawn.
+        t = b"ssh-ed25519"
+        blob = (len(t).to_bytes(4, "big") + t
+                + (32).to_bytes(4, "big") + bytes([fill]) * 32)
+        return "ssh-ed25519 " + base64.b64encode(blob).decode()
+
+    def _audit(self, **over):
+        ns = argparse.Namespace(alias=None, revoke_alias=None,
+                                list_aliases=False)
+        for k, v in over.items():
+            setattr(ns, k, v)
+        out = io.StringIO()
+        code = 0
+        with contextlib.redirect_stdout(out):
+            try:
+                mesh.cmd_pins_audit(ns)
+            except SystemExit as e:
+                code = e.code
+        return code, out.getvalue()
+
+    def test_clean_store_exits_zero(self):
+        self._write_pins({"alpha": "ssh-ed25519 AAAA",
+                          "beta": "ssh-ed25519 BBBB"})
+        code, out = self._audit()
+        self.assertEqual(code, 0)
+        self.assertIn("2 pins", out)
+        self.assertIn("clean", out)
+        self.assertNotIn("KEY_COLLISION", out)
+
+    def test_collision_is_a_loud_nonzero_finding(self):
+        self._write_pins({"old-name": "ssh-ed25519 AAAA",
+                          "new-name": "ssh-ed25519 AAAA"})
+        code, out = self._audit()
+        self.assertEqual(code, 1)
+        self.assertIn("KEY_COLLISION", out)
+        self.assertIn("old-name", out)
+        self.assertIn("new-name", out)
+        self.assertIn("SHA256:", out)
+
+    def test_operator_alias_acknowledges_a_rename_pair(self):
+        self._write_pins({"old-name": "ssh-ed25519 AAAA",
+                          "new-name": "ssh-ed25519 AAAA"})
+        code, _out = self._audit(alias="old-name=new-name")
+        self.assertEqual(code, 0)
+        code, out = self._audit()
+        self.assertEqual(code, 0)
+        self.assertIn("ALIAS_OK", out)
+        self.assertNotIn("KEY_COLLISION", out)
+
+    def test_alias_covers_the_named_pair_only(self):
+        # Three names on one key: acknowledging (a,b) leaves (a,c) and
+        # (b,c) live -- pairwise, never transitive.
+        self._write_pins({"a": "ssh-ed25519 AAAA",
+                          "b": "ssh-ed25519 AAAA",
+                          "c": "ssh-ed25519 AAAA"})
+        self._audit(alias="a=b")
+        code, out = self._audit()
+        self.assertEqual(code, 1)
+        self.assertEqual(out.count("KEY_COLLISION"), 2)
+        self.assertEqual(out.count("ALIAS_OK"), 1)
+
+    def test_revoke_alias_reopens_the_finding(self):
+        self._write_pins({"a": "ssh-ed25519 AAAA",
+                          "b": "ssh-ed25519 AAAA"})
+        self._audit(alias="a=b")
+        self._audit(revoke_alias="a=b")
+        code, out = self._audit()
+        self.assertEqual(code, 1)
+        self.assertIn("KEY_COLLISION", out)
+
+    def test_malformed_alias_is_rejected(self):
+        code, _out = self._audit(alias="not-a-pair")
+        self.assertNotEqual(code, 0)
+        code, _out = self._audit(alias="same=same")
+        self.assertNotEqual(code, 0)
+
+    def test_cert_key_drift_is_a_finding(self):
+        # lodestar's bonus check: a pinned key with a cached owner cert
+        # must be byte-identical there -- two acquisition paths agreeing.
+        cfg = mesh.load_config()
+        pub = self._fake_pub(1)
+        self._write_pins({"alpha": pub})
+        fpr = mesh._key_fingerprint(pub)
+        mesh._write_json_secure(mesh.certs_file(cfg), {
+            fpr: {"v": 1, "kind": "membercert", "name": "alpha",
+                  "key": self._fake_pub(2), "fpr": fpr,
+                  "iat": 1, "exp": 2**31}})
+        code, out = self._audit()
+        self.assertEqual(code, 1)
+        self.assertIn("CERT_KEY_DRIFT", out)
+
+    def test_matching_cert_is_clean(self):
+        cfg = mesh.load_config()
+        pub = self._fake_pub(1)
+        self._write_pins({"alpha": pub})
+        fpr = mesh._key_fingerprint(pub)
+        mesh._write_json_secure(mesh.certs_file(cfg), {
+            fpr: {"v": 1, "kind": "membercert", "name": "alpha",
+                  "key": pub, "fpr": fpr, "iat": 1, "exp": 2**31}})
+        code, out = self._audit()
+        self.assertEqual(code, 0)
+        self.assertNotIn("CERT_KEY_DRIFT", out)
+
+    def test_list_aliases_prints_pairs(self):
+        self._audit(alias="a=b")
+        code, out = self._audit(list_aliases=True)
+        self.assertEqual(code, 0)
+        self.assertIn("a <-> b", out)
+
+
 class ClaudeSetupTests(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()

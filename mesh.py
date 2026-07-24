@@ -6069,6 +6069,119 @@ def cmd_owner_check(args):
           "the passphrase at a terminal (attended-mint property in force)")
 
 
+def _parse_alias_pair(raw):
+    """OLD=NEW -> a sorted two-name pair; loud rejection otherwise."""
+    if not isinstance(raw, str) or raw.count("=") != 1:
+        sys.exit("error: alias must be OLD=NEW (two node names)")
+    a, b = (part.strip() for part in raw.split("="))
+    if not a or not b or a == b:
+        sys.exit("error: alias must name two DIFFERENT nodes")
+    return sorted((a, b))
+
+
+def _load_pin_aliases(cfg):
+    """Operator-acknowledged rename pairs. PROVENANCE is the load-bearing
+    property (#116, lodestar): entries enter via `mesh pins-audit
+    --alias` at this keyboard -- never from the wire and never from the
+    pinned subject, or a key signing under one name could declare its
+    second name a "known rename" and suppress exactly the collision the
+    audit exists to surface."""
+    out = set()
+    pairs = cfg.get("pin_aliases")
+    if isinstance(pairs, list):
+        for pair in pairs:
+            if (isinstance(pair, list) and len(pair) == 2
+                    and all(isinstance(n, str) and n for n in pair)
+                    and pair[0] != pair[1]):
+                out.add(frozenset(pair))
+    return out
+
+
+def cmd_pins_audit(args):
+    """#116: pairwise key-equality scan across the local pin table.
+    What it catches: one key signing under two identities -- the shape
+    rename verification (#93) exists to police. What it re-derives for
+    free: every legitimate rename's key-equality evidence, from local
+    state only. Log-only observation, mutates nothing; exit 0 iff every
+    collision is an operator-acknowledged alias."""
+    cfg = load_config()
+    if getattr(args, "alias", None):
+        pair = _parse_alias_pair(args.alias)
+
+        def _add(latest):
+            latest.setdefault("pin_aliases", [])
+            if pair not in latest["pin_aliases"]:
+                latest["pin_aliases"].append(pair)
+        _mutate_config(cfg, _add)
+        print(f"pin alias acknowledged: {pair[0]} <-> {pair[1]}")
+        return
+    if getattr(args, "revoke_alias", None):
+        pair = _parse_alias_pair(args.revoke_alias)
+
+        def _drop(latest):
+            latest.setdefault("pin_aliases", [])
+            if pair in latest["pin_aliases"]:
+                latest["pin_aliases"].remove(pair)
+        _mutate_config(cfg, _drop)
+        print(f"pin alias revoked: {pair[0]} <-> {pair[1]}")
+        return
+    aliases = _load_pin_aliases(cfg)
+    if getattr(args, "list_aliases", False):
+        if aliases:
+            for pair in sorted(sorted(p) for p in aliases):
+                print(f"{pair[0]} <-> {pair[1]}")
+        else:
+            print("(no acknowledged aliases)")
+        return
+    pins = _load_pins(cfg)
+    by_key = {}
+    for name, pub in pins.items():
+        if isinstance(pub, str) and pub.strip():
+            by_key.setdefault(pub.strip(), []).append(name)
+    print(f"pins-audit: {len(pins)} pins, {len(by_key)} distinct keys")
+    findings = 0
+    for pub in sorted(by_key, key=lambda k: sorted(by_key[k])):
+        names = sorted(by_key[pub])
+        if len(names) < 2:
+            continue
+        try:
+            fpr = _key_fingerprint(pub)
+        except ValueError:
+            fpr = "(unfingerprintable)"
+        for i, a in enumerate(names):
+            for b in names[i + 1:]:
+                if frozenset((a, b)) in aliases:
+                    print(f"PINS_AUDIT ALIAS_OK {a} <-> {b} {fpr} "
+                          f"(operator-acknowledged rename)")
+                else:
+                    findings += 1
+                    print(f"PINS_AUDIT KEY_COLLISION {a} <-> {b} {fpr} "
+                          f"(one key, two identities -- acknowledge a "
+                          f"#93-verified rename with `mesh pins-audit "
+                          f"--alias {a}={b}`, or investigate "
+                          f"impersonation)")
+    # lodestar's bonus consistency check: a pinned key that also appears
+    # in a cached owner cert must be byte-identical there -- two
+    # acquisition paths (wire TOFU, owner mint) agreeing.
+    for name in sorted(pins):
+        pub = pins[name]
+        if not isinstance(pub, str) or not pub.strip():
+            continue
+        cert = _cert_for_key(cfg, pub)
+        if not isinstance(cert, dict):
+            continue
+        cert_key = cert.get("key")
+        if isinstance(cert_key, str) and cert_key.strip() != pub.strip():
+            findings += 1
+            print(f"PINS_AUDIT CERT_KEY_DRIFT {name} -- the cached owner "
+                  f"cert at this pin's fingerprint carries a DIFFERENT "
+                  f"key (cache tamper or corruption)")
+    if findings:
+        print(f"pins-audit: {findings} unacknowledged finding(s)")
+        raise SystemExit(1)
+    print("pins-audit: clean")
+
+
 def cmd_owner_trust(args):
     # #87 F2: owner-key ROTATION is interactive-only, and it refuses in ANY
     # unattended POSTURE -- the --unattended flag or an armed env var alike,
@@ -11621,6 +11734,22 @@ def main():
                             "protected / 1 unprotected / 2 absent / 3 "
                             "probe-failed) (#110)")
     p.set_defaults(fn=cmd_owner_check)
+    p = sub.add_parser("pins-audit",
+                       help="pairwise key-collision scan over the pin "
+                            "store; exit 0 only when every collision is "
+                            "an operator-acknowledged rename alias (#116)")
+    p.add_argument("--alias", default=None, metavar="OLD=NEW",
+                   help="acknowledge a #93-verified rename pair as one "
+                        "identity (operator-local; never accepted from "
+                        "the wire)")
+    p.add_argument("--revoke-alias", dest="revoke_alias", default=None,
+                   metavar="OLD=NEW",
+                   help="withdraw an acknowledged pair")
+    p.add_argument("--list-aliases", dest="list_aliases",
+                   action="store_true",
+                   help="print acknowledged pairs")
+    p.set_defaults(fn=cmd_pins_audit)
+
     p = sub.add_parser("owner-trust",
                        help="trust the mesh owner here from its mwtrust1- "
                             "block (share it privately, like an invite)")
