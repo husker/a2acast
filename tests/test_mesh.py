@@ -1930,7 +1930,7 @@ class WatchTests(MembershipCmdTests):
         ev = self._msg_event(cfg, "beta", body, "invalid-route-event", 200)
         opened = (
             "beta", None, body, True, None,
-            "invalid-plaintext-route-fingerprint", None, None, None)
+            "invalid-plaintext-route-fingerprint", None, None, None, None)
         acks = []
         out, err = io.StringIO(), io.StringIO()
 
@@ -5281,10 +5281,13 @@ class SignOnSendTests(unittest.TestCase):
         wire = mesh.encrypt(self.cfg, json.dumps(signed), to=to, timestamp=ts)
         ev = {"message": wire, "topic": mesh.topic(self.cfg, to)}
         (frm, recipient, body, trusted, ctl, fp,
-         _s, _k, _ts) = mesh._open_details(ev, self.cfg, me="laptop")
+         _s, _k, _ts, sbase) = mesh._open_details(ev, self.cfg, me="laptop")
         self.assertTrue(trusted)
         self.assertEqual(frm, "peer")
         self.assertEqual(body, "body-text")
+        # the surfaced signed base is the wrapper minus s/k, byte-equal to
+        # what the sender signed
+        self.assertEqual(sbase, {"f": "peer", "t": to, "b": "body-text"})
 
     def test_keyless_node_generates_its_key_and_signs(self):
         # A node upgraded from a pre-signing version has no key. First send
@@ -5362,6 +5365,88 @@ class VerifyFrameTests(unittest.TestCase):
             self.cfg, "laptop", w2.get("k"), w2.get("s"),
             self.topic, ts2, mesh._base_payload(w2))
         self.assertEqual(status, mesh.FRAME_VERIFIED)
+
+    def _pin_laptop(self):
+        ts1, w1 = self._frame_from(self.sender_cfg)
+        mesh._verify_frame(self.cfg, "laptop", w1.get("k"), w1.get("s"),
+                           self.topic, ts1, mesh._base_payload(w1))
+
+    def test_forward_compat_extra_signed_field_verifies_via_wrapper_base(self):
+        # #76 forward-compat: a future signed field (here 'rli', the
+        # revocation-freshness iat) rides in the signed base. Reconstructing
+        # from the received wrapper verifies it; the legacy fixed-{f,t,b,c}
+        # rebuild MISMATCHES because it silently drops the field. This is the
+        # whole reason the reconstruction must go fleet-wide before any node
+        # stamps such a field.
+        self._pin_laptop()
+        payload = {"f": "laptop", "t": self.to, "b": "hi", "rli": 1784848596}
+        ts2, w2 = mesh._sign_wrapper_payload(
+            self.sender_cfg, self.to, payload, harness="claude")
+        ev = {"topic": self.topic}
+        good = mesh._frame_verdict(
+            self.cfg, "laptop", self.to, "hi", None, w2.get("s"),
+            w2.get("k"), ts2, ev, signed_base=mesh._base_payload(w2))
+        self.assertEqual(good, mesh.FRAME_VERIFIED)
+        legacy = mesh._frame_verdict(
+            self.cfg, "laptop", self.to, "hi", None, w2.get("s"),
+            w2.get("k"), ts2, ev, signed_base=None)
+        self.assertEqual(legacy, mesh.FRAME_MISMATCH)
+
+    def test_current_shape_frame_same_verdict_both_reconstructions(self):
+        # No-op proof: for a frame with no extra fields, the wrapper-derived
+        # base equals the fixed-field base, so the verdict is identical
+        # whether signed_base is supplied or not -- the change touches no
+        # traffic shape shipped to date.
+        self._pin_laptop()
+        ts2, w2 = self._frame_from(self.sender_cfg, b="second")
+        ev = {"topic": self.topic}
+        with_base = mesh._frame_verdict(
+            self.cfg, "laptop", self.to, "second", None, w2.get("s"),
+            w2.get("k"), ts2, ev, signed_base=mesh._base_payload(w2))
+        without = mesh._frame_verdict(
+            self.cfg, "laptop", self.to, "second", None, w2.get("s"),
+            w2.get("k"), ts2, ev, signed_base=None)
+        self.assertEqual(with_base, mesh.FRAME_VERIFIED)
+        self.assertEqual(without, mesh.FRAME_VERIFIED)
+
+    def test_wrapper_base_detects_post_sign_field_injection(self):
+        # Security improvement: a mesh member re-encrypting a peer's wrapper
+        # with a field the original signer never covered is caught -- the
+        # wrapper-derived base includes it and the signature fails. The old
+        # fixed-field rebuild dropped it and verified anyway (the gap closed).
+        self._pin_laptop()
+        ts2, w2 = self._frame_from(self.sender_cfg, b="second")
+        injected = dict(w2)
+        injected["x"] = "added-after-signing"
+        ev = {"topic": self.topic}
+        caught = mesh._frame_verdict(
+            self.cfg, "laptop", self.to, "second", None, w2.get("s"),
+            w2.get("k"), ts2, ev, signed_base=mesh._base_payload(injected))
+        self.assertEqual(caught, mesh.FRAME_MISMATCH)
+        missed = mesh._frame_verdict(
+            self.cfg, "laptop", self.to, "second", None, w2.get("s"),
+            w2.get("k"), ts2, ev, signed_base=None)
+        self.assertEqual(missed, mesh.FRAME_VERIFIED)
+
+    def test_open_details_plumbs_wrapper_base_end_to_end(self):
+        # Full path: a signed frame carrying an extra field, encrypted,
+        # opened. _open_details surfaces the wrapper-derived base with the
+        # field, and the plumbed verdict verifies against the pin.
+        self._pin_laptop()
+        payload = {"f": "laptop", "t": self.to, "b": "e2e", "rli": 42}
+        ts2, signed = mesh._sign_wrapper_payload(
+            self.sender_cfg, self.to, payload, harness="claude")
+        wire = mesh.encrypt(self.cfg, json.dumps(signed), to=self.to,
+                            timestamp=ts2)
+        ev = {"message": wire, "topic": self.topic}
+        (frm, recipient, body, trusted, ctl, fp,
+         sig, pk, wts, sbase) = mesh._open_details(ev, self.cfg, me="alpha")
+        self.assertTrue(trusted)
+        self.assertEqual(sbase.get("rli"), 42)
+        verdict = mesh._frame_verdict(
+            self.cfg, frm, recipient, body, ctl, sig, pk, wts, ev,
+            signed_base=sbase)
+        self.assertEqual(verdict, mesh.FRAME_VERIFIED)
 
     def test_pin_lock_unavailable_is_unverified_not_a_crash(self):
         # _verify_frame runs on the receive hot path; a transient pin-lock

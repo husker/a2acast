@@ -1828,7 +1828,8 @@ def _base_payload(wrapper):
     return {k: v for k, v in wrapper.items() if k not in ("s", "k")}
 
 
-def _frame_verdict(cfg, frm, recipient, body, ctl, sig, pubkey, wire_ts, ev):
+def _frame_verdict(cfg, frm, recipient, body, ctl, sig, pubkey, wire_ts, ev,
+                   signed_base=None):
     """Stage-3 authenticity verdict for an inbound frame, reconstructing the
     signed payload from the already-unpacked fields. This runs AFTER the
     shared-key MAC (stage 1, in decrypt) and the replay fingerprint (stage 2)
@@ -1843,12 +1844,29 @@ def _frame_verdict(cfg, frm, recipient, body, ctl, sig, pubkey, wire_ts, ev):
     frame only reaches here after decrypt, and decrypt drops any frame whose
     MAC-covered wire relay topic does not equal ev["topic"]. So a delivered
     frame's ev["topic"] provably equals the topic the signature was bound
-    to. (ntfy sets this field on every message event.)"""
+    to. (ntfy sets this field on every message event.)
+
+    `signed_base`, when the caller supplies it, is the received wrapper minus
+    the post-signature `s`/`k` fields (`_base_payload`) -- i.e. reconstructed
+    the SAME way the sender computed what it signed, rather than from a fixed
+    {f,t,b,c} field set. The two are byte-identical for every frame shape
+    shipped to date (senders emit only f/t/b/[c] plus s/k), so this changes
+    no current verdict. It makes the base FORWARD-COMPATIBLE with any future
+    signed field (the #76 revocation-freshness iat is the first) and STRICTER
+    against a mesh member re-encrypting a peer's wrapper with an extra field
+    the original signer never covered -- the fixed-field rebuild silently
+    dropped such a field and verified anyway. ROLLOUT ORDERING (#74/#93): a
+    node still on the fixed rebuild MISMATCHES a peer that adds a new signed
+    field, so this reconstruction must be fleet-wide BEFORE any node stamps
+    one. The `None` fallback preserves every existing direct caller/test."""
     relay_topic = (ev.get("topic")
                    if isinstance(ev.get("topic"), str) else None)
-    base = {"f": frm, "t": recipient, "b": body}
-    if ctl:
-        base["c"] = ctl
+    if signed_base is not None:
+        base = signed_base
+    else:
+        base = {"f": frm, "t": recipient, "b": body}
+        if ctl:
+            base["c"] = ctl
     return _verify_frame(cfg, frm, pubkey, sig, relay_topic, wire_ts, base)
 
 
@@ -3158,36 +3176,44 @@ def _open_details(ev, cfg, me=None):
     """Open a relay event, retaining the authenticated wrapper recipient."""
     body = _unwrap(ev, cfg, node=me)
     if not isinstance(body, str):
-        return None, None, "", False, None, None, None, None, None
+        return None, None, "", False, None, None, None, None, None, None
     relay_topic = ev.get("topic") if isinstance(ev.get("topic"), str) else None
     pt, wire_ts = _decrypt_meta(cfg, body, expected_topic=relay_topic)
     if pt is not None:
         try:
             wrapper = json.loads(pt)
         except (json.JSONDecodeError, ValueError):
-            return None, None, "", False, None, None, None, None, None
+            return None, None, "", False, None, None, None, None, None, None
         if (not isinstance(wrapper, dict) or
                 not isinstance(wrapper.get("f"), str) or
                 not isinstance(wrapper.get("t"), str) or
                 not isinstance(wrapper.get("b"), str) or
                 ("c" in wrapper and not isinstance(wrapper["c"], dict)) or
                 (me is not None and wrapper["t"] not in (me, BROADCAST))):
-            return None, None, "", False, None, None, None, None, None
+            return None, None, "", False, None, None, None, None, None, None
         fingerprint = hashlib.sha256(body.encode("utf-8")).hexdigest()
         sig = wrapper.get("s") if isinstance(wrapper.get("s"), str) else None
         pubkey = wrapper.get("k") if isinstance(wrapper.get("k"), str) else None
+        # The signed base = the wrapper minus the post-signature s/k fields,
+        # reconstructed the SAME way the sender computed what it signed
+        # (_sign_wrapper_payload signs the payload BEFORE adding s/k). Surfaced
+        # so _frame_verdict verifies over exactly these bytes, forward-compat
+        # with future signed fields rather than a fixed {f,t,b,c} rebuild.
+        signed_base = _base_payload(wrapper)
         return (wrapper["f"], wrapper["t"], wrapper["b"], True,
-                wrapper.get("c"), fingerprint, sig, pubkey, wire_ts)
+                wrapper.get("c"), fingerprint, sig, pubkey, wire_ts,
+                signed_base)
     if body.startswith((WIRE_MAGIC, LEGACY_WIRE_MAGIC)):
-        return None, None, "", False, None, None, None, None, None
+        return None, None, "", False, None, None, None, None, None, None
     # legacy plaintext: sender via title convention
     title = ev.get("title", "")
     if "title" in ev and not isinstance(title, str):
-        return None, None, "", False, None, None, None, None, None
+        return None, None, "", False, None, None, None, None, None, None
     frm = None
     if ": " in title and " -> " in title:
         frm = title.split(": ", 1)[1].split(" -> ", 1)[0]
-    return frm, None, body, not cfg.get("key"), None, None, None, None, None
+    return frm, None, body, not cfg.get("key"), None, None, None, None, \
+        None, None
 
 
 def _parse_envelope(body):
@@ -7311,7 +7337,7 @@ def _cmd_watch_owned(args, cfg, me):
                 (event_time == since and ev.get("id") in seen)):
             continue
         (frm, recipient, body, trusted, ctl, fingerprint,
-         _sig, _pk, _wts) = _open_details(
+         _sig, _pk, _wts, _sbase) = _open_details(
             ev, cfg, me)
         if not trusted:
             if body != "":
@@ -7355,7 +7381,8 @@ def _cmd_watch_owned(args, cfg, me):
         # stage 3: classify sender authenticity. Non-enforcing -- the verdict
         # is surfaced and pins an unseen peer, but never drops a frame.
         verdict = _frame_verdict(
-            cfg, frm, recipient, body, ctl, _sig, _pk, _wts, ev)
+            cfg, frm, recipient, body, ctl, _sig, _pk, _wts, ev,
+            signed_base=_sbase)
         _report_verdict(frm, ev, verdict)
         if verdict == FRAME_VERIFIED:
             # #76 Phase A: log-only cert observability for verified frames,
@@ -8007,7 +8034,7 @@ class MeshMCPServer:
                     (et == since and ev.get("id") in seen)):
                 continue
             (frm, recipient, body, trusted, ctl, fingerprint,
-             _sig, _pk, _wts) = \
+             _sig, _pk, _wts, _sbase) = \
                 _open_details(ev, cfg, me)
             if not trusted:
                 continue
@@ -8033,7 +8060,8 @@ class MeshMCPServer:
                 continue
             # stage 3: classify sender authenticity (non-enforcing).
             verdict = _frame_verdict(
-                cfg, frm, recipient, body, ctl, _sig, _pk, _wts, ev)
+                cfg, frm, recipient, body, ctl, _sig, _pk, _wts, ev,
+                signed_base=_sbase)
             _report_verdict(frm, ev, verdict)
             if verdict == FRAME_VERIFIED:
                 # #76 Phase A: log-only cert observability (see cmd_watch).
@@ -9240,7 +9268,7 @@ def _await_result(cfg, me, task_id, timeout, first=None,
                      if expected.get("direction") == "outbound" else None)
     for ev in _stream_events(cfg, tpc, stream_since, deadline,
                              first=first):
-        frm, recipient, body, trusted, ctl, _, _, _, _ = _open_details(
+        frm, recipient, body, trusted, ctl, _, _, _, _, _ = _open_details(
             ev, cfg, me)
         if not trusted or ctl:
             continue
@@ -9296,7 +9324,7 @@ def _await_worker_result(cfg, me, task_id, node, backend, timeout,
         max(0, int(expected.get("updated", time.time())) - 1))
     for ev in _stream_events(
             cfg, topic(cfg, me), stream_since, deadline, first=first):
-        frm, recipient, body, trusted, ctl, _, _, _, _ = _open_details(
+        frm, recipient, body, trusted, ctl, _, _, _, _, _ = _open_details(
             ev, cfg, me)
         if not trusted or ctl or frm != node or recipient != me:
             continue
@@ -9354,7 +9382,7 @@ def _collect_recipe_results(cfg, me, pending, timeout, first=None, since=None):
     stream_since = since if since is not None else str(int(time.time()) - 5)
     tpc = f"{topic(cfg, me)},{topic(cfg, BROADCAST)}"
     for ev in _stream_events(cfg, tpc, stream_since, deadline, first=first):
-        frm, recipient, body, trusted, ctl, _, _, _, _ = _open_details(
+        frm, recipient, body, trusted, ctl, _, _, _, _, _ = _open_details(
             ev, cfg, me)
         if not trusted or ctl:
             continue
