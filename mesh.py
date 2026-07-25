@@ -1884,7 +1884,14 @@ def _report_verdict(frm, ev, verdict):
 
 
 REVGAP_LOG_INTERVAL = 300       # s; per-peer REVGAP log throttle
+REVPULL_MIN_INTERVAL = 60       # s; per-peer pull-request rate limit
+REVSERVE_MIN_INTERVAL = 60      # s; per-peer serve rate limit (anti-reflection)
+REVPULL_STRIKE_MAX = 3          # unsubstantiated assertions before back-off
 _revgap_last = {}
+_revpull_last = {}              # peer -> last pull-request ts
+_revpull_expect = {}            # peer -> the iat it asserted when we pulled
+_revpull_strikes = {}           # peer -> unsubstantiated-assertion count
+_revserve_last = {}             # peer -> last time we served it a list
 _revgap_lock = threading.Lock()
 
 
@@ -1915,15 +1922,31 @@ def _assert_revlist_freshness(cfg, payload):
     return out
 
 
-def _observe_revlist_freshness(cfg, frm, signed_base, now=None):
-    """#76 distribution, OBSERVE-ONLY: a peer's signed frame asserts its
-    revocation-list `iat`. If it exceeds ours we are behind that peer and
-    should pull (the pull transport is the next increment -- leg 2); here
-    we emit a throttled REVGAP evidence line so the #62 soak can witness
-    real offline gaps before #74 enforces anything. Never writes, never
-    gates delivery. `signed_base` is the authenticated wrapper, so the
-    asserted `rl` is under the sender's signature -- an unsubstantiable
-    assertion is caught at pull time, not here."""
+def _revlist_strike(frm, expected, reason):
+    """#76 leg 2: record a peer failing to substantiate an asserted `iat`.
+    Past REVPULL_STRIKE_MAX the observer stops pulling from it. Loud: an
+    honest node never asserts freshness it cannot back, so this is its own
+    evidence line (lodestar)."""
+    with _revgap_lock:
+        n = _revpull_strikes.get(frm, 0) + 1
+        _revpull_strikes[frm] = n
+        _revpull_expect.pop(frm, None)
+    print(f"MESH_REVLIST_UNSUBSTANTIATED from={_single_line(frm)} "
+          f"asserted={expected} strike={n}/{REVPULL_STRIKE_MAX} "
+          f"({_single_line(str(reason))}) -- #76", file=sys.stderr)
+
+
+def _observe_revlist_freshness(cfg, me, frm, signed_base, now=None):
+    """#76 distribution: a peer's signed frame asserts its revocation-list
+    `iat`. When it exceeds ours we are behind that peer -- log a throttled
+    REVGAP and (leg 2) PULL the peer's list to converge. iat is monotonic,
+    so `peer_iat > mine` is unambiguous ("who is fresher" needs no
+    bidirectional digest exchange -- that concern was digest-gossip's, not
+    iat's). Only the pull's adopt-on-verify writes, and it writes a single
+    owner-signed list bounded by the verify cap; no verdict gates delivery.
+    An unsubstantiable assertion is caught at pull time (the peer cannot
+    produce the list it claimed) -- that is the non-suppressibility the
+    #74 gate waits on."""
     if not isinstance(signed_base, dict):
         return
     peer_iat = signed_base.get("rl")
@@ -1935,12 +1958,27 @@ def _observe_revlist_freshness(cfg, frm, signed_base, now=None):
     now = time.time() if now is None else now
     with _revgap_lock:
         last = _revgap_last.get(frm)
-        if last is not None and now - last < REVGAP_LOG_INTERVAL:
+        if last is None or now - last >= REVGAP_LOG_INTERVAL:
+            _revgap_last[frm] = now
+            print(f"MESH_REVGAP from={_single_line(frm)} peer_iat={peer_iat} "
+                  f"mine={mine} (peer holds a newer owner-signed revocation "
+                  f"list; pulling to converge -- #76)", file=sys.stderr)
+        # Back-off: a peer that keeps asserting an iat it cannot substantiate
+        # is not something an honest node does (lodestar) -- stop pulling
+        # from it, but keep logging the gap above so the abuse stays visible.
+        if _revpull_strikes.get(frm, 0) >= REVPULL_STRIKE_MAX:
             return
-        _revgap_last[frm] = now
-    print(f"MESH_REVGAP from={_single_line(frm)} peer_iat={peer_iat} "
-          f"mine={mine} (peer holds a newer owner-signed revocation list; "
-          f"pull to converge -- observe-only, #76)", file=sys.stderr)
+        pulled = _revpull_last.get(frm)
+        if pulled is not None and now - pulled < REVPULL_MIN_INTERVAL:
+            return
+        _revpull_last[frm] = now
+        _revpull_expect[frm] = peer_iat
+    try:
+        send_raw(cfg, me, frm, "revlist-req",
+                 ctl=_stamp_posture({"mw": "revlist-req", "have": mine}))
+    except (urllib.error.URLError, socket.timeout, UnicodeError, ValueError,
+            OSError):
+        pass
 
 
 def _own_node_pubkey(cfg, harness):
@@ -7395,6 +7433,68 @@ def _handle_control(cfg, me, frm, ctl, verdict=None, ev=None):
         note_peer(cfg, frm, "pong", ctl.get("status"),
                   posture=ctl.get("posture"))
         return None
+    if kind == "revlist-req":
+        # #76 leg 2: a peer is behind and asked for our list. Serve our
+        # adopted block only when it is genuinely newer than what the peer
+        # has (`have`), and re-VERIFY it before serving -- the confused-
+        # deputy note on _load_revlist: body and cached block are not bound,
+        # so never serve a block we have not just checked. Rate-limited per
+        # peer so a stream of requests cannot make us a 128KB reflector.
+        want = ctl.get("have")
+        want = want if isinstance(want, int) and not isinstance(want, bool) else 0
+        now = time.time()
+        with _revgap_lock:
+            served = _revserve_last.get(frm)
+            if served is not None and now - served < REVSERVE_MIN_INTERVAL:
+                return None
+            _revserve_last[frm] = now
+        try:
+            body, block = _load_revlist(cfg)
+        except (OSError, ValueError):
+            return None
+        if body is None or body.get("iat", 0) <= want:
+            return None
+        ok, _reason, _b = _verify_revlist(cfg, block)
+        if not ok:
+            return None
+        try:
+            send_raw(cfg, me, frm, "revlist-resp",
+                     ctl=_stamp_posture({"mw": "revlist-resp", "block": block}))
+        except (urllib.error.URLError, socket.timeout, UnicodeError,
+                ValueError, OSError):
+            pass
+        return None
+    if kind == "revlist-resp":
+        # #76 leg 2: a served list arrived. VERIFY the owner signature
+        # before trusting it (the block came from a possibly-hostile peer),
+        # adopt if strictly newer, and score substantiation: a peer that
+        # asserted iat=N but cannot produce a valid list with iat>=N gets a
+        # strike -- the non-suppressibility signal the #74 gate waits on.
+        block = ctl.get("block")
+        expected = _revpull_expect.get(frm)
+        if not isinstance(block, str):
+            _revlist_strike(frm, expected, "no block in response")
+            return None
+        ok, reason, body = _verify_revlist(cfg, block)
+        if not ok:
+            _revlist_strike(frm, expected, reason)
+            return None
+        if (isinstance(expected, int)
+                and body.get("iat", 0) < expected):
+            _revlist_strike(frm, expected,
+                            f"served iat={body.get('iat')} < asserted "
+                            f"{expected}")
+            return None
+        with _revgap_lock:
+            _revpull_strikes.pop(frm, None)  # substantiated: clear strikes
+            _revpull_expect.pop(frm, None)
+        verdict = _note_revlist(cfg, body, block)
+        if verdict == "adopted":
+            print(f"MESH_REVLIST_PULLED from={_single_line(frm)} "
+                  f"iat={body['iat']} n={len(body['revocations'])} "
+                  f"(adopted a newer owner-signed list -- #76)",
+                  file=sys.stderr)
+        return None
     if kind == "ack":
         note_peer(cfg, frm, "ack", ctl.get("status"),
                   posture=ctl.get("posture"))
@@ -7634,7 +7734,7 @@ def _cmd_watch_owned(args, cfg, me):
             cfg, frm, recipient, body, ctl, _sig, _pk, _wts, ev,
             signed_base=_sbase)
         _report_verdict(frm, ev, verdict)
-        _observe_revlist_freshness(cfg, frm, _sbase)
+        _observe_revlist_freshness(cfg, me, frm, _sbase)
         if verdict == FRAME_VERIFIED:
             # #76 Phase A: log-only cert observability for verified frames,
             # against the LOCAL pin (the key that actually verified).
@@ -8334,7 +8434,7 @@ class MeshMCPServer:
                 cfg, frm, recipient, body, ctl, _sig, _pk, _wts, ev,
                 signed_base=_sbase)
             _report_verdict(frm, ev, verdict)
-            _observe_revlist_freshness(cfg, frm, _sbase)
+            _observe_revlist_freshness(cfg, me, frm, _sbase)
             if verdict == FRAME_VERIFIED:
                 # #76 Phase A: log-only cert observability (see cmd_watch).
                 _report_cert_status(cfg, frm, _load_pins(cfg).get(frm))
