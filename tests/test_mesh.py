@@ -837,20 +837,26 @@ class ProcessPostureTests(unittest.TestCase):
 
 class PostureStatusRenderTests(unittest.TestCase):
     def test_status_renders_posture_when_known(self):
+        old = os.getcwd()
         with tempfile.TemporaryDirectory() as d:
-            old = os.getcwd()
-            self.addCleanup(lambda: os.chdir(old))
-            os.chdir(d)
-            cfg = make_cfg(d)
-            with open(mesh.CONFIG_NAME, "w") as f:
-                json.dump({k: v for k, v in cfg.items()
-                           if not k.startswith("_")}, f)
-            mesh.note_peer(cfg, "beta", "pong", status="listening",
-                           posture="watch")
-            out = io.StringIO()
-            with contextlib.redirect_stdout(out):
-                mesh.cmd_status(argparse.Namespace(as_node=None))
-            self.assertIn("posture=watch", out.getvalue())
+            try:
+                os.chdir(d)
+                cfg = make_cfg(d)
+                with open(mesh.CONFIG_NAME, "w") as f:
+                    json.dump({k: v for k, v in cfg.items()
+                               if not k.startswith("_")}, f)
+                mesh.note_peer(cfg, "beta", "pong", status="listening",
+                               posture="watch")
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    mesh.cmd_status(argparse.Namespace(as_node=None))
+                self.assertIn("posture=watch", out.getvalue())
+            finally:
+                # Windows cannot rmtree a directory that is the process cwd,
+                # so restore cwd BEFORE the TemporaryDirectory cleanup runs
+                # at the with-block exit -- addCleanup runs too late (during
+                # tearDown, after __exit__ already tried to delete d).
+                os.chdir(old)
 
 
 class PeerTests(unittest.TestCase):
@@ -14394,6 +14400,21 @@ class PoolLifecycleTests(unittest.TestCase):
                 self.cfg, self.pool, inbound, task_id, record)
 
 
+def _only_receiver_thread(receiver, thread):
+    """Thread side_effect that returns the test's assertion mock ONLY for
+    the supervisor's own receiver thread (target=receiver.watch_loop) and
+    an inert throwaway for any other Thread(...) -- so a leaked background
+    thread that happens to call the globally-patched threading.Thread
+    during this test cannot contaminate `thread`'s join/start call counts
+    (a Windows-timing cross-test flake). The unit under test is THIS
+    supervisor's cleanup, not global thread-primitive purity."""
+    def _make(*_args, **kwargs):
+        if kwargs.get("target") is receiver.watch_loop:
+            return thread
+        return mock.Mock(is_alive=mock.Mock(return_value=False))
+    return _make
+
+
 class WorkerSuperviseTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -14546,7 +14567,9 @@ class WorkerSuperviseTests(unittest.TestCase):
              mock.patch.object(
                  mesh, "MeshMCPServer", side_effect=make_receiver), \
              mock.patch.object(
-                 mesh.threading, "Thread", return_value=thread) as thread_cls, \
+                 mesh.threading, "Thread",
+                 side_effect=_only_receiver_thread(
+                     receiver, thread)) as thread_cls, \
              mock.patch.object(
                  mesh, "_supervise_pending",
                  side_effect=lambda *_args, **_kwargs: []), \
@@ -14561,9 +14584,10 @@ class WorkerSuperviseTests(unittest.TestCase):
             "recovery", "receiver", "start", "stop",
             ("join", mesh.SUPERVISE_RECEIVER_JOIN_TIMEOUT),
         ])
-        self.assertEqual(thread_cls.call_args.kwargs["target"],
-                         receiver.watch_loop)
-        self.assertIs(thread_cls.call_args.kwargs["daemon"], True)
+        receiver_calls = [c for c in thread_cls.call_args_list
+                          if c.kwargs.get("target") is receiver.watch_loop]
+        self.assertEqual(len(receiver_calls), 1)
+        self.assertIs(receiver_calls[0].kwargs["daemon"], True)
         self.assertFalse(os.path.exists(
             mesh._supervise_pid_file(self.cfg, "worker-copilot")))
 
@@ -14850,7 +14874,8 @@ class WorkerSuperviseTests(unittest.TestCase):
              mock.patch.object(mesh, "_recover_worker_tasks"), \
              mock.patch.object(mesh, "MeshMCPServer", return_value=receiver), \
              mock.patch.object(
-                 mesh.threading, "Thread", return_value=thread), \
+                 mesh.threading, "Thread",
+                 side_effect=_only_receiver_thread(receiver, thread)), \
              mock.patch.object(
                  mesh, "_supervise_pending",
                  side_effect=mesh.TaskLedgerBusy("busy")), \
