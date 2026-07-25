@@ -28,7 +28,7 @@ cryptographic key conflict.
 Three arms run, and all must hold:
 
   attack      key B signs as `victim`        -> FRAME_MISMATCH -> KEY_MISMATCH
-  control     key A signs as `victim`        -> FRAME_VERIFIED -> WOULD_MIGRATE
+  control     key A signs as `victim`        -> FRAME_VERIFIED -> MIGRATED
   forged hint key B signs, hint claims key A -> FRAME_MISMATCH -> KEY_MISMATCH
 
 None of the three is decoration. Without the control arm, a verifier that
@@ -160,7 +160,7 @@ def rehearse(out=sys.stdout, keep=False):
                             % verdict)
         if "KEY_MISMATCH" not in log:
             failures.append("attack arm: no KEY_MISMATCH evidence line")
-        for token in ("WOULD_MIGRATE", "UNVERIFIED_SOURCE"):
+        for token in ("WOULD_MIGRATE", "MIGRATED", "UNVERIFIED_SOURCE"):
             if token in log:
                 failures.append("attack arm: leaked %s" % token)
         say()
@@ -176,8 +176,9 @@ def rehearse(out=sys.stdout, keep=False):
         if verdict2 != mesh.FRAME_VERIFIED:
             failures.append("control arm: verdict %r, want FRAME_VERIFIED"
                             % verdict2)
-        if "WOULD_MIGRATE" not in log2:
-            failures.append("control arm: no WOULD_MIGRATE evidence line")
+        if "MIGRATED" not in log2:
+            failures.append("control arm: no MIGRATED evidence line (#93 "
+                            "Phase B-prime: a verified rename migrates)")
         for token in ("KEY_MISMATCH", "UNVERIFIED_SOURCE"):
             if token in log2:
                 failures.append("control arm: leaked %s" % token)
@@ -205,21 +206,39 @@ def rehearse(out=sys.stdout, keep=False):
                 "receiver trusted the carried hint over the pin" % verdict3)
         if "KEY_MISMATCH" not in log3:
             failures.append("forged-hint arm: no KEY_MISMATCH evidence line")
-        if "WOULD_MIGRATE" in log3:
-            failures.append("forged-hint arm: leaked WOULD_MIGRATE")
+        for token in ("WOULD_MIGRATE", "MIGRATED"):
+            if token in log3:
+                failures.append("forged-hint arm: leaked %s" % token)
         say()
 
-        # ---- Ph1 purity: no arm may mutate durable state ----
-        say("--- Ph1 purity: did either arm mutate the pin store? ---")
+        # ---- migration integrity (#93 Phase B-prime) ----
+        # The invariant changed from "no arm mutates" (Phase A log-only) to
+        # "a MISMATCH migrates nothing; the VERIFIED control arm migrates
+        # its pin and retains the source." Both arms that produced a
+        # mismatch must have left no stray pin; the control arm must have
+        # carried key A to the new name while keeping the old pin (the
+        # cert, if any, stays bound to the old name until re-mint).
+        say("--- migration integrity: did the arms mutate correctly? ---")
         pins = mesh._load_pins(receiver)
-        say("  %s still pinned to key A : %s"
+        renames = mesh._load_renames(receiver)
+        say("  %s still pinned to key A   : %s"
             % (VICTIM, _fpr(pins.get(VICTIM, "")) == _fpr(key_a)))
-        say("  claimed new name pinned  : %s" % (CLAIMED_NEW in pins))
-        say("  pin store names          : %s" % sorted(pins))
+        say("  %s migrated to key A       : %s"
+            % (CLAIMED_NEW, _fpr(pins.get(CLAIMED_NEW, "")) == _fpr(key_a)))
+        say("  tombstone %s -> %s         : %s"
+            % (VICTIM, CLAIMED_NEW,
+               renames.get(VICTIM, {}).get("new") == CLAIMED_NEW))
+        say("  pin store names            : %s" % sorted(pins))
         if _fpr(pins.get(VICTIM, "")) != _fpr(key_a):
-            failures.append("pin for %s was mutated" % VICTIM)
-        if CLAIMED_NEW in pins:
-            failures.append("claimed new name %r was pinned" % CLAIMED_NEW)
+            failures.append("source pin for %s was not retained" % VICTIM)
+        if _fpr(pins.get(CLAIMED_NEW, "")) != _fpr(key_a):
+            failures.append("verified control arm did not migrate %s -> %s"
+                            % (VICTIM, CLAIMED_NEW))
+        if renames.get(VICTIM, {}).get("new") != CLAIMED_NEW:
+            failures.append("no tombstone recorded for the migration")
+        if sorted(pins) != sorted((VICTIM, CLAIMED_NEW)):
+            failures.append("unexpected pins (a mismatch arm mutated the "
+                            "store): %s" % sorted(pins))
         say()
 
         if failures:
@@ -231,7 +250,10 @@ def rehearse(out=sys.stdout, keep=False):
         return {"ok": not failures, "root": root, "failures": failures,
                 "attack": {"verdict": verdict, "log": log},
                 "control": {"verdict": verdict2, "log": log2},
-                "forged_hint": {"verdict": verdict3, "log": log3}}
+                "forged_hint": {"verdict": verdict3, "log": log3},
+                "migrated": {"new_pinned":
+                             _fpr(mesh._load_pins(receiver).get(
+                                 CLAIMED_NEW, "")) == _fpr(key_a)}}
     finally:
         if not keep:
             shutil.rmtree(root, ignore_errors=True)

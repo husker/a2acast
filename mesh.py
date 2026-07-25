@@ -1718,6 +1718,83 @@ def _bind_peer(cfg, node, pub):
             pass
 
 
+RENAMES_NAME = ".meshwire.renames.json"
+RENAMES_FILE_MAX = 256 * 1024
+
+
+def renames_file(cfg):
+    return os.path.join(cfg["_dir"], RENAMES_NAME)
+
+
+def _load_renames(cfg):
+    """Tombstone ledger: old name -> its one-and-only migration (#93
+    Phase B-prime). Growth needs a KEY-VERIFIED rename from a PINNED
+    source, so it is bounded by the pin store; the byte cap is the
+    same store discipline as everything else fed by the wire (#106)."""
+    try:
+        value = _load_json_regular(renames_file(cfg), require_private=False,
+                                   max_bytes=RENAMES_FILE_MAX)
+    except (OSError, ValueError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _migrate_pin(cfg, old, new, head):
+    """#93 Phase B-prime: carry a KEY-VERIFIED rename's pin to the new
+    name and tombstone the old one. Every refusal is loud and names the
+    frame (`head` carries the id). Invariants, from the recorded design:
+    `old` is the SIGNED sender (the caller passes frm, never ctl['old']);
+    monotonic -- one migration per old name, ever, so a replayed or
+    conflicting rename can never flip a migration (never FROM a
+    tombstone); a tombstoned name is never a migration TARGET either;
+    _bind_peer's never-silently-replace invariant decides target
+    conflicts; continuity tier (owner-certified vs TOFU) is inherited by
+    RECORD -- the cert itself stays bound to the old name until the
+    owner re-mints."""
+    src_key = _pinned_peer_key(cfg, old)
+    if src_key is None:
+        # verdict said verified but no pin exists (harness-driven or a
+        # corrupted store): nothing to carry, keep it an observation.
+        print(f"{head} WOULD_MIGRATE (source pin missing -- nothing to "
+              f"migrate)", file=sys.stderr)
+        return
+    renames = _load_renames(cfg)
+    prior = renames.get(old)
+    if isinstance(prior, dict):
+        if prior.get("new") == new:
+            print(f"{head} ALREADY_MIGRATED (replay of a recorded "
+                  f"migration; ledger unchanged)", file=sys.stderr)
+        else:
+            print(f"{head} REFUSED_TOMBSTONE ('{_single_line(old)}' "
+                  f"already migrated to "
+                  f"'{_single_line(str(prior.get('new')))}' -- a second "
+                  f"migration FROM a tombstone never happens)",
+                  file=sys.stderr)
+        return
+    if isinstance(renames.get(new), dict):
+        print(f"{head} REFUSED_TOMBSTONE (target "
+              f"'{_single_line(new)}' is itself a tombstoned name)",
+              file=sys.stderr)
+        return
+    try:
+        _bind_peer(cfg, new, src_key)
+    except ValueError:
+        print(f"{head} TARGET_PIN_CONFLICT (target name is pinned to a "
+              f"DIFFERENT key -- a rename cannot steal a name; no "
+              f"migration)", file=sys.stderr)
+        return
+    except RuntimeError as exc:
+        print(f"{head} REFUSED ({_single_line(str(exc))}; no migration)",
+              file=sys.stderr)
+        return
+    renames[old] = {"new": new, "fpr": _key_fingerprint(src_key),
+                    "iat": int(time.time()),
+                    "certified": _cert_for_key(cfg, src_key) is not None}
+    _write_json_secure(renames_file(cfg), renames)
+    print(f"{head} MIGRATED (pin carried to '{_single_line(new)}'; "
+          f"'{_single_line(old)}' tombstoned)", file=sys.stderr)
+
+
 def _node_sig_message(cfg, relay_topic, timestamp, payload):
     """The exact bytes a node signature covers: the wire AAD (mesh id, relay
     topic, timestamp) then the canonical payload. AAD first is the whole
@@ -7273,15 +7350,14 @@ def _handle_control(cfg, me, frm, ctl, verdict=None, ev=None):
                   posture=ctl.get("posture"))
         return f"MESH_NODE_JOINED node={_single_line(frm)}"
     if kind == "rename":
-        # #93/#76 slice 2, LOG-ONLY: a node announces old->new signed by its
-        # UNCHANGED key, sent AS the old name so the signature verifies
-        # against the pin peers already hold. In Phase A we OBSERVE and log
-        # WOULD_MIGRATE -- we migrate no pin and write no tombstone; real
-        # migration is a gated later phase. Continuity is only as strong as
-        # the source pin (B3): a verified source is a real key-continuity
-        # rename, anything else is an unproven claim. `old` is the SIGNED
-        # frm, never ctl['old'] (which is not even minted) -- reading an
-        # unauthenticated old would be a pin hijack.
+        # #93: a node announces old->new signed by its UNCHANGED key,
+        # sent AS the old name so the signature verifies against the pin
+        # peers already hold. A VERIFIED source migrates (Phase B-prime,
+        # _migrate_pin -- monotonic, tombstoned, never a silent replace);
+        # anything else stays an observation. Continuity is only as
+        # strong as the source pin (B3). `old` is the SIGNED frm, never
+        # ctl['old'] -- reading an unauthenticated old would be a
+        # pin hijack.
         old, new = frm, ctl.get("new")
         if not isinstance(new, str) or not new or new == BROADCAST:
             return None
@@ -7292,8 +7368,9 @@ def _handle_control(cfg, me, frm, ctl, verdict=None, ev=None):
         fid = _single_line(ev.get("id")) if isinstance(ev, dict) else "?"
         head = f"MESH_RENAME id={fid} {_single_line(old)} -> {_single_line(new)}"
         if verdict == FRAME_VERIFIED:
-            print(f"{head} WOULD_MIGRATE (key-verified; Phase A log-only, "
-                  f"pin NOT migrated)", file=sys.stderr)
+            # #93 Phase B-prime: verified continuity now MIGRATES (the
+            # gated later phase, shipped). All refusal paths stay loud.
+            _migrate_pin(cfg, old, new, head)
         elif verdict == FRAME_MISMATCH:
             # A DIFFERENT key than the one pinned for `old` is asking the
             # fleet to carry old's identity to `new` -- the exact
