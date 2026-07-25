@@ -6487,6 +6487,8 @@ class DowngradeRatchetObserveTests(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         self.cfg = make_cfg(self._tmp.name)
+        mesh._downgrade_last.clear()
+        self.addCleanup(mesh._downgrade_last.clear)
 
     @staticmethod
     def _fake_pub(fill):
@@ -6529,6 +6531,32 @@ class DowngradeRatchetObserveTests(unittest.TestCase):
         before = sorted(os.listdir(self.cfg["_dir"]))
         self._observe("beta", mesh.FRAME_UNSIGNED)
         self.assertEqual(sorted(os.listdir(self.cfg["_dir"])), before)
+
+    def test_downgrade_is_throttled_per_peer(self):
+        # bastion seat: a node that genuinely can't sign must not emit one
+        # line per frame -- throttle per peer, first sight always logs.
+        self._pin("beta")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            mesh._observe_downgrade(self.cfg, "beta", mesh.FRAME_UNSIGNED,
+                                    now=1.0)
+            mesh._observe_downgrade(self.cfg, "beta", mesh.FRAME_UNSIGNED,
+                                    now=5.0)
+            mesh._observe_downgrade(
+                self.cfg, "beta", mesh.FRAME_UNSIGNED,
+                now=1.0 + mesh.DOWNGRADE_LOG_INTERVAL + 1)
+        self.assertEqual(err.getvalue().count("MESH_DOWNGRADE"), 2)
+
+    def test_downgrade_throttle_is_per_peer_not_global(self):
+        self._pin("beta")
+        self._pin("gamma")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            mesh._observe_downgrade(self.cfg, "beta", mesh.FRAME_UNSIGNED,
+                                    now=1.0)
+            mesh._observe_downgrade(self.cfg, "gamma", mesh.FRAME_UNSIGNED,
+                                    now=1.0)
+        self.assertEqual(err.getvalue().count("MESH_DOWNGRADE"), 2)
 
     def test_enforcement_is_not_wired_into_delivery(self):
         # the recorded #74 hard gate: no verdict may gate delivery until
