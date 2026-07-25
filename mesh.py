@@ -1910,10 +1910,26 @@ def _my_revlist_iat(cfg):
     return iat if isinstance(iat, int) and not isinstance(iat, bool) else None
 
 
+def _revlist_freshness_enabled(cfg):
+    """Whether this node may stamp the freshness `rl` field. It is a NEW
+    signed wrapper field, and a peer still on the pre-#120 fixed-field
+    rebuild MISMATCHES a frame that carries it (rollout ordering, recorded
+    on _frame_verdict). A node CANNOT detect a peer's version unilaterally
+    -- 0.16.1 predates #120 and the fleet runs mixed versions -- so
+    stamping is gated on an explicit operator assertion that the WHOLE
+    fleet reconstructs the base (#120), the `revlist_freshness` config
+    flag, NOT on merely holding a list (bastion seat). Off by default: a
+    fresh mesh stamps nothing and stays byte-identical to today."""
+    return bool(cfg.get("revlist_freshness"))
+
+
 def _assert_revlist_freshness(cfg, payload):
     """Return payload with a signed `rl` = adopted-list iat, or unchanged
-    when this node holds no readable list. Copies before mutating so the
-    caller's dict is untouched."""
+    when freshness stamping is not enabled for this fleet or this node
+    holds no readable list. Copies before mutating so the caller's dict is
+    untouched."""
+    if not _revlist_freshness_enabled(cfg):
+        return payload
     iat = _my_revlist_iat(cfg)
     if iat is None:
         return payload
