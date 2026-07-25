@@ -7735,19 +7735,39 @@ class MeshMCPServer:
             else:
                 raise ValueError(f"unknown tool {name}")
         except Exception as exc:
+            # No piggyback on errors: the delivery stays buffered for the
+            # next successful surface rather than riding a result the
+            # harness may treat as noise.
             self._respond(mid, {"content": [{"type": "text",
                                              "text": f"error: {exc}"}],
                                 "isError": True})
             return
+        if name != "mesh_pending":
+            # #121 (the cookbook's key delivery line): deliveries that
+            # arrived mid-turn ride THIS tool result instead of waiting
+            # for a mesh_pending poll -- push delivery inside the
+            # tool-use loop. Same drain, same lock, same render as
+            # mesh_pending, so surfacing clears exactly like a poll and
+            # there is one rendering path to keep honest.
+            drained = self._drain_pending()
+            if drained is not None:
+                text += ("\n\n[a2acast: deliveries arrived while you "
+                         "worked -- surfaced here instead of waiting for "
+                         "mesh_pending]\n" + drained)
         self._respond(mid, {"content": [{"type": "text", "text": text}]})
 
-    def _tool_pending(self):
+    def _drain_pending(self):
+        """Drain and render the delivery buffer; None when it is empty."""
         with self._buf_lock:
             items = self._buf[:]
             self._buf.clear()
         if not items:
-            return "(no pending deliveries)"
+            return None
         return json.dumps(items, indent=2)
+
+    def _tool_pending(self):
+        drained = self._drain_pending()
+        return drained if drained is not None else "(no pending deliveries)"
 
     def _tool_reply(self, args):
         task_id = args.get("task_id")

@@ -7786,6 +7786,59 @@ class MCPServeTests(unittest.TestCase):
         self.assertIn("no pending",
                       self._sent(out)[0]["result"]["content"][0]["text"])
 
+    def test_deliveries_piggyback_on_any_tool_result(self):
+        # #121 (the cookbook key line): a delivery buffered mid-turn rides
+        # the next tool result instead of waiting for a mesh_pending poll.
+        srv, out = self._server()
+        self._initialize(srv, out, sampling=False)
+        srv.deliver({"kind": "message", "from": "beta", "text": "mid-turn"})
+        with mock.patch.object(mesh, "send_raw",
+                               lambda *a, **k: {"id": "m9"}):
+            srv.handle({"jsonrpc": "2.0", "id": 21, "method": "tools/call",
+                        "params": {"name": "mesh_send",
+                                   "arguments": {"to": "beta",
+                                                 "message": "hi"}}})
+        text = self._sent(out)[0]["result"]["content"][0]["text"]
+        self.assertIn("sent to beta", text)   # the tool's own result first
+        self.assertIn("mid-turn", text)       # then the piggybacked delivery
+        out.clear()
+        # surfaced means CLEARED: a follow-up poll must not repeat it
+        srv.handle({"jsonrpc": "2.0", "id": 22, "method": "tools/call",
+                    "params": {"name": "mesh_pending", "arguments": {}}})
+        self.assertIn("no pending",
+                      self._sent(out)[0]["result"]["content"][0]["text"])
+
+    def test_error_results_do_not_consume_deliveries(self):
+        # A failed call may be handled differently by the harness; the
+        # delivery stays buffered for the next successful surface.
+        srv, out = self._server()
+        self._initialize(srv, out, sampling=False)
+        srv.deliver({"kind": "message", "from": "beta", "text": "keep me"})
+        srv.handle({"jsonrpc": "2.0", "id": 23, "method": "tools/call",
+                    "params": {"name": "mesh_reply",
+                               "arguments": {"task_id": "nope",
+                                             "result": "x"}}})
+        resp = self._sent(out)[0]["result"]
+        self.assertTrue(resp.get("isError"))
+        self.assertNotIn("keep me", resp["content"][0]["text"])
+        out.clear()
+        srv.handle({"jsonrpc": "2.0", "id": 24, "method": "tools/call",
+                    "params": {"name": "mesh_pending", "arguments": {}}})
+        self.assertIn("keep me",
+                      self._sent(out)[0]["result"]["content"][0]["text"])
+
+    def test_quiet_buffer_leaves_tool_results_untouched(self):
+        srv, out = self._server()
+        self._initialize(srv, out, sampling=False)
+        with mock.patch.object(mesh, "send_raw",
+                               lambda *a, **k: {"id": "m9"}):
+            srv.handle({"jsonrpc": "2.0", "id": 25, "method": "tools/call",
+                        "params": {"name": "mesh_send",
+                                   "arguments": {"to": "beta",
+                                                 "message": "hi"}}})
+        text = self._sent(out)[0]["result"]["content"][0]["text"]
+        self.assertNotIn("deliveries arrived", text)
+
     def test_mesh_reply_sends_result_envelope(self):
         srv, out = self._server()
         self._initialize(srv, out, sampling=False)
