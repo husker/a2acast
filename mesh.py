@@ -11813,7 +11813,28 @@ def cmd_integrate(args):
 
 
 
+def _degrade_strict_stdio():
+    """#98: stock Windows consoles hand Python a cp1252 stdout with
+    errors='strict', so echoing user text (message bodies) can raise
+    UnicodeEncodeError AFTER a frame already shipped -- exit 1 for a
+    delivered send, and every exit-code-keyed caller retries into
+    duplicate frames. Degrade strict std streams to errors='replace'
+    once, at CLI entry: the wire is UTF-8 JSON and unaffected; only the
+    local echo loses glyphs. Streams with a non-strict policy (stderr
+    ships as backslashreplace) were tuned deliberately and stay as-is."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            if (getattr(stream, "errors", None) or "strict") == "strict":
+                reconfigure(errors="replace")
+        except (ValueError, OSError):
+            pass
+
+
 def main():
+    _degrade_strict_stdio()
     ap = argparse.ArgumentParser(
         prog="mesh",
         description="Zero-infrastructure messaging between AI agent sessions "
