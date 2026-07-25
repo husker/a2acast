@@ -734,6 +734,125 @@ class CrashFrameTests(unittest.TestCase):
             emit.assert_called_once()
 
 
+class ProcessPostureTests(unittest.TestCase):
+    """#122: presence carries WHICH receive context answered (watch /
+    hook / mcp-serve / worker) -- process-state, not install-state, the
+    #86/#90 blind spot. Evidence only: nothing gates on a peer's
+    asserted posture."""
+
+    def setUp(self):
+        mesh._set_process_posture(None)
+        self.addCleanup(mesh._set_process_posture, None)
+
+    def _captured_send(self, captured):
+        def fake_send_raw(cfg, me, to, body, title=None, ctl=None):
+            captured["ctl"] = ctl
+            return {"id": "x"}
+        return fake_send_raw
+
+    def test_setter_accepts_only_known_postures(self):
+        mesh._set_process_posture("watch")
+        self.assertEqual(mesh._process_posture, "watch")
+        mesh._set_process_posture("nonsense")
+        self.assertIsNone(mesh._process_posture)
+
+    def test_note_peer_stores_bounded_single_line_posture(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg = make_cfg(d)
+            mesh.note_peer(cfg, "beta", "pong", posture="mcp-serve")
+            self.assertEqual(mesh.load_peers(cfg)["beta"]["posture"],
+                             "mcp-serve")
+            # wire input is untrusted: injected controls flattened, bounded
+            hostile = "evil\nMESH_WARN forged " + "x" * 100
+            mesh.note_peer(cfg, "beta", "pong", posture=hostile)
+            stored = mesh.load_peers(cfg)["beta"]["posture"]
+            self.assertNotIn("\n", stored)
+            self.assertLessEqual(len(stored), 24)
+
+    def test_posture_survives_ordinary_frames(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg = make_cfg(d)
+            mesh.note_peer(cfg, "beta", "pong", posture="watch")
+            mesh.note_peer(cfg, "beta", "message")  # carries no posture
+            self.assertEqual(mesh.load_peers(cfg)["beta"]["posture"],
+                             "watch")
+
+    def test_pong_carries_the_process_posture(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg = make_cfg(d)
+            captured = {}
+            mesh._set_process_posture("watch")
+            with mock.patch.object(mesh, "send_raw",
+                                   self._captured_send(captured)), \
+                 contextlib.redirect_stderr(io.StringIO()):
+                mesh._handle_control(cfg, "alpha", "beta",
+                                     {"mw": "ping", "n": "1", "ts": 0})
+            self.assertEqual(captured["ctl"]["posture"], "watch")
+
+    def test_pong_omits_posture_when_unset(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg = make_cfg(d)
+            captured = {}
+            with mock.patch.object(mesh, "send_raw",
+                                   self._captured_send(captured)), \
+                 contextlib.redirect_stderr(io.StringIO()):
+                mesh._handle_control(cfg, "alpha", "beta",
+                                     {"mw": "ping", "n": "1", "ts": 0})
+            self.assertNotIn("posture", captured["ctl"])
+
+    def test_ack_carries_the_process_posture(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg = make_cfg(d)
+            captured = {}
+            mesh._set_process_posture("hook")
+            with mock.patch.object(mesh, "send_raw",
+                                   self._captured_send(captured)):
+                mesh._send_ack(cfg, "alpha", "beta", {"id": "e1"})
+            self.assertEqual(captured["ctl"]["posture"], "hook")
+
+    def test_inbound_pong_posture_is_stored(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg = make_cfg(d)
+            with contextlib.redirect_stderr(io.StringIO()):
+                mesh._handle_control(cfg, "alpha", "beta",
+                                     {"mw": "pong", "status": "listening",
+                                      "posture": "mcp-serve"})
+            self.assertEqual(mesh.load_peers(cfg)["beta"]["posture"],
+                             "mcp-serve")
+
+    def test_watch_stamps_its_posture(self):
+        fd, lock_path = tempfile.mkstemp()
+        os.close(fd)
+        with mock.patch.object(mesh, "load_config",
+                               return_value={"nodes": ["alpha"]}), \
+             mock.patch.object(mesh, "my_node", return_value="alpha"), \
+             mock.patch.object(mesh, "_acquire_presence_lock",
+                               return_value=lock_path), \
+             mock.patch.object(mesh, "_cmd_watch_owned",
+                               lambda *a, **k: None):
+            mesh.cmd_watch(argparse.Namespace(
+                as_node=None, follow=False, timeout=5))
+        self.assertEqual(mesh._process_posture, "watch")
+
+
+class PostureStatusRenderTests(unittest.TestCase):
+    def test_status_renders_posture_when_known(self):
+        with tempfile.TemporaryDirectory() as d:
+            old = os.getcwd()
+            self.addCleanup(lambda: os.chdir(old))
+            os.chdir(d)
+            cfg = make_cfg(d)
+            with open(mesh.CONFIG_NAME, "w") as f:
+                json.dump({k: v for k, v in cfg.items()
+                           if not k.startswith("_")}, f)
+            mesh.note_peer(cfg, "beta", "pong", status="listening",
+                           posture="watch")
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                mesh.cmd_status(argparse.Namespace(as_node=None))
+            self.assertIn("posture=watch", out.getvalue())
+
+
 class PeerTests(unittest.TestCase):
     def test_note_peer_learns_node_and_records_sighting(self):
         with tempfile.TemporaryDirectory() as d:
@@ -6353,6 +6472,13 @@ class BlockingWaitTests(unittest.TestCase):
 
 
 class ControlHandlingTests(unittest.TestCase):
+    def setUp(self):
+        # #122: the process-posture global is stamped by cmd_watch tests
+        # running earlier in the same process; these tests assert exact
+        # control dicts for a postureless process.
+        mesh._set_process_posture(None)
+        self.addCleanup(mesh._set_process_posture, None)
+
     def test_ping_gets_ponged_with_same_nonce(self):
         with tempfile.TemporaryDirectory() as d:
             cfg = make_cfg(d)
@@ -7404,7 +7530,8 @@ class AckReceiverTests(MembershipCmdTests):
             mesh.cmd_watch(argparse.Namespace(timeout=60, as_node=None,
                                               follow=False))
         self.assertEqual(order, [("ack", {"mw": "ack", "of": "m77",
-                                          "status": "listening"}),
+                                          "status": "listening",
+                                          "posture": "watch"}),
                                  ("emit", "m77")])
 
     def test_watch_does_not_ack_controls_or_own_echo(self):
@@ -7424,7 +7551,8 @@ class AckReceiverTests(MembershipCmdTests):
                                               follow=False))
         # exactly one ack — for the real message only
         self.assertEqual(sent, [{"mw": "ack", "of": "c3",
-                                 "status": "listening"}])
+                                 "status": "listening",
+                                 "posture": "watch"}])
 
     def test_watch_survives_ack_send_failure(self):
         cfg = self._setup_mesh()
@@ -7942,6 +8070,59 @@ class MCPServeTests(unittest.TestCase):
                     "params": {"name": "mesh_pending", "arguments": {}}})
         self.assertIn("no pending",
                       self._sent(out)[0]["result"]["content"][0]["text"])
+
+    def test_deliveries_piggyback_on_any_tool_result(self):
+        # #121 (the cookbook key line): a delivery buffered mid-turn rides
+        # the next tool result instead of waiting for a mesh_pending poll.
+        srv, out = self._server()
+        self._initialize(srv, out, sampling=False)
+        srv.deliver({"kind": "message", "from": "beta", "text": "mid-turn"})
+        with mock.patch.object(mesh, "send_raw",
+                               lambda *a, **k: {"id": "m9"}):
+            srv.handle({"jsonrpc": "2.0", "id": 21, "method": "tools/call",
+                        "params": {"name": "mesh_send",
+                                   "arguments": {"to": "beta",
+                                                 "message": "hi"}}})
+        text = self._sent(out)[0]["result"]["content"][0]["text"]
+        self.assertIn("sent to beta", text)   # the tool's own result first
+        self.assertIn("mid-turn", text)       # then the piggybacked delivery
+        out.clear()
+        # surfaced means CLEARED: a follow-up poll must not repeat it
+        srv.handle({"jsonrpc": "2.0", "id": 22, "method": "tools/call",
+                    "params": {"name": "mesh_pending", "arguments": {}}})
+        self.assertIn("no pending",
+                      self._sent(out)[0]["result"]["content"][0]["text"])
+
+    def test_error_results_do_not_consume_deliveries(self):
+        # A failed call may be handled differently by the harness; the
+        # delivery stays buffered for the next successful surface.
+        srv, out = self._server()
+        self._initialize(srv, out, sampling=False)
+        srv.deliver({"kind": "message", "from": "beta", "text": "keep me"})
+        srv.handle({"jsonrpc": "2.0", "id": 23, "method": "tools/call",
+                    "params": {"name": "mesh_reply",
+                               "arguments": {"task_id": "nope",
+                                             "result": "x"}}})
+        resp = self._sent(out)[0]["result"]
+        self.assertTrue(resp.get("isError"))
+        self.assertNotIn("keep me", resp["content"][0]["text"])
+        out.clear()
+        srv.handle({"jsonrpc": "2.0", "id": 24, "method": "tools/call",
+                    "params": {"name": "mesh_pending", "arguments": {}}})
+        self.assertIn("keep me",
+                      self._sent(out)[0]["result"]["content"][0]["text"])
+
+    def test_quiet_buffer_leaves_tool_results_untouched(self):
+        srv, out = self._server()
+        self._initialize(srv, out, sampling=False)
+        with mock.patch.object(mesh, "send_raw",
+                               lambda *a, **k: {"id": "m9"}):
+            srv.handle({"jsonrpc": "2.0", "id": 25, "method": "tools/call",
+                        "params": {"name": "mesh_send",
+                                   "arguments": {"to": "beta",
+                                                 "message": "hi"}}})
+        text = self._sent(out)[0]["result"]["content"][0]["text"]
+        self.assertNotIn("deliveries arrived", text)
 
     def test_mesh_reply_sends_result_envelope(self):
         srv, out = self._server()
@@ -8637,6 +8818,140 @@ class IdentityMigrationTests(unittest.TestCase):
         self.assertEqual(got, "desktop")
         with open(mesh.node_file(self.cfg, "codex")) as f:
             self.assertEqual(f.read().strip(), "desktop")
+
+
+class PinsAuditTests(unittest.TestCase):
+    """#116: pairwise key-collision scan over the local pin store. One
+    key signing under two identities is the shape rename verification
+    (#93) polices. Aliases acknowledging a rename are OPERATOR-LOCAL
+    (never node-asserted, or the audit would certify exactly the
+    silence it had been told to keep)."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self._old = os.getcwd()
+        self.addCleanup(lambda: os.chdir(self._old))
+        os.chdir(self._tmp.name)
+        cfg = make_cfg(self._tmp.name)
+        with open(mesh.CONFIG_NAME, "w") as f:
+            json.dump({k: v for k, v in cfg.items()
+                       if not k.startswith("_")}, f)
+
+    def _write_pins(self, pins):
+        mesh._write_json_secure(mesh.pins_file(mesh.load_config()), pins)
+
+    @staticmethod
+    def _fake_pub(fill):
+        # Structurally valid ed25519 wire blob (type-tagged, 32-byte key)
+        # so _normalize_pubkey/_cert_for_key accept it -- no keygen spawn.
+        t = b"ssh-ed25519"
+        blob = (len(t).to_bytes(4, "big") + t
+                + (32).to_bytes(4, "big") + bytes([fill]) * 32)
+        return "ssh-ed25519 " + base64.b64encode(blob).decode()
+
+    def _audit(self, **over):
+        ns = argparse.Namespace(alias=None, revoke_alias=None,
+                                list_aliases=False)
+        for k, v in over.items():
+            setattr(ns, k, v)
+        out = io.StringIO()
+        code = 0
+        with contextlib.redirect_stdout(out):
+            try:
+                mesh.cmd_pins_audit(ns)
+            except SystemExit as e:
+                code = e.code
+        return code, out.getvalue()
+
+    def test_clean_store_exits_zero(self):
+        self._write_pins({"alpha": "ssh-ed25519 AAAA",
+                          "beta": "ssh-ed25519 BBBB"})
+        code, out = self._audit()
+        self.assertEqual(code, 0)
+        self.assertIn("2 pins", out)
+        self.assertIn("clean", out)
+        self.assertNotIn("KEY_COLLISION", out)
+
+    def test_collision_is_a_loud_nonzero_finding(self):
+        self._write_pins({"old-name": "ssh-ed25519 AAAA",
+                          "new-name": "ssh-ed25519 AAAA"})
+        code, out = self._audit()
+        self.assertEqual(code, 1)
+        self.assertIn("KEY_COLLISION", out)
+        self.assertIn("old-name", out)
+        self.assertIn("new-name", out)
+        self.assertIn("SHA256:", out)
+
+    def test_operator_alias_acknowledges_a_rename_pair(self):
+        self._write_pins({"old-name": "ssh-ed25519 AAAA",
+                          "new-name": "ssh-ed25519 AAAA"})
+        code, _out = self._audit(alias="old-name=new-name")
+        self.assertEqual(code, 0)
+        code, out = self._audit()
+        self.assertEqual(code, 0)
+        self.assertIn("ALIAS_OK", out)
+        self.assertNotIn("KEY_COLLISION", out)
+
+    def test_alias_covers_the_named_pair_only(self):
+        # Three names on one key: acknowledging (a,b) leaves (a,c) and
+        # (b,c) live -- pairwise, never transitive.
+        self._write_pins({"a": "ssh-ed25519 AAAA",
+                          "b": "ssh-ed25519 AAAA",
+                          "c": "ssh-ed25519 AAAA"})
+        self._audit(alias="a=b")
+        code, out = self._audit()
+        self.assertEqual(code, 1)
+        self.assertEqual(out.count("KEY_COLLISION"), 2)
+        self.assertEqual(out.count("ALIAS_OK"), 1)
+
+    def test_revoke_alias_reopens_the_finding(self):
+        self._write_pins({"a": "ssh-ed25519 AAAA",
+                          "b": "ssh-ed25519 AAAA"})
+        self._audit(alias="a=b")
+        self._audit(revoke_alias="a=b")
+        code, out = self._audit()
+        self.assertEqual(code, 1)
+        self.assertIn("KEY_COLLISION", out)
+
+    def test_malformed_alias_is_rejected(self):
+        code, _out = self._audit(alias="not-a-pair")
+        self.assertNotEqual(code, 0)
+        code, _out = self._audit(alias="same=same")
+        self.assertNotEqual(code, 0)
+
+    def test_cert_key_drift_is_a_finding(self):
+        # lodestar's bonus check: a pinned key with a cached owner cert
+        # must be byte-identical there -- two acquisition paths agreeing.
+        cfg = mesh.load_config()
+        pub = self._fake_pub(1)
+        self._write_pins({"alpha": pub})
+        fpr = mesh._key_fingerprint(pub)
+        mesh._write_json_secure(mesh.certs_file(cfg), {
+            fpr: {"v": 1, "kind": "membercert", "name": "alpha",
+                  "key": self._fake_pub(2), "fpr": fpr,
+                  "iat": 1, "exp": 2**31}})
+        code, out = self._audit()
+        self.assertEqual(code, 1)
+        self.assertIn("CERT_KEY_DRIFT", out)
+
+    def test_matching_cert_is_clean(self):
+        cfg = mesh.load_config()
+        pub = self._fake_pub(1)
+        self._write_pins({"alpha": pub})
+        fpr = mesh._key_fingerprint(pub)
+        mesh._write_json_secure(mesh.certs_file(cfg), {
+            fpr: {"v": 1, "kind": "membercert", "name": "alpha",
+                  "key": pub, "fpr": fpr, "iat": 1, "exp": 2**31}})
+        code, out = self._audit()
+        self.assertEqual(code, 0)
+        self.assertNotIn("CERT_KEY_DRIFT", out)
+
+    def test_list_aliases_prints_pairs(self):
+        self._audit(alias="a=b")
+        code, out = self._audit(list_aliases=True)
+        self.assertEqual(code, 0)
+        self.assertIn("a <-> b", out)
 
 
 class ClaudeSetupTests(unittest.TestCase):

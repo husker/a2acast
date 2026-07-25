@@ -2796,6 +2796,28 @@ def status_file(cfg, node):
     return os.path.join(cfg["_dir"], STATUS_NAME.format(node))
 
 
+PROCESS_POSTURES = ("watch", "hook", "mcp-serve", "mcp", "worker")
+_process_posture = None
+
+
+def _set_process_posture(posture):
+    """#122: which long-running receive context this process is. Rides
+    outbound pong/ack control frames so the fleet can observe WHAT is
+    listening on a node, not merely that it was seen -- process-state vs
+    install-state, the #86/#90 blind spot. Evidence only: nothing may
+    ever gate on a peer's asserted posture (a lying posture buys
+    nothing)."""
+    global _process_posture
+    _process_posture = posture if posture in PROCESS_POSTURES else None
+
+
+def _stamp_posture(ctl):
+    """Add this process's posture to an outbound control dict, when set."""
+    if _process_posture:
+        ctl["posture"] = _process_posture
+    return ctl
+
+
 def local_status(cfg, node):
     try:
         with open(status_file(cfg, node), "r", encoding="utf-8") as f:
@@ -2869,7 +2891,7 @@ def _prune_peers(cfg, peers, keep_node, now=None):
     return kept
 
 
-def note_peer(cfg, node, via, status=None):
+def note_peer(cfg, node, via, status=None, posture=None):
     """Record a live sighting of `node`; learn unknown nodes into the config.
 
     Membership is dynamic: any authenticated message teaches us its sender.
@@ -2908,6 +2930,9 @@ def note_peer(cfg, node, via, status=None):
     peer.update({"seen": now, "via": via})
     if status in PRESENCE_STATES:
         peer.update({"status": status, "status_seen": now})
+    if isinstance(posture, str) and posture:
+        # #122: untrusted wire input -- flatten and bound before storing.
+        peer.update({"posture": _single_line(posture)[:24]})
     peers[node] = peer
     peers = _prune_peers(cfg, peers, node, now)  # #106: bound on write
     with open(peers_file(cfg), "w", encoding="utf-8") as f:
@@ -6095,6 +6120,119 @@ def cmd_owner_check(args):
           "the passphrase at a terminal (attended-mint property in force)")
 
 
+def _parse_alias_pair(raw):
+    """OLD=NEW -> a sorted two-name pair; loud rejection otherwise."""
+    if not isinstance(raw, str) or raw.count("=") != 1:
+        sys.exit("error: alias must be OLD=NEW (two node names)")
+    a, b = (part.strip() for part in raw.split("="))
+    if not a or not b or a == b:
+        sys.exit("error: alias must name two DIFFERENT nodes")
+    return sorted((a, b))
+
+
+def _load_pin_aliases(cfg):
+    """Operator-acknowledged rename pairs. PROVENANCE is the load-bearing
+    property (#116, lodestar): entries enter via `mesh pins-audit
+    --alias` at this keyboard -- never from the wire and never from the
+    pinned subject, or a key signing under one name could declare its
+    second name a "known rename" and suppress exactly the collision the
+    audit exists to surface."""
+    out = set()
+    pairs = cfg.get("pin_aliases")
+    if isinstance(pairs, list):
+        for pair in pairs:
+            if (isinstance(pair, list) and len(pair) == 2
+                    and all(isinstance(n, str) and n for n in pair)
+                    and pair[0] != pair[1]):
+                out.add(frozenset(pair))
+    return out
+
+
+def cmd_pins_audit(args):
+    """#116: pairwise key-equality scan across the local pin table.
+    What it catches: one key signing under two identities -- the shape
+    rename verification (#93) exists to police. What it re-derives for
+    free: every legitimate rename's key-equality evidence, from local
+    state only. Log-only observation, mutates nothing; exit 0 iff every
+    collision is an operator-acknowledged alias."""
+    cfg = load_config()
+    if getattr(args, "alias", None):
+        pair = _parse_alias_pair(args.alias)
+
+        def _add(latest):
+            latest.setdefault("pin_aliases", [])
+            if pair not in latest["pin_aliases"]:
+                latest["pin_aliases"].append(pair)
+        _mutate_config(cfg, _add)
+        print(f"pin alias acknowledged: {pair[0]} <-> {pair[1]}")
+        return
+    if getattr(args, "revoke_alias", None):
+        pair = _parse_alias_pair(args.revoke_alias)
+
+        def _drop(latest):
+            latest.setdefault("pin_aliases", [])
+            if pair in latest["pin_aliases"]:
+                latest["pin_aliases"].remove(pair)
+        _mutate_config(cfg, _drop)
+        print(f"pin alias revoked: {pair[0]} <-> {pair[1]}")
+        return
+    aliases = _load_pin_aliases(cfg)
+    if getattr(args, "list_aliases", False):
+        if aliases:
+            for pair in sorted(sorted(p) for p in aliases):
+                print(f"{pair[0]} <-> {pair[1]}")
+        else:
+            print("(no acknowledged aliases)")
+        return
+    pins = _load_pins(cfg)
+    by_key = {}
+    for name, pub in pins.items():
+        if isinstance(pub, str) and pub.strip():
+            by_key.setdefault(pub.strip(), []).append(name)
+    print(f"pins-audit: {len(pins)} pins, {len(by_key)} distinct keys")
+    findings = 0
+    for pub in sorted(by_key, key=lambda k: sorted(by_key[k])):
+        names = sorted(by_key[pub])
+        if len(names) < 2:
+            continue
+        try:
+            fpr = _key_fingerprint(pub)
+        except ValueError:
+            fpr = "(unfingerprintable)"
+        for i, a in enumerate(names):
+            for b in names[i + 1:]:
+                if frozenset((a, b)) in aliases:
+                    print(f"PINS_AUDIT ALIAS_OK {a} <-> {b} {fpr} "
+                          f"(operator-acknowledged rename)")
+                else:
+                    findings += 1
+                    print(f"PINS_AUDIT KEY_COLLISION {a} <-> {b} {fpr} "
+                          f"(one key, two identities -- acknowledge a "
+                          f"#93-verified rename with `mesh pins-audit "
+                          f"--alias {a}={b}`, or investigate "
+                          f"impersonation)")
+    # lodestar's bonus consistency check: a pinned key that also appears
+    # in a cached owner cert must be byte-identical there -- two
+    # acquisition paths (wire TOFU, owner mint) agreeing.
+    for name in sorted(pins):
+        pub = pins[name]
+        if not isinstance(pub, str) or not pub.strip():
+            continue
+        cert = _cert_for_key(cfg, pub)
+        if not isinstance(cert, dict):
+            continue
+        cert_key = cert.get("key")
+        if isinstance(cert_key, str) and cert_key.strip() != pub.strip():
+            findings += 1
+            print(f"PINS_AUDIT CERT_KEY_DRIFT {name} -- the cached owner "
+                  f"cert at this pin's fingerprint carries a DIFFERENT "
+                  f"key (cache tamper or corruption)")
+    if findings:
+        print(f"pins-audit: {findings} unacknowledged finding(s)")
+        raise SystemExit(1)
+    print("pins-audit: clean")
+
+
 def cmd_owner_trust(args):
     # #87 F2: owner-key ROTATION is interactive-only, and it refuses in ANY
     # unattended POSTURE -- the --unattended flag or an armed env var alike,
@@ -7131,7 +7269,8 @@ def _handle_control(cfg, me, frm, ctl, verdict=None, ev=None):
     useful MESH_NODE_JOINED)."""
     kind = ctl.get("mw")
     if kind == "announce":
-        note_peer(cfg, frm, "announce", ctl.get("status"))
+        note_peer(cfg, frm, "announce", ctl.get("status"),
+                  posture=ctl.get("posture"))
         return f"MESH_NODE_JOINED node={_single_line(frm)}"
     if kind == "rename":
         # #93/#76 slice 2, LOG-ONLY: a node announces old->new signed by its
@@ -7172,9 +7311,9 @@ def _handle_control(cfg, me, frm, ctl, verdict=None, ev=None):
         note_peer(cfg, frm, "message", ctl.get("status"))
         try:
             send_raw(cfg, me, frm, "pong",
-                     ctl={"mw": "pong", "n": ctl.get("n"),
-                          "ts": ctl.get("ts"),
-                          "status": local_status(cfg, me)})
+                     ctl=_stamp_posture({"mw": "pong", "n": ctl.get("n"),
+                                         "ts": ctl.get("ts"),
+                                         "status": local_status(cfg, me)}))
             print(f"MESH_PING from={_single_line(frm)} (answered)",
                   file=sys.stderr)
         except (urllib.error.URLError, socket.timeout):
@@ -7182,10 +7321,12 @@ def _handle_control(cfg, me, frm, ctl, verdict=None, ev=None):
                   file=sys.stderr)
         return None
     if kind == "pong":
-        note_peer(cfg, frm, "pong", ctl.get("status"))
+        note_peer(cfg, frm, "pong", ctl.get("status"),
+                  posture=ctl.get("posture"))
         return None
     if kind == "ack":
-        note_peer(cfg, frm, "ack", ctl.get("status"))
+        note_peer(cfg, frm, "ack", ctl.get("status"),
+                  posture=ctl.get("posture"))
         return None
     if kind == "presence" and ctl.get("status") in PRESENCE_STATES:
         note_peer(cfg, frm, "presence", ctl["status"])
@@ -7213,8 +7354,8 @@ def _send_ack(cfg, me, frm, ev):
         return
     try:
         send_raw(cfg, me, frm, "ack",
-                 ctl={"mw": "ack", "of": ev.get("id"),
-                      "status": local_status(cfg, me)})
+                 ctl=_stamp_posture({"mw": "ack", "of": ev.get("id"),
+                                     "status": local_status(cfg, me)}))
     except (urllib.error.URLError, socket.timeout, UnicodeError, ValueError):
         pass
 
@@ -7260,7 +7401,8 @@ def _await_acks(cfg, me, msg_id, t0, timeout, first=None, want_all=False):
                 continue
             if frm not in [n for n, _ in got]:
                 got.append((frm, int((time.monotonic() - t0) * 1000)))
-                note_peer(cfg, frm, "ack", ctl.get("status"))
+                note_peer(cfg, frm, "ack", ctl.get("status"),
+                          posture=ctl.get("posture"))
             if not want_all:
                 return got
     except Exception:
@@ -7286,6 +7428,7 @@ def _agent_session_without_wake():
 
 
 def cmd_watch(args):
+    _set_process_posture("watch")
     cfg = load_config()
     me = my_node(cfg, args.as_node)
     if args.follow or args.timeout is None:  # long-running watch
@@ -7771,19 +7914,39 @@ class MeshMCPServer:
             else:
                 raise ValueError(f"unknown tool {name}")
         except Exception as exc:
+            # No piggyback on errors: the delivery stays buffered for the
+            # next successful surface rather than riding a result the
+            # harness may treat as noise.
             self._respond(mid, {"content": [{"type": "text",
                                              "text": f"error: {exc}"}],
                                 "isError": True})
             return
+        if name != "mesh_pending":
+            # #121 (the cookbook's key delivery line): deliveries that
+            # arrived mid-turn ride THIS tool result instead of waiting
+            # for a mesh_pending poll -- push delivery inside the
+            # tool-use loop. Same drain, same lock, same render as
+            # mesh_pending, so surfacing clears exactly like a poll and
+            # there is one rendering path to keep honest.
+            drained = self._drain_pending()
+            if drained is not None:
+                text += ("\n\n[a2acast: deliveries arrived while you "
+                         "worked -- surfaced here instead of waiting for "
+                         "mesh_pending]\n" + drained)
         self._respond(mid, {"content": [{"type": "text", "text": text}]})
 
-    def _tool_pending(self):
+    def _drain_pending(self):
+        """Drain and render the delivery buffer; None when it is empty."""
         with self._buf_lock:
             items = self._buf[:]
             self._buf.clear()
         if not items:
-            return "(no pending deliveries)"
+            return None
         return json.dumps(items, indent=2)
+
+    def _tool_pending(self):
+        drained = self._drain_pending()
+        return drained if drained is not None else "(no pending deliveries)"
 
     def _tool_reply(self, args):
         task_id = args.get("task_id")
@@ -8193,6 +8356,7 @@ def _run_mcp_server(args, label, idle_hint):
     both. Sampling (idle-session wake) only activates if the MCP client
     advertises the capability; clients that don't (Claude Desktop, Cursor, …)
     get plain pull-mode tools and pull deliveries via mesh_pending."""
+    _set_process_posture(label)
     path, how = _mcp_config_path(args)
     if not path:
         print(f"a2acast {label}: no mesh node found (tried {how}; "
@@ -9042,6 +9206,7 @@ def _emit_continuation_hook(args, harness):
 
 def _run_harness_delivery_hook(args, harness):
     """Route a delivery through the prompt contract declared by its spec."""
+    _set_process_posture("hook")
     spec = HARNESS_SPECS[harness]
     if spec.delivery_prompt == "continuation-json":
         _emit_continuation_hook(args, harness)
@@ -9239,9 +9404,12 @@ def cmd_status(args):
         if n == me:
             print(f"  {n}  (this machine)")
         elif n in peers:
+            posture = peers[n].get("posture")
+            shown = (f", posture={_single_line(str(posture))[:24]}"
+                     if isinstance(posture, str) and posture else "")
             print(f"  {n}  (last seen {_ago(peers[n]['seen'])}, "
                   f"via {peers[n]['via']}, "
-                  f"status={peers[n].get('status', 'unknown')})")
+                  f"status={peers[n].get('status', 'unknown')}{shown})")
         else:
             print(f"  {n}  (never seen)")
     print(f"me:     {me or '(unset — run `mesh iam <node>`)'}")
@@ -9287,7 +9455,8 @@ def cmd_ping(args):
             continue
         if ctl.get("mw") == "pong" and ctl.get("n") == nonce:
             rtt = int((time.monotonic() - t0) * 1000)
-            note_peer(cfg, frm or to, "pong", ctl.get("status"))
+            note_peer(cfg, frm or to, "pong", ctl.get("status"),
+                      posture=ctl.get("posture"))
             print(f"MESH_PONG node={frm or to} rtt={rtt}ms")
             return
     print(f"MESH_PING_TIMEOUT node={to} after {args.timeout}s -- no watcher "
@@ -11370,6 +11539,7 @@ def _update_worker_health_after_task(
 
 def _run_worker_supervisor(args):
     """Run one configured worker without consuming another node's tasks."""
+    _set_process_posture("worker")
     backend = getattr(args, "backend", None)
     if backend not in WORKER_BACKENDS:
         sys.exit(f"error: invalid backend '{backend}'")
@@ -11693,6 +11863,22 @@ def main():
                             "protected / 1 unprotected / 2 absent / 3 "
                             "probe-failed) (#110)")
     p.set_defaults(fn=cmd_owner_check)
+    p = sub.add_parser("pins-audit",
+                       help="pairwise key-collision scan over the pin "
+                            "store; exit 0 only when every collision is "
+                            "an operator-acknowledged rename alias (#116)")
+    p.add_argument("--alias", default=None, metavar="OLD=NEW",
+                   help="acknowledge a #93-verified rename pair as one "
+                        "identity (operator-local; never accepted from "
+                        "the wire)")
+    p.add_argument("--revoke-alias", dest="revoke_alias", default=None,
+                   metavar="OLD=NEW",
+                   help="withdraw an acknowledged pair")
+    p.add_argument("--list-aliases", dest="list_aliases",
+                   action="store_true",
+                   help="print acknowledged pairs")
+    p.set_defaults(fn=cmd_pins_audit)
+
     p = sub.add_parser("owner-trust",
                        help="trust the mesh owner here from its mwtrust1- "
                             "block (share it privately, like an invite)")
