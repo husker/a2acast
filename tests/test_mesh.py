@@ -3621,17 +3621,34 @@ class RevlistFreshnessTests(unittest.TestCase):
         out = mesh._assert_revlist_freshness(self.cfg, {"f": "a", "b": "hi"})
         self.assertNotIn("rl", out)
 
+    def test_adopted_list_without_enable_asserts_nothing(self):
+        # bastion seat: having a list is NOT sufficient -- stamping a new
+        # signed field before the fleet is #120-capable MISMATCHES old
+        # peers. Requires the explicit revlist_freshness opt-in.
+        self._adopt(iat=7000)
+        out = mesh._assert_revlist_freshness(
+            self.cfg, {"f": "a", "t": "b", "b": "hi"})
+        self.assertNotIn("rl", out)
+
     def test_adopted_list_stamps_signed_iat(self):
         self._adopt(iat=7000)
+        self.cfg["revlist_freshness"] = True
         payload = {"f": "a", "t": "b", "b": "hi"}
         out = mesh._assert_revlist_freshness(self.cfg, payload)
         self.assertEqual(out["rl"], 7000)
         self.assertNotIn("rl", payload)  # caller dict untouched
 
+    def test_enable_without_a_list_still_asserts_nothing(self):
+        self.cfg["revlist_freshness"] = True  # enabled but no list adopted
+        out = mesh._assert_revlist_freshness(
+            self.cfg, {"f": "a", "t": "b", "b": "hi"})
+        self.assertNotIn("rl", out)
+
     def test_stamp_rides_the_signed_base(self):
         # rl must be UNDER the node signature: _base_payload keeps it, so a
         # receiver reconstructs it and the signature covers it.
         self._adopt(iat=7000)
+        self.cfg["revlist_freshness"] = True
         stamped = mesh._assert_revlist_freshness(
             self.cfg, {"f": "a", "t": "b", "b": "hi"})
         wrapper = dict(stamped)
