@@ -837,20 +837,26 @@ class ProcessPostureTests(unittest.TestCase):
 
 class PostureStatusRenderTests(unittest.TestCase):
     def test_status_renders_posture_when_known(self):
+        old = os.getcwd()
         with tempfile.TemporaryDirectory() as d:
-            old = os.getcwd()
-            self.addCleanup(lambda: os.chdir(old))
-            os.chdir(d)
-            cfg = make_cfg(d)
-            with open(mesh.CONFIG_NAME, "w") as f:
-                json.dump({k: v for k, v in cfg.items()
-                           if not k.startswith("_")}, f)
-            mesh.note_peer(cfg, "beta", "pong", status="listening",
-                           posture="watch")
-            out = io.StringIO()
-            with contextlib.redirect_stdout(out):
-                mesh.cmd_status(argparse.Namespace(as_node=None))
-            self.assertIn("posture=watch", out.getvalue())
+            try:
+                os.chdir(d)
+                cfg = make_cfg(d)
+                with open(mesh.CONFIG_NAME, "w") as f:
+                    json.dump({k: v for k, v in cfg.items()
+                               if not k.startswith("_")}, f)
+                mesh.note_peer(cfg, "beta", "pong", status="listening",
+                               posture="watch")
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    mesh.cmd_status(argparse.Namespace(as_node=None))
+                self.assertIn("posture=watch", out.getvalue())
+            finally:
+                # Windows cannot rmtree a directory that is the process cwd,
+                # so restore cwd BEFORE the TemporaryDirectory cleanup runs
+                # at the with-block exit -- addCleanup runs too late (during
+                # tearDown, after __exit__ already tried to delete d).
+                os.chdir(old)
 
 
 class PeerTests(unittest.TestCase):
