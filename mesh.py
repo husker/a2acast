@@ -7481,31 +7481,40 @@ def _handle_control(cfg, me, frm, ctl, verdict=None, ev=None):
             pass
         return None
     if kind == "revlist-resp":
-        # #76 leg 2: a served list arrived. VERIFY the owner signature
-        # before trusting it (the block came from a possibly-hostile peer),
-        # adopt if strictly newer, and score substantiation: a peer that
-        # asserted iat=N but cannot produce a valid list with iat>=N gets a
-        # strike -- the non-suppressibility signal the #74 gate waits on.
+        # #76 leg 2: a served list arrived. Two separable decisions
+        # (bastion seat): ADOPTION is gated only on the owner signature
+        # re-verifying (the block came from a possibly-hostile carrier, but
+        # the owner sig is the trust anchor, so a valid newer list is safe
+        # to adopt from anyone -- that IS gossip). A STRIKE, which penalizes
+        # a peer and backs off pulling from it, is far stronger and requires
+        # BOTH: a signature-VERIFIED frame (never strike on an
+        # unauthenticated carrier a shared-key holder could forge AS an
+        # honest node) AND an OUTSTANDING pull we actually made to this peer
+        # (an unsolicited response, expected is None, strikes nobody).
         block = ctl.get("block")
         expected = _revpull_expect.get(frm)
+        may_strike = verdict == FRAME_VERIFIED and expected is not None
+
+        def _maybe_strike(why):
+            if may_strike:
+                _revlist_strike(frm, expected, why)
+
         if not isinstance(block, str):
-            _revlist_strike(frm, expected, "no block in response")
+            _maybe_strike("no block in response")
             return None
         ok, reason, body = _verify_revlist(cfg, block)
         if not ok:
-            _revlist_strike(frm, expected, reason)
+            _maybe_strike(reason)
             return None
-        if (isinstance(expected, int)
-                and body.get("iat", 0) < expected):
-            _revlist_strike(frm, expected,
-                            f"served iat={body.get('iat')} < asserted "
-                            f"{expected}")
+        if expected is not None and body.get("iat", 0) < expected:
+            _maybe_strike(f"served iat={body.get('iat')} < asserted "
+                          f"{expected}")
             return None
         with _revgap_lock:
             _revpull_strikes.pop(frm, None)  # substantiated: clear strikes
             _revpull_expect.pop(frm, None)
-        verdict = _note_revlist(cfg, body, block)
-        if verdict == "adopted":
+        note = _note_revlist(cfg, body, block)
+        if note == "adopted":
             print(f"MESH_REVLIST_PULLED from={_single_line(frm)} "
                   f"iat={body['iat']} n={len(body['revocations'])} "
                   f"(adopted a newer owner-signed list -- #76)",

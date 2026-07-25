@@ -3698,7 +3698,8 @@ class RevlistPullTests(unittest.TestCase):
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
             mesh._handle_control(self.cfg, "me", "beta",
-                                 {"mw": "revlist-resp", "block": block})
+                                 {"mw": "revlist-resp", "block": block},
+                                 verdict=mesh.FRAME_VERIFIED)
         got, _ = mesh._load_revlist(self.cfg)
         self.assertEqual(got["iat"], body["iat"])
         self.assertIn("MESH_REVLIST_PULLED", err.getvalue())
@@ -3710,7 +3711,8 @@ class RevlistPullTests(unittest.TestCase):
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
             mesh._handle_control(self.cfg, "me", "beta",
-                                 {"mw": "revlist-resp", "block": forged})
+                                 {"mw": "revlist-resp", "block": forged},
+                                 verdict=mesh.FRAME_VERIFIED)
         self.assertIsNone(mesh._load_revlist(self.cfg)[0])
         self.assertIn("MESH_REVLIST_UNSUBSTANTIATED", err.getvalue())
         self.assertEqual(mesh._revpull_strikes["beta"], 1)
@@ -3722,9 +3724,46 @@ class RevlistPullTests(unittest.TestCase):
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
             mesh._handle_control(self.cfg, "me", "beta",
-                                 {"mw": "revlist-resp", "block": block})
+                                 {"mw": "revlist-resp", "block": block},
+                                 verdict=mesh.FRAME_VERIFIED)
         self.assertIn("MESH_REVLIST_UNSUBSTANTIATED", err.getvalue())
         self.assertIsNone(mesh._load_revlist(self.cfg)[0])
+
+    def test_unverified_frame_never_strikes(self):
+        # bastion seat: a forged revlist-resp on an UNVERIFIED carrier must
+        # not strike the honest node it claims to be from.
+        block, body = self._mint_list()
+        forged = block[:-6] + "AAAAAA"
+        mesh._revpull_expect["beta"] = body["iat"]
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            for v in (mesh.FRAME_UNVERIFIED, mesh.FRAME_UNSIGNED,
+                      mesh.FRAME_MISMATCH, None):
+                mesh._handle_control(self.cfg, "me", "beta",
+                                     {"mw": "revlist-resp", "block": forged},
+                                     verdict=v)
+        self.assertNotIn("MESH_REVLIST_UNSUBSTANTIATED", err.getvalue())
+        self.assertNotIn("beta", mesh._revpull_strikes)
+
+    def test_unsolicited_response_strikes_nobody_but_still_adopts(self):
+        # no outstanding pull (expected is None): a valid owner-signed list
+        # is adopted (gossip), but a bad one strikes nobody.
+        block, body = self._mint_list()
+        with contextlib.redirect_stderr(io.StringIO()):
+            mesh._handle_control(self.cfg, "me", "beta",
+                                 {"mw": "revlist-resp", "block": block},
+                                 verdict=mesh.FRAME_VERIFIED)
+        self.assertEqual(mesh._load_revlist(self.cfg)[0]["iat"], body["iat"])
+        self.assertNotIn("beta", mesh._revpull_strikes)
+        # and a forged unsolicited one strikes nobody either
+        forged = block[:-6] + "AAAAAA"
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            mesh._handle_control(self.cfg, "me", "gamma",
+                                 {"mw": "revlist-resp", "block": forged},
+                                 verdict=mesh.FRAME_VERIFIED)
+        self.assertNotIn("MESH_REVLIST_UNSUBSTANTIATED", err.getvalue())
+        self.assertNotIn("gamma", mesh._revpull_strikes)
 
     def test_struck_peer_is_backed_off_from_pulling(self):
         mesh._revpull_strikes["beta"] = mesh.REVPULL_STRIKE_MAX
@@ -3741,7 +3780,8 @@ class RevlistPullTests(unittest.TestCase):
         mesh._revpull_expect["beta"] = body["iat"]
         with contextlib.redirect_stderr(io.StringIO()):
             mesh._handle_control(self.cfg, "me", "beta",
-                                 {"mw": "revlist-resp", "block": block})
+                                 {"mw": "revlist-resp", "block": block},
+                                 verdict=mesh.FRAME_VERIFIED)
         self.assertNotIn("beta", mesh._revpull_strikes)
 
     def test_full_cycle_two_nodes_converge(self):
@@ -3760,7 +3800,8 @@ class RevlistPullTests(unittest.TestCase):
         mesh._revpull_expect["B"] = body["iat"]
         with contextlib.redirect_stderr(io.StringIO()):
             mesh._handle_control(self.cfg, "A", "B",
-                                 {"mw": "revlist-resp", "block": served_block})
+                                 {"mw": "revlist-resp", "block": served_block},
+                                 verdict=mesh.FRAME_VERIFIED)
         self.assertEqual(mesh._load_revlist(self.cfg)[0]["iat"], body["iat"])
 
 
