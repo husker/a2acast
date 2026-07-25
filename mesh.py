@@ -1883,6 +1883,66 @@ def _report_verdict(frm, ev, verdict):
               f"from={_single_line(frm)} status={verdict}", file=sys.stderr)
 
 
+REVGAP_LOG_INTERVAL = 300       # s; per-peer REVGAP log throttle
+_revgap_last = {}
+_revgap_lock = threading.Lock()
+
+
+def _my_revlist_iat(cfg):
+    """This node's adopted-list iat, or None when it holds no readable
+    list (blind -- asserts nothing, enforces nothing). An unreadable
+    cache is treated as no-assertion here, NOT fail-shut: this is the
+    observe-only freshness path, never a delivery gate."""
+    try:
+        body, _ = _load_revlist(cfg)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(body, dict):
+        return None
+    iat = body.get("iat")
+    return iat if isinstance(iat, int) and not isinstance(iat, bool) else None
+
+
+def _assert_revlist_freshness(cfg, payload):
+    """Return payload with a signed `rl` = adopted-list iat, or unchanged
+    when this node holds no readable list. Copies before mutating so the
+    caller's dict is untouched."""
+    iat = _my_revlist_iat(cfg)
+    if iat is None:
+        return payload
+    out = dict(payload)
+    out["rl"] = iat
+    return out
+
+
+def _observe_revlist_freshness(cfg, frm, signed_base, now=None):
+    """#76 distribution, OBSERVE-ONLY: a peer's signed frame asserts its
+    revocation-list `iat`. If it exceeds ours we are behind that peer and
+    should pull (the pull transport is the next increment -- leg 2); here
+    we emit a throttled REVGAP evidence line so the #62 soak can witness
+    real offline gaps before #74 enforces anything. Never writes, never
+    gates delivery. `signed_base` is the authenticated wrapper, so the
+    asserted `rl` is under the sender's signature -- an unsubstantiable
+    assertion is caught at pull time, not here."""
+    if not isinstance(signed_base, dict):
+        return
+    peer_iat = signed_base.get("rl")
+    if not isinstance(peer_iat, int) or isinstance(peer_iat, bool):
+        return
+    mine = _my_revlist_iat(cfg) or 0
+    if peer_iat <= mine:
+        return
+    now = time.time() if now is None else now
+    with _revgap_lock:
+        last = _revgap_last.get(frm)
+        if last is not None and now - last < REVGAP_LOG_INTERVAL:
+            return
+        _revgap_last[frm] = now
+    print(f"MESH_REVGAP from={_single_line(frm)} peer_iat={peer_iat} "
+          f"mine={mine} (peer holds a newer owner-signed revocation list; "
+          f"pull to converge -- observe-only, #76)", file=sys.stderr)
+
+
 def _own_node_pubkey(cfg, harness):
     """This node's own normalized public key, or None if it has no key."""
     try:
@@ -1925,6 +1985,17 @@ def _sign_wrapper_payload(cfg, to, payload, harness=None):
         pub = _own_node_pubkey(cfg, harness)
         if pub is None:
             return timestamp, payload
+        # #76 distribution: assert this node's revocation-list freshness so a
+        # peer can detect it is behind and pull. Signed (inside the payload,
+        # covered by the node signature -- the first NEW signed wrapper field,
+        # which _base_payload carries forward-compatibly), and substantiable:
+        # `iat` is bounded by what the owner actually published, so a node
+        # cannot assert one it can't back at pull time. A node with no
+        # readable adopted list asserts NOTHING -- honest blindness, and it
+        # keeps a fresh mesh's frames byte-identical to today (no rl field),
+        # which is what gates this behind an operator's deliberate
+        # revlist-trust rather than tripping the mixed-version rollout.
+        payload = _assert_revlist_freshness(cfg, payload)
         relay_topic = topic(cfg, to) if to is not None else ""
         signature = _sign_as_node(cfg, harness, relay_topic, timestamp,
                                   payload)
@@ -7563,6 +7634,7 @@ def _cmd_watch_owned(args, cfg, me):
             cfg, frm, recipient, body, ctl, _sig, _pk, _wts, ev,
             signed_base=_sbase)
         _report_verdict(frm, ev, verdict)
+        _observe_revlist_freshness(cfg, frm, _sbase)
         if verdict == FRAME_VERIFIED:
             # #76 Phase A: log-only cert observability for verified frames,
             # against the LOCAL pin (the key that actually verified).
@@ -8262,6 +8334,7 @@ class MeshMCPServer:
                 cfg, frm, recipient, body, ctl, _sig, _pk, _wts, ev,
                 signed_base=_sbase)
             _report_verdict(frm, ev, verdict)
+            _observe_revlist_freshness(cfg, frm, _sbase)
             if verdict == FRAME_VERIFIED:
                 # #76 Phase A: log-only cert observability (see cmd_watch).
                 _report_cert_status(cfg, frm, _load_pins(cfg).get(frm))
