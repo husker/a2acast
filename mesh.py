@@ -1883,6 +1883,29 @@ def _report_verdict(frm, ev, verdict):
               f"from={_single_line(frm)} status={verdict}", file=sys.stderr)
 
 
+def _observe_downgrade(cfg, frm, verdict):
+    """#74 downgrade ratchet, OBSERVE-ONLY: a name whose signing key is
+    already PINNED (so it has been seen to sign) sending an UNSIGNED
+    frame is the signature-stripping shape enforcement will refuse. A
+    pin is only ever established from a signed frame, so 'pinned' IS
+    'has signed before' -- no new state store. Log-only here: it drops
+    nothing, and the #62 soak needs to witness how often a legitimate
+    unsigned-after-signed occurs (a node that later cannot sign) BEFORE
+    enforcement gates delivery on it. Enforcement itself is BLOCKED on
+    the recorded #74 preconditions (non-suppressible revocation
+    distribution seated) and is not wired here."""
+    if verdict != FRAME_UNSIGNED:
+        return
+    if not isinstance(frm, str) or not frm:
+        return
+    if _pinned_peer_key(cfg, frm) is None:
+        return
+    print(f"MESH_DOWNGRADE from={_single_line(frm)} (a pinned signing key "
+          f"exists for this name but the frame arrived UNSIGNED -- "
+          f"signature-stripping is what the #74 ratchet will refuse; "
+          f"observe-only)", file=sys.stderr)
+
+
 def _own_node_pubkey(cfg, harness):
     """This node's own normalized public key, or None if it has no key."""
     try:
@@ -7563,6 +7586,7 @@ def _cmd_watch_owned(args, cfg, me):
             cfg, frm, recipient, body, ctl, _sig, _pk, _wts, ev,
             signed_base=_sbase)
         _report_verdict(frm, ev, verdict)
+        _observe_downgrade(cfg, frm, verdict)
         if verdict == FRAME_VERIFIED:
             # #76 Phase A: log-only cert observability for verified frames,
             # against the LOCAL pin (the key that actually verified).
@@ -8262,6 +8286,7 @@ class MeshMCPServer:
                 cfg, frm, recipient, body, ctl, _sig, _pk, _wts, ev,
                 signed_base=_sbase)
             _report_verdict(frm, ev, verdict)
+            _observe_downgrade(cfg, frm, verdict)
             if verdict == FRAME_VERIFIED:
                 # #76 Phase A: log-only cert observability (see cmd_watch).
                 _report_cert_status(cfg, frm, _load_pins(cfg).get(frm))

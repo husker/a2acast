@@ -6471,6 +6471,74 @@ class BlockingWaitTests(unittest.TestCase):
         self.assertEqual(calls[1][1].timeout, 9)
 
 
+class DowngradeRatchetObserveTests(unittest.TestCase):
+    """#74 downgrade ratchet, OBSERVE-ONLY: a pinned name (seen to sign)
+    sending an unsigned frame logs MESH_DOWNGRADE and drops nothing.
+    Enforcement is blocked on the recorded #74 preconditions and is not
+    exercised here."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.cfg = make_cfg(self._tmp.name)
+
+    @staticmethod
+    def _fake_pub(fill):
+        t = b"ssh-ed25519"
+        blob = (len(t).to_bytes(4, "big") + t
+                + (32).to_bytes(4, "big") + bytes([fill]) * 32)
+        return "ssh-ed25519 " + base64.b64encode(blob).decode()
+
+    def _pin(self, name):
+        pins = mesh._load_pins(self.cfg)
+        pins[name] = self._fake_pub(1)
+        mesh._write_json_secure(mesh.pins_file(self.cfg), pins)
+
+    def _observe(self, frm, verdict):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            mesh._observe_downgrade(self.cfg, frm, verdict)
+        return err.getvalue()
+
+    def test_pinned_name_unsigned_is_a_downgrade(self):
+        self._pin("beta")
+        out = self._observe("beta", mesh.FRAME_UNSIGNED)
+        self.assertIn("MESH_DOWNGRADE", out)
+        self.assertIn("from=beta", out)
+
+    def test_unpinned_name_unsigned_is_not_a_downgrade(self):
+        # first contact is legitimately unsigned; nothing to ratchet yet
+        out = self._observe("stranger", mesh.FRAME_UNSIGNED)
+        self.assertNotIn("MESH_DOWNGRADE", out)
+
+    def test_signed_verdicts_never_downgrade(self):
+        self._pin("beta")
+        for verdict in (mesh.FRAME_VERIFIED, mesh.FRAME_MISMATCH,
+                        mesh.FRAME_UNVERIFIED):
+            self.assertNotIn("MESH_DOWNGRADE",
+                             self._observe("beta", verdict))
+
+    def test_observation_writes_nothing(self):
+        self._pin("beta")
+        before = sorted(os.listdir(self.cfg["_dir"]))
+        self._observe("beta", mesh.FRAME_UNSIGNED)
+        self.assertEqual(sorted(os.listdir(self.cfg["_dir"])), before)
+
+    def test_enforcement_is_not_wired_into_delivery(self):
+        # the recorded #74 hard gate: no verdict may gate delivery until
+        # non-suppressible distribution is seated. The observer must be a
+        # pure side-effect logger -- it returns None and yields no signal
+        # a caller could branch delivery on.
+        self.assertIsNone(self._observe_return("beta", mesh.FRAME_UNSIGNED))
+        self.assertIsNone(self._observe_return("s", mesh.FRAME_VERIFIED))
+
+    def _observe_return(self, frm, verdict):
+        if frm == "beta":
+            self._pin("beta")
+        with contextlib.redirect_stderr(io.StringIO()):
+            return mesh._observe_downgrade(self.cfg, frm, verdict)
+
+
 class ControlHandlingTests(unittest.TestCase):
     def setUp(self):
         # #122: the process-posture global is stamped by cmd_watch tests
