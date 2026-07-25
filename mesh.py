@@ -1744,6 +1744,17 @@ def _load_renames(cfg):
     return value if isinstance(value, dict) else {}
 
 
+def _rename_migration_enabled(cfg):
+    """Whether a key-verified rename may MIGRATE the pin, or only be
+    observed. Default OFF: a node does not get to rename itself in the
+    fleet's trust store on its own key alone -- migration is a durable
+    identity-store write driven by a received frame, and the OWNER
+    authorizes that policy by setting `rename_migration` (James's design
+    call, #130/#93). Off => today's log-only WOULD_MIGRATE; the mechanism
+    is present but dormant until the owner turns it on fleet-wide."""
+    return bool(cfg.get("rename_migration"))
+
+
 def _migrate_pin(cfg, old, new, head):
     """#93 Phase B-prime: carry a KEY-VERIFIED rename's pin to the new
     name and tombstone the old one. Every refusal is loud and names the
@@ -7467,9 +7478,15 @@ def _handle_control(cfg, me, frm, ctl, verdict=None, ev=None):
         fid = _single_line(ev.get("id")) if isinstance(ev, dict) else "?"
         head = f"MESH_RENAME id={fid} {_single_line(old)} -> {_single_line(new)}"
         if verdict == FRAME_VERIFIED:
-            # #93 Phase B-prime: verified continuity now MIGRATES (the
-            # gated later phase, shipped). All refusal paths stay loud.
-            _migrate_pin(cfg, old, new, head)
+            # #93 Phase B-prime: verified continuity MIGRATES -- but only
+            # when the owner has authorized it (#130). Default is log-only:
+            # a node cannot rename itself in the trust store unbidden.
+            if _rename_migration_enabled(cfg):
+                _migrate_pin(cfg, old, new, head)
+            else:
+                print(f"{head} WOULD_MIGRATE (key-verified; migration not "
+                      f"enabled -- owner sets `rename_migration` to allow, "
+                      f"#130)", file=sys.stderr)
         elif verdict == FRAME_MISMATCH:
             # A DIFFERENT key than the one pinned for `old` is asking the
             # fleet to carry old's identity to `new` -- the exact

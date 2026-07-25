@@ -80,6 +80,10 @@ def _scratch(root, name, shared):
         json.dump(body, f)
     cfg = dict(body)
     cfg["_dir"], cfg["_path"] = node_dir, path
+    # #130: migration is owner-gated (default off). The control arm proves
+    # a verified rename MIGRATES, so the receiver must have it enabled --
+    # this is the lab exercising the enabled path, not the default.
+    cfg["rename_migration"] = True
     return cfg
 
 

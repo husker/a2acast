@@ -6623,12 +6623,15 @@ class RenameMigrationTests(unittest.TestCase):
     """#93 Phase B-prime: a KEY-VERIFIED rename migrates the pin to the
     new name and tombstones the old one. Monotonic (one migration per
     old name, ever -- never FROM a tombstone), replay-idempotent, never
-    a silent pin replace, and `old` derives from the signed frm only."""
+    a silent pin replace, and `old` derives from the signed frm only.
+    Gated on the owner's `rename_migration` opt-in (#130); enabled here
+    to exercise the migration path (default-off is its own test)."""
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         self.cfg = make_cfg(self._tmp.name)
+        self.cfg["rename_migration"] = True  # #130: owner-authorized
 
     @staticmethod
     def _fake_pub(fill):
@@ -6651,6 +6654,26 @@ class RenameMigrationTests(unittest.TestCase):
                                  {"mw": "rename", "new": new, "ts": 1},
                                  verdict=verdict, ev={"id": eid})
         return err.getvalue()
+
+    def test_default_is_log_only_migration_disabled(self):
+        # #130 (James's design call): without the owner's opt-in a
+        # key-verified rename does NOT migrate -- it stays today's
+        # log-only WOULD_MIGRATE, and the trust store is untouched.
+        cfg = dict(self.cfg)
+        cfg.pop("rename_migration", None)
+        key = self._fake_pub(1)
+        pins = mesh._load_pins(cfg)
+        pins["beta"] = key
+        mesh._write_json_secure(mesh.pins_file(cfg), pins)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            mesh._handle_control(cfg, "me", "beta",
+                                 {"mw": "rename", "new": "gamma", "ts": 1},
+                                 verdict=mesh.FRAME_VERIFIED, ev={"id": "f"})
+        self.assertIn("WOULD_MIGRATE", err.getvalue())
+        self.assertNotIn("MIGRATED (", err.getvalue())
+        self.assertNotIn("gamma", mesh._load_pins(cfg))
+        self.assertEqual(mesh._load_renames(cfg), {})
 
     def test_verified_rename_migrates_pin_and_tombstones(self):
         key = self._fake_pub(1)
