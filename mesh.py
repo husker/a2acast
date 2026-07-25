@@ -1671,13 +1671,20 @@ def _pin_cap(cfg):
     return max(PIN_STORE_CAP_FLOOR, 4 * certified)
 
 
-def _bind_peer(cfg, node, pub):
+def _bind_peer(cfg, node, pub, replacing=None):
     """Trust-on-first-use pin of node -> public key; returns the bound key.
 
     Raises ValueError when `node` is already pinned to a different key. Never
     a silent replace: the pin is the identity, so a changed key is either a
     rotation nobody authorised or an impersonation, and both must surface
     rather than be adopted. Same shape as _apply_owner_trust's refusal.
+
+    `replacing` (a specific key) permits ONE explicit, non-silent overwrite:
+    the caller has already decided, under its own policy, that the existing
+    pin may be replaced (e.g. a proven-revoked occupant, #130 seam 1). It is
+    targeted -- the existing pin must still equal `replacing` when re-checked
+    under the lock, or the normal reject-a-different-key invariant fires --
+    so it cannot race into replacing a key the caller never validated.
 
     The read-check-write runs under a lock, re-reading the pin store inside
     it. Without that, two processes first-contacting the same node
@@ -1698,11 +1705,18 @@ def _bind_peer(cfg, node, pub):
         pins = _load_pins(cfg)  # fresh read INSIDE the lock
         existing = pins.get(node)
         if isinstance(existing, str) and existing.strip():
-            if existing.strip() != pub:
+            if existing.strip() == pub:
+                return existing.strip()
+            if not (replacing is not None
+                    and existing.strip() == _normalize_pubkey(replacing)):
                 raise ValueError(
                     f"peer '{node}' is already pinned to a different key; "
                     f"refusing to replace it")
-            return existing.strip()
+            # validated targeted replacement: overwrite in place (count
+            # unchanged, so the cap does not apply).
+            pins[node] = pub
+            _write_json_secure(pins_file(cfg), pins)
+            return pub
         cap = _pin_cap(cfg)
         if len(pins) >= cap:
             # #76 c4: growth past the fleet-scaled bound is the attack
@@ -1742,6 +1756,22 @@ def _load_renames(cfg):
     except (OSError, ValueError):
         return {}
     return value if isinstance(value, dict) else {}
+
+
+def _name_is_live(cfg, name):
+    """Whether `name` is a known live identity even WITHOUT a pin -- present
+    in the roster or with a peer sighting. A rename must not TOFU-capture
+    such a name (#130 seam 2, lodestar): migrating onto an unpinned-but-live
+    name binds the renamer's key to an identity someone else is actively
+    using -- an impersonation / identity-DoS."""
+    if not isinstance(name, str) or not name:
+        return False
+    if name in cfg.get("nodes", []):
+        return True
+    try:
+        return name in load_peers(cfg)
+    except (OSError, ValueError):
+        return False
 
 
 def _rename_migration_enabled(cfg):
@@ -1792,8 +1822,35 @@ def _migrate_pin(cfg, old, new, head):
               f"'{_single_line(new)}' is itself a tombstoned name)",
               file=sys.stderr)
         return
+    # Target-occupancy predicate (lodestar seams). A rename may only land on
+    # a name that is genuinely FREE:
+    target_key = _pinned_peer_key(cfg, new)
+    replacing = None
+    if target_key is not None and target_key != src_key:
+        # Pinned to a DIFFERENT key. A PROVEN-revoked occupant is not a
+        # legitimate holder and must not permanently block a real migration
+        # (seam 1, availability); a clean-or-UNKNOWN occupant DOES block --
+        # unknown fails shut, never read as free (lodestar B2).
+        if _revocation_status(cfg, target_key) == "revoked":
+            replacing = target_key
+            print(f"{head} TARGET_REVOKED_REPLACED (target was pinned to a "
+                  f"REVOKED key -- freeing it for the migration)",
+                  file=sys.stderr)
+        else:
+            print(f"{head} TARGET_PIN_CONFLICT (target pinned to a "
+                  f"different, non-revoked key -- a rename cannot steal a "
+                  f"name; no migration)", file=sys.stderr)
+            return
+    elif target_key is None and _name_is_live(cfg, new):
+        # UNPINNED but a live known identity: migrating here would
+        # TOFU-capture a name someone else is using (seam 2, impersonation
+        # / identity-DoS).
+        print(f"{head} TARGET_OCCUPIED (target is an unpinned but LIVE "
+              f"identity -- refusing to capture it; no migration)",
+              file=sys.stderr)
+        return
     try:
-        _bind_peer(cfg, new, src_key)
+        _bind_peer(cfg, new, src_key, replacing=replacing)
     except ValueError:
         print(f"{head} TARGET_PIN_CONFLICT (target name is pinned to a "
               f"DIFFERENT key -- a rename cannot steal a name; no "

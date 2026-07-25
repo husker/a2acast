@@ -6724,6 +6724,55 @@ class RenameMigrationTests(unittest.TestCase):
                          self._fake_pub(2))
         self.assertNotIn("beta", mesh._load_renames(self.cfg))
 
+    def test_revoked_occupant_does_not_block_migration(self):
+        # seam 1 (lodestar): a target pinned to a REVOKED key is not a
+        # legitimate holder -- it must not permanently block a real
+        # migration. The revoked pin is replaced (targeted, non-silent).
+        src = self._fake_pub(1)
+        revoked = self._fake_pub(2)
+        self._pin("beta", src)
+        self._pin("gamma", revoked)
+        # mark gamma's key revoked in the loose store
+        fpr = mesh._key_fingerprint(revoked)
+        mesh._write_json_secure(mesh.revocations_file(self.cfg),
+                                {fpr: {"name": "gamma", "iat": 1}})
+        out = self._rename("beta", "gamma")
+        self.assertIn("TARGET_REVOKED_REPLACED", out)
+        self.assertIn("MIGRATED", out)
+        self.assertEqual(mesh._load_pins(self.cfg)["gamma"], src)
+        self.assertEqual(mesh._load_renames(self.cfg)["beta"]["new"], "gamma")
+
+    def test_clean_and_unknown_occupant_still_block(self):
+        # a different NON-revoked (clean) occupant blocks; an UNKNOWN
+        # revocation status must FAIL SHUT and also block (lodestar B2).
+        self._pin("beta", self._fake_pub(1))
+        self._pin("gamma", self._fake_pub(2))  # clean: no revocations
+        out = self._rename("beta", "gamma")
+        self.assertIn("TARGET_PIN_CONFLICT", out)
+        self.assertEqual(mesh._load_pins(self.cfg)["gamma"], self._fake_pub(2))
+        self.assertNotIn("beta", mesh._load_renames(self.cfg))
+
+    def test_unpinned_but_live_name_is_occupied(self):
+        # seam 2 (lodestar): an UNPINNED name that is a live known identity
+        # (in the roster) must not be TOFU-captured by a rename.
+        self._pin("beta", self._fake_pub(1))
+        self.cfg["nodes"] = list(self.cfg.get("nodes", [])) + ["gamma"]
+        self.assertIsNone(mesh._pinned_peer_key(self.cfg, "gamma"))  # unpinned
+        out = self._rename("beta", "gamma")
+        self.assertIn("TARGET_OCCUPIED", out)
+        self.assertNotIn("gamma", mesh._load_pins(self.cfg))
+        self.assertNotIn("beta", mesh._load_renames(self.cfg))
+
+    def test_unpinned_and_not_live_name_migrates(self):
+        # the happy path stays intact: a genuinely fresh name (not pinned,
+        # not in roster/peers) is free to receive the migration.
+        self._pin("beta", self._fake_pub(1))
+        self.assertNotIn("zeta-fresh", self.cfg.get("nodes", []))
+        out = self._rename("beta", "zeta-fresh")
+        self.assertIn("MIGRATED", out)
+        self.assertEqual(mesh._load_pins(self.cfg)["zeta-fresh"],
+                         self._fake_pub(1))
+
     def test_migration_onto_a_tombstoned_name_is_refused(self):
         key = self._fake_pub(1)
         self._pin("beta", key)
