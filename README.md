@@ -11,9 +11,11 @@ Copilot on a Windows PC — all exchanging messages and
 **Machine A** — create the mesh:
 
 ```bash
-pipx install git+https://github.com/husker/a2acast   # or: uv tool install ...
+uv tool install a2acast   # or: pipx install a2acast — it's on PyPI
 mesh init home   # prints a block to paste on machine B, then starts listening
 ```
+
+(Bleeding edge instead: `pipx install git+https://github.com/husker/a2acast`.)
 
 **Machine B** — paste the block `mesh init` printed. It looks like:
 
