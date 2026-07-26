@@ -23,6 +23,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import urllib.error
 from unittest import mock
@@ -6217,6 +6218,145 @@ class DecryptMetaTests(unittest.TestCase):
         pt, ts = mesh._decrypt_meta(self.cfg, wire, expected_topic="mw-wrong")
         self.assertIsNone(pt)
         self.assertIsNone(ts)
+
+
+class EnrollmentTests(unittest.TestCase):
+    """#76 owner-signed enrollment: with `enrollment` on, first contact pins
+    only a key the OWNER has vouched for, closing the TOFU first-contact-MITM
+    window. Default OFF -- an existing mesh upgrades to byte-identical
+    behaviour and the owner turns it on deliberately, fleet-wide.
+
+    The property that makes this shippable ahead of #74: refusing to PIN never
+    refuses DELIVERY. An unenrolled peer stays FRAME_UNVERIFIED, which
+    delivers today and still delivers under enforcement."""
+
+    @classmethod
+    def setUpClass(cls):
+        if not shutil.which("ssh-keygen"):
+            raise unittest.SkipTest("ssh-keygen unavailable")
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.cfg = make_cfg(tmp.name)
+        with contextlib.redirect_stdout(io.StringIO()):
+            mesh._owner_init(self.cfg, allow_unprotected=True)
+        self.sender_cfg = make_cfg(tempfile.mkdtemp())
+        self.sender_cfg["id"] = self.cfg["id"]
+        self.sender_pub = mesh._ensure_node_key(
+            self.sender_cfg, "laptop", "claude")
+        self.to = "all"
+        self.topic = mesh.topic(self.cfg, self.to)
+
+    def _frame(self):
+        payload = {"f": "laptop", "t": self.to, "b": "hi"}
+        ts, signed = mesh._sign_wrapper_payload(
+            self.sender_cfg, self.to, payload, harness="claude")
+        return ts, signed
+
+    def _verify(self, err=None):
+        ts, w = self._frame()
+        with contextlib.redirect_stderr(io.StringIO() if err is None else err):
+            return mesh._verify_frame(
+                self.cfg, "laptop", w.get("k"), w.get("s"),
+                self.topic, ts, mesh._base_payload(w))
+
+    def _enroll(self, name="laptop", pub=None):
+        """Owner-vouch a key into this receiver's cert cache."""
+        block = mesh._mint_member_cert(self.cfg, name,
+                                       self.sender_pub if pub is None else pub)
+        ok, reason, body = mesh._verify_member_cert(self.cfg, block)
+        self.assertTrue(ok, reason)
+        mesh._note_cert(self.cfg, body)
+        return body
+
+    # -- the default-off gate -------------------------------------------
+
+    def test_enrollment_off_still_tofu_pins(self):
+        """Fails if the gate defaults on: every existing mesh relies on this."""
+        self.assertFalse(mesh._enrollment_enabled(self.cfg))
+        self.assertEqual(self._verify(), mesh.FRAME_UNVERIFIED)
+        self.assertEqual(mesh._pinned_peer_key(self.cfg, "laptop"),
+                         mesh._normalize_pubkey(self.sender_pub))
+
+    # -- enrollment on: the legitimate case must still work ---------------
+
+    def test_enrolled_key_pins(self):
+        """The load-bearing 'still permits the honest case' direction: a guard
+        that only ever refuses could be replaced by `return None`."""
+        self.cfg["enrollment"] = True
+        self._enroll()
+        self.assertEqual(self._verify(), mesh.FRAME_UNVERIFIED)
+        self.assertEqual(mesh._pinned_peer_key(self.cfg, "laptop"),
+                         mesh._normalize_pubkey(self.sender_pub))
+
+    # -- enrollment on: the refusals -------------------------------------
+
+    def test_uncertified_key_is_not_pinned(self):
+        """The TOFU-MITM window: no owner cert -> no pin."""
+        self.cfg["enrollment"] = True
+        self.assertEqual(self._verify(), mesh.FRAME_UNVERIFIED)
+        self.assertIsNone(mesh._pinned_peer_key(self.cfg, "laptop"))
+
+    def test_cert_for_a_different_name_is_not_pinned(self):
+        """A cert binds key AND name; presenting beta's cert as laptop fails."""
+        self.cfg["enrollment"] = True
+        self._enroll(name="beta")
+        self.assertEqual(self._verify(), mesh.FRAME_UNVERIFIED)
+        self.assertIsNone(mesh._pinned_peer_key(self.cfg, "laptop"))
+
+    def test_revoked_cert_is_not_pinned(self):
+        self.cfg["enrollment"] = True
+        body = self._enroll()
+        with contextlib.redirect_stdout(io.StringIO()):
+            block = mesh._mint_revocation(self.cfg, body["fpr"], "laptop")
+        ok, _reason, rbody = mesh._verify_revocation(self.cfg, block)
+        self.assertTrue(ok)
+        mesh._note_revocation(self.cfg, rbody)
+        self.assertEqual(self._verify(), mesh.FRAME_UNVERIFIED)
+        self.assertIsNone(mesh._pinned_peer_key(self.cfg, "laptop"))
+
+    def test_expired_cert_is_not_pinned(self):
+        self.cfg["enrollment"] = True
+        body = self._enroll()
+        body["exp"] = int(time.time()) - 1
+        mesh._note_cert(self.cfg, body)
+        self.assertEqual(self._verify(), mesh.FRAME_UNVERIFIED)
+        self.assertIsNone(mesh._pinned_peer_key(self.cfg, "laptop"))
+
+    # -- refusing to pin is not refusing to deliver -----------------------
+
+    def test_refusal_does_not_change_the_verdict(self):
+        """Phase 1 must stay additive: an unenrolled peer gets the SAME verdict
+        an unpinned peer already got, so nothing downstream drops it. Fails if
+        enrollment ever starts returning MISMATCH/UNSIGNED."""
+        self.cfg["enrollment"] = True
+        refused = self._verify()
+        self.cfg["enrollment"] = False
+        cfg2 = make_cfg(tempfile.mkdtemp())
+        cfg2["id"] = self.cfg["id"]
+        ts, w = self._frame()
+        with contextlib.redirect_stderr(io.StringIO()):
+            baseline = mesh._verify_frame(
+                cfg2, "laptop", w.get("k"), w.get("s"),
+                mesh.topic(cfg2, self.to), ts, mesh._base_payload(w))
+        self.assertEqual(refused, baseline)
+
+    def test_refusal_emits_throttled_evidence(self):
+        """#129: a misconfigured fleet must not look identical to a quiet one."""
+        self.cfg["enrollment"] = True
+        mesh._enroll_last.clear()
+        err = io.StringIO()
+        self._verify(err)
+        self._verify(err)
+        self.assertEqual(err.getvalue().count("ENROLL_REFUSED"), 1)
+
+    def test_already_pinned_peer_is_unaffected(self):
+        """Enrollment gates FIRST CONTACT only -- turning it on must not strand
+        peers pinned before it was enabled."""
+        self.assertEqual(self._verify(), mesh.FRAME_UNVERIFIED)
+        self.cfg["enrollment"] = True
+        self.assertEqual(self._verify(), mesh.FRAME_VERIFIED)
 
 
 class PeerPinTests(unittest.TestCase):

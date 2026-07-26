@@ -1790,6 +1790,67 @@ def _rename_migration_enabled(cfg):
     return bool(cfg.get("rename_migration"))
 
 
+def _enrollment_enabled(cfg):
+    """Whether first-contact pinning requires an OWNER-SIGNED member cert
+    (#76 enrollment) or stays trust-on-first-use. Default OFF: turning it on
+    means an uncertified peer never pins, so it must be an owner decision
+    made once the fleet's certs are actually distributed -- flipping it on a
+    single node early costs that node its pins, not the fleet its traffic.
+
+    Off => today's TOFU, byte-identical. On => a pin is non-self-service,
+    which is the half of #76 the distinct-pin cap does not cover: the cap
+    bounds how MANY names a malicious member can pin, enrollment bounds
+    WHICH keys can claim a name at all, closing the first-contact-MITM
+    window TOFU leaves open."""
+    return bool(cfg.get("enrollment"))
+
+
+ENROLL_LOG_INTERVAL = 300        # s; per-peer ENROLL_REFUSED log throttle
+_enroll_last = {}
+_enroll_lock = threading.Lock()
+
+
+def _enroll_refusal(cfg, frm, pub, now=None):
+    """Reason a first-contact key may NOT be pinned under enrollment, or None
+    when the owner has vouched for it.
+
+    Reads only the local owner-verified stores: `_note_cert` caches bodies
+    that already passed `_verify_member_cert`, so the owner signature is
+    checked at trust time and never on the receive hot path (no ssh-keygen
+    spawn per frame). The cert binds key AND name -- presenting a valid cert
+    minted for another name must not enroll this one."""
+    body = _cert_for_key(cfg, pub)
+    if not isinstance(body, dict):
+        return "no owner cert for this key"
+    if body.get("mesh") != cfg.get("id"):
+        return "cert is for a different mesh"
+    if body.get("name") != frm:
+        return "cert names %s, frame claims %s" % (
+            _single_line(str(body.get("name"))), _single_line(frm))
+    now = time.time() if now is None else now
+    if not body.get("exp", 0) > now:
+        return "cert expired"
+    if _revocation_status(cfg, pub) == "revoked":
+        return "cert key is revoked"
+    return None
+
+
+def _report_enroll_refused(frm, reason):
+    """#129: a fleet with enrollment on and certs undistributed must not look
+    identical to a quiet one. Throttled per peer, matching MESH_DOWNGRADE --
+    an uncertified peer sending steadily would otherwise emit a line per
+    frame and drown the soak signal it is meant to provide."""
+    now = time.time()
+    with _enroll_lock:
+        last = _enroll_last.get(frm)
+        if last is not None and now - last < ENROLL_LOG_INTERVAL:
+            return
+        _enroll_last[frm] = now
+    _evidence("MESH_ENROLL from=%s ENROLL_REFUSED (%s -- first contact not "
+              "pinned; the frame still delivers)"
+              % (_single_line(frm), reason))
+
+
 def _migrate_pin(cfg, old, new, head):
     """#93 Phase B-prime: carry a KEY-VERIFIED rename's pin to the new
     name and tombstone the old one. Every refusal is loud and names the
@@ -1943,19 +2004,29 @@ def _verify_frame(cfg, frm, carried_pub, signature, relay_topic,
         return FRAME_UNSIGNED
     pinned = _pinned_peer_key(cfg, frm)
     if pinned is None:
-        # SLICE 4 / ENROLLMENT CONSTRAINT (design, not yet enforced): this
-        # pin write is a receive-path side effect, so a malicious MEMBER (it
-        # is past the MAC, so mesh-key-holders only) can pin N fabricated
-        # names and grow the store without bound. Same class as the replay
-        # ledger, but the remedy does NOT transfer: the ledger evicts by age,
-        # and dropping a pin is not space reclaimed -- it reopens TOFU for an
-        # established name, an AUTHENTICATION downgrade. So the store stays
-        # durable and must be bounded another way: a distinct-pin cap, or
-        # owner-signed enrollment (non-self-service pins, which also closes
-        # the TOFU first-contact-MITM window). Decide this in slice 4; do not
-        # discover it. "Member-only, so fine" is the phrasing to distrust --
-        # a malicious member is who signing exists to constrain.
+        # ENROLLMENT (#76, decided): this pin write is a receive-path side
+        # effect, so a malicious MEMBER (it is past the MAC, so
+        # mesh-key-holders only) can pin N fabricated names, and a
+        # first-contact MITM can pin ITS key for an honest name. Both halves
+        # are now addressed, and deliberately by two different mechanisms
+        # because the remedies are not interchangeable:
+        #   GROWTH  -> _pin_cap, a bound on distinct pins. The replay
+        #              ledger's evict-by-age does NOT transfer: dropping a
+        #              pin is not space reclaimed, it reopens TOFU for an
+        #              established name -- an AUTHENTICATION downgrade.
+        #   TRUST   -> _enrollment_enabled, owner-signed enrollment. Pins
+        #              become non-self-service, which closes the TOFU
+        #              first-contact window the cap cannot touch.
+        # Enrollment gates whether a pin is CREATED, never whether a frame is
+        # DELIVERED: an unenrolled peer stays FRAME_UNVERIFIED, exactly the
+        # verdict an unpinned peer already got. That keeps this additive and
+        # revertible -- the safety that expires at #74 enforcement, not here.
         if isinstance(carried_pub, str) and carried_pub.strip():
+            if _enrollment_enabled(cfg):
+                refusal = _enroll_refusal(cfg, frm, carried_pub)
+                if refusal is not None:
+                    _report_enroll_refused(frm, refusal)
+                    return FRAME_UNVERIFIED
             try:
                 _bind_peer(cfg, frm, carried_pub)
             except ValueError:
