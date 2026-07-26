@@ -133,6 +133,11 @@ VERSION = "0.16.1"
 USER_AGENT = f"a2acast/{VERSION}"
 ACK_WAIT = 5   # seconds a sender listens for delivery acks
 MAX_ATTACHMENT = 512 * 1024  # bytes we're willing to fetch for a wrapped body
+CHUNK_PREFIX = "mwchunk1:"      # #66 tier 2: transport framing version
+CHUNK_HEADER_ROOM = 128         # prefix + cid + indexes + separators
+CHUNK_MAX_COUNT = 16            # ceiling ~63 KB of wire; beyond -> attachment
+CHUNK_SET_TTL = 600             # seconds a partial set may wait for pieces
+CHUNK_MAX_SETS = 32             # concurrent partial sets (~2 MB worst case)
 NTFY_INLINE_LIMIT = 4096  # ntfy stores larger posts as ATTACHMENTS with a
 # ~3h TTL instead of the normal cache retention -- delivery durability
 # silently depends on size past this line (#66)
@@ -3163,6 +3168,77 @@ def http(url, data=None, headers=None, timeout=15):
     return urllib.request.urlopen(req, timeout=timeout)
 
 
+CHUNK_DATA_MAX = NTFY_INLINE_LIMIT - CHUNK_HEADER_ROOM
+_chunk_sets = {}
+_chunk_lock = threading.Lock()
+
+
+def _chunk_wire(wire):
+    """#66 tier 2: split an encrypted wire string into prefixed pieces
+    that each fit the relay's inline limit, or None when it would take
+    more than CHUNK_MAX_COUNT pieces (caller falls back to the
+    attachment path and its TTL warning). Framing sits BELOW the
+    crypto: signature and ciphertext cover the whole frame, so chunking
+    adds no authenticated surface -- a garbled or forged piece can only
+    make the reassembled frame fail decrypt."""
+    pieces = [wire[i:i + CHUNK_DATA_MAX]
+              for i in range(0, len(wire), CHUNK_DATA_MAX)]
+    if not 2 <= len(pieces) <= CHUNK_MAX_COUNT:
+        return None
+    cid = uuid.uuid4().hex
+    total = len(pieces)
+    return [f"{CHUNK_PREFIX}{cid}:{i}:{total}:{piece}"
+            for i, piece in enumerate(pieces)]
+
+
+def _absorb_chunk(message, now=None):
+    """Buffer one chunk piece; return the reassembled wire when this
+    piece completes its set, else None (pending or malformed -- callers
+    treat both as silently not-a-message-yet).
+
+    Bounded like every store fed by the wire (#106 discipline): sets
+    expire after CHUNK_SET_TTL, at most CHUNK_MAX_SETS concurrent sets
+    with the oldest evicted, first write wins per slot so a later
+    duplicate cannot poison a set, and a set whose pieces disagree on
+    the total is dropped whole. The pieces are UNAUTHENTICATED framing;
+    nothing here is trusted until the reassembled frame decrypts."""
+    if now is None:
+        now = time.time()
+    parts = message[len(CHUNK_PREFIX):].split(":", 3)
+    if len(parts) != 4:
+        return None
+    cid, index_s, total_s, data = parts
+    if len(cid) != 32 or any(ch not in "0123456789abcdef" for ch in cid):
+        return None
+    try:
+        index, total = int(index_s), int(total_s)
+    except ValueError:
+        return None
+    if not (0 < total <= CHUNK_MAX_COUNT and 0 <= index < total
+            and 0 < len(data) <= CHUNK_DATA_MAX):
+        return None
+    with _chunk_lock:
+        for stale in [c for c, s in _chunk_sets.items()
+                      if now - s["born"] > CHUNK_SET_TTL]:
+            del _chunk_sets[stale]
+        entry = _chunk_sets.get(cid)
+        if entry is None:
+            if len(_chunk_sets) >= CHUNK_MAX_SETS:
+                oldest = min(_chunk_sets,
+                             key=lambda c: _chunk_sets[c]["born"])
+                del _chunk_sets[oldest]
+            entry = _chunk_sets[cid] = {"born": now, "n": total,
+                                        "parts": {}}
+        if entry["n"] != total:
+            del _chunk_sets[cid]  # self-contradictory set: poison, drop
+            return None
+        entry["parts"].setdefault(index, data)
+        if len(entry["parts"]) < entry["n"]:
+            return None
+        del _chunk_sets[cid]
+        return "".join(entry["parts"][i] for i in range(total))
+
+
 def _unwrap(ev, cfg, node=None):
     """ntfy wraps large bodies into attachments. Return the effective body
     text of a message event, fetching the attachment when needed. Return None
@@ -3240,6 +3316,14 @@ def _open_details(ev, cfg, me=None):
     body = _unwrap(ev, cfg, node=me)
     if not isinstance(body, str):
         return None, None, "", False, None, None, None, None, None, None
+    if body.startswith(CHUNK_PREFIX):
+        # #66 tier 2: buffer the piece; only a completed set proceeds to
+        # decrypt (fingerprint and replay dedupe then cover the whole
+        # reassembled frame). Pending or malformed pieces are silently
+        # not-a-message-yet: empty untrusted body never warns.
+        body = _absorb_chunk(body)
+        if body is None:
+            return None, None, "", False, None, None, None, None, None, None
     relay_topic = ev.get("topic") if isinstance(ev.get("topic"), str) else None
     pt, wire_ts = _decrypt_meta(cfg, body, expected_topic=relay_topic)
     if pt is not None:
@@ -5860,11 +5944,26 @@ def send_raw(cfg, sender, to, body, title=None, ctl=None):
         wire = encrypt(cfg, json.dumps(payload), to=to, timestamp=timestamp)
         headers = {"Title": cfg["mesh"]}
         if len(wire) > NTFY_INLINE_LIMIT:
+            pieces = _chunk_wire(wire)
+            if pieces is not None:
+                # #66 tier 2: every piece stays under the inline limit, so
+                # the relay's NORMAL retention carries the content -- the
+                # attachment TTL cliff no longer applies to this send. The
+                # returned relay id is the last piece's: in-order delivery
+                # makes it the completing piece, so ack --wait still keys
+                # correctly (out-of-order completion can time the wait out
+                # while still delivering; accepted, documented on #66).
+                resp = None
+                for piece in pieces:
+                    resp = _post(cfg, topic(cfg, to),
+                                 piece.encode("utf-8"), headers)
+                return resp
             print(f"MESH_WARN: payload exceeds the relay's ~{NTFY_INLINE_LIMIT}B "
-                  f"inline limit and will ride an attachment with a ~3h TTL -- "
-                  f"a receiver offline past that window loses the CONTENT "
-                  f"(the wake survives). Prefer smaller messages or a durable "
-                  f"channel for bulk (#66)", file=sys.stderr)
+                  f"inline limit and the {CHUNK_MAX_COUNT}-chunk ceiling, so "
+                  f"it will ride an attachment with a ~3h TTL -- a receiver "
+                  f"offline past that window loses the CONTENT (the wake "
+                  f"survives). Prefer smaller messages or a durable channel "
+                  f"for bulk (#66)", file=sys.stderr)
     else:
         wire = body
         headers = {"Title": title or f"{cfg['mesh']}: {sender} -> {to}",
