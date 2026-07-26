@@ -125,6 +125,8 @@ REPLAY_NAME = ".meshwire.replay-{}.json"
 REPLAY_REVISIT_THRESHOLD = 20000  # #77: above this, the full-rewrite save is
 # worth measuring (~26ms); surfaced in `mesh status` so the trigger is visible
 STATUS_NAME = ".meshwire.status-{}.json"
+EVIDENCE_NAME = ".meshwire.evidence-{}.log"     # #129: durable Phase-A soak log
+EVIDENCE_FILE_MAX = 1024 * 1024                 # rotate to .1 past this (~2MiB)
 BROADCAST = "all"
 # Single source of truth for the running client's version. Must match
 # pyproject.toml (enforced by test_plugin_versions_match_pyproject). Everything
@@ -2028,9 +2030,9 @@ def _report_verdict(frm, ev, verdict):
     louder (a pinned peer's signature failed -- forgery or corruption);
     unsigned/unverified are informational. Verified is silent."""
     if verdict == FRAME_MISMATCH:
-        print(f"MESH_WARN: signature mismatch from {_single_line(frm)} "
+        _evidence(f"MESH_WARN: signature mismatch from {_single_line(frm)} "
               f"id={_single_line(ev.get('id'))} "
-              f"(the pinned key did not verify this frame)", file=sys.stderr)
+              f"(the pinned key did not verify this frame)")
     elif verdict in (FRAME_UNSIGNED, FRAME_UNVERIFIED):
         print(f"MESH_VERIFY id={_single_line(ev.get('id'))} "
               f"from={_single_line(frm)} status={verdict}", file=sys.stderr)
@@ -3090,17 +3092,15 @@ def _report_cert_status(cfg, frm, pubkey):
         # Highest-priority signal: the owner has revoked this key. Log-only
         # in Phase A -- the frame still delivers -- but this is the line the
         # enforcement ratchet (#74) will one day act on.
-        print(f"MESH_CERT from={_single_line(frm)} CERT_REVOKED",
-              file=sys.stderr)
+        _evidence(f"MESH_CERT from={_single_line(frm)} CERT_REVOKED")
         return
     if rev == "unknown":
         # Fail SHUT (lodestar B2): the revocation store exists but is
         # unreadable, so we cannot prove this key is clean. Never fall
         # through to a clean-looking cert status -- report the failure.
-        print(f"MESH_CERT from={_single_line(frm)} CERT_REVCHECK_FAILED "
+        _evidence(f"MESH_CERT from={_single_line(frm)} CERT_REVCHECK_FAILED "
               f"(cannot confirm not-revoked -- store unreadable or key "
-              f"unfingerprintable)",
-              file=sys.stderr)
+              f"unfingerprintable)")
         return
     body = _cert_for_key(cfg, pubkey)
     if body is None:
@@ -3114,7 +3114,7 @@ def _report_cert_status(cfg, frm, pubkey):
         status = f"CERT_NAME_DRIFT cert_name={_single_line(body['name'])}"
     else:
         status = "CERT_OK"
-    print(f"MESH_CERT from={_single_line(frm)} {status}", file=sys.stderr)
+    _evidence(f"MESH_CERT from={_single_line(frm)} {status}")
 
 
 def status_file(cfg, node):
@@ -3123,6 +3123,53 @@ def status_file(cfg, node):
 
 PROCESS_POSTURES = ("watch", "hook", "mcp-serve", "mcp", "worker")
 _process_posture = None
+
+
+_evidence_path = None
+_evidence_lock = threading.Lock()
+
+
+def evidence_file(cfg, node):
+    return os.path.join(cfg["_dir"], EVIDENCE_NAME.format(node))
+
+
+def _set_evidence_log(cfg, node):
+    """#129: arm a durable, bounded evidence log for Phase-A observability.
+    Those lifecycle lines (MESH_RENAME/KEY_MISMATCH/MESH_CERT/...) are the
+    exact set #62 soaks, yet they only ever go to stderr -- invisible under
+    hook-wake posture, where nothing captures a receive process's stderr.
+    A long-running receive loop calls this once at startup (like
+    _set_process_posture) so the lines survive independent of posture.
+    Passing cfg=None clears the sink."""
+    global _evidence_path
+    try:
+        _evidence_path = (evidence_file(cfg, node)
+                          if cfg and cfg.get("_dir") and node else None)
+    except (KeyError, TypeError):
+        _evidence_path = None
+
+
+def _evidence(line):
+    """Emit an observability line to stderr (as always) AND, when a receive
+    loop has armed a durable sink (#129), append it there so #62 soak
+    evidence stops being ephemeral. Best-effort with a single-backup
+    rotation: evidence logging must NEVER break or slow the receive path."""
+    print(line, file=sys.stderr)
+    path = _evidence_path
+    if not path:
+        return
+    try:
+        with _evidence_lock:
+            try:
+                if (os.path.exists(path)
+                        and os.path.getsize(path) > EVIDENCE_FILE_MAX):
+                    os.replace(path, path + ".1")
+            except OSError:
+                pass
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(f"{int(time.time())} {line}\n")
+    except OSError:
+        pass
 
 
 def _set_process_posture(posture):
@@ -7712,13 +7759,14 @@ def _handle_control(cfg, me, frm, ctl, verdict=None, ev=None):
         if verdict == FRAME_VERIFIED:
             # #93 Phase B-prime: verified continuity MIGRATES -- but only
             # when the owner has authorized it (#130). Default is log-only:
-            # a node cannot rename itself in the trust store unbidden.
+            # a node cannot rename itself in the trust store unbidden. The
+            # WOULD_MIGRATE line rides the durable evidence log (#129).
             if _rename_migration_enabled(cfg):
                 _migrate_pin(cfg, old, new, head)
             else:
-                print(f"{head} WOULD_MIGRATE (key-verified; migration not "
-                      f"enabled -- owner sets `rename_migration` to allow, "
-                      f"#130)", file=sys.stderr)
+                _evidence(f"{head} WOULD_MIGRATE (key-verified; migration "
+                          f"not enabled -- owner sets `rename_migration` to "
+                          f"allow, #130)")
         elif verdict == FRAME_MISMATCH:
             # A DIFFERENT key than the one pinned for `old` is asking the
             # fleet to carry old's identity to `new` -- the exact
@@ -7726,11 +7774,11 @@ def _handle_control(cfg, me, frm, ctl, verdict=None, ev=None):
             # product is evidence, so this cannot read as generic unverified
             # chatter (lodestar B1); it is the attack-path event the #62
             # soak bar requires witnessing.
-            print(f"{head} KEY_MISMATCH (pin conflict -- possible "
-                  f"impersonation)", file=sys.stderr)
+            _evidence(f"{head} KEY_MISMATCH (pin conflict -- possible "
+                  f"impersonation)")
         else:
-            print(f"{head} UNVERIFIED_SOURCE (ignored -- not a proven "
-                  f"key-continuity rename)", file=sys.stderr)
+            _evidence(f"{head} UNVERIFIED_SOURCE (ignored -- not a proven "
+                  f"key-continuity rename)")
         return None
     if kind == "ping":
         note_peer(cfg, frm, "message", ctl.get("status"))
@@ -7834,9 +7882,9 @@ def _handle_control(cfg, me, frm, ctl, verdict=None, ev=None):
         # and never wakes an agent.
         exc_name = _single_line(str(ctl.get("exc") or "?"))[:40]
         note_peer(cfg, frm, "crash")
-        print(f"MESH_CRASH from={_single_line(frm)} exc={exc_name} "
+        _evidence(f"MESH_CRASH from={_single_line(frm)} exc={exc_name} "
               f"(its receive loop died -- deliveries there will sit "
-              f"until something re-arms)", file=sys.stderr)
+              f"until something re-arms)")
         return None
     print(f"MESH_CTL from={_single_line(frm)} kind={kind!r} (ignored)",
           file=sys.stderr)
@@ -7927,6 +7975,7 @@ def cmd_watch(args):
     _set_process_posture("watch")
     cfg = load_config()
     me = my_node(cfg, args.as_node)
+    _set_evidence_log(cfg, me)  # #129: durable soak evidence
     if args.follow or args.timeout is None:  # long-running watch
         # Surface the running version so process-state is visible, not just
         # install-state: enforcement (#74) gates on the live watcher (#75).
@@ -8872,6 +8921,7 @@ def _run_mcp_server(args, label, idle_hint):
     # overrides (legacy registrations); harness=None keeps env auto-detection.
     me = my_node(cfg, getattr(args, "as_node", None),
                  harness=getattr(args, "harness", None))
+    _set_evidence_log(cfg, me)  # #129: durable soak evidence
     # Log the RUNNING version, not just the installed one: enforcement (#74)
     # keys on the live receive process, so an operator needs to see which code
     # this long-running server is actually on -- an install can be updated
@@ -12134,6 +12184,7 @@ def _run_worker_supervisor(args):
             f"error: --as '{requested_node}' does not match configured "
             f"node '{configured_node}' for backend '{backend}'")
     me = my_node(cfg, configured_node)
+    _set_evidence_log(cfg, me)  # #129: durable soak evidence
     if me != configured_node:
         sys.exit(
             f"error: configured worker node '{configured_node}' could not "

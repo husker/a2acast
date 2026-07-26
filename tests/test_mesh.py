@@ -7323,6 +7323,84 @@ class RenameMigrationTests(unittest.TestCase):
         self.assertTrue(mesh._load_renames(self.cfg)["beta"]["certified"])
 
 
+class EvidenceLogTests(unittest.TestCase):
+    """#129: Phase-A observability lines (the #62 lifecycle set) must be
+    DURABLY logged, not only printed to a receive process's stderr that
+    nothing captures under hook-wake posture."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.cfg = make_cfg(self._tmp.name)
+        mesh._set_evidence_log(None, None)          # start disarmed
+        self.addCleanup(mesh._set_evidence_log, None, None)
+
+    def test_disarmed_writes_stderr_only(self):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            mesh._evidence("MESH_RENAME id=x beta -> gamma WOULD_MIGRATE")
+        self.assertIn("WOULD_MIGRATE", err.getvalue())
+        self.assertFalse(os.path.exists(
+            mesh.evidence_file(self.cfg, "me")))
+
+    def test_armed_writes_both_stderr_and_durable_log(self):
+        mesh._set_evidence_log(self.cfg, "me")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            mesh._evidence("MESH_CERT from=beta CERT_OK")
+        self.assertIn("CERT_OK", err.getvalue())          # stderr preserved
+        with open(mesh.evidence_file(self.cfg, "me")) as f:
+            logged = f.read()
+        self.assertIn("MESH_CERT from=beta CERT_OK", logged)
+        self.assertRegex(logged, r"^\d+ MESH_CERT")       # timestamped
+
+    def test_lifecycle_line_lands_in_the_durable_log(self):
+        # the real path: a rename observation through _handle_control writes
+        # WOULD_MIGRATE to the durable log, not just stderr.
+        mesh._set_evidence_log(self.cfg, "me")
+        with contextlib.redirect_stderr(io.StringIO()):
+            mesh._handle_control(self.cfg, "me", "beta",
+                                 {"mw": "rename", "new": "gamma", "ts": 1},
+                                 verdict=mesh.FRAME_VERIFIED, ev={"id": "f1"})
+        with open(mesh.evidence_file(self.cfg, "me")) as f:
+            self.assertIn("WOULD_MIGRATE", f.read())
+
+    def test_log_rotates_at_the_cap(self):
+        mesh._set_evidence_log(self.cfg, "me")
+        path = mesh.evidence_file(self.cfg, "me")
+        with open(path, "w") as f:
+            f.write("x" * (mesh.EVIDENCE_FILE_MAX + 1))
+        with contextlib.redirect_stderr(io.StringIO()):
+            mesh._evidence("MESH_CERT from=beta CERT_OK")
+        self.assertTrue(os.path.exists(path + ".1"))       # rolled backup
+        with open(path) as f:
+            fresh = f.read()
+        self.assertIn("CERT_OK", fresh)
+        self.assertLess(len(fresh), 1000)                  # fresh file
+
+    def test_evidence_never_raises_on_a_bad_sink(self):
+        # a directory where the file should be: append fails, must be
+        # swallowed (evidence logging cannot break the receive path).
+        mesh._set_evidence_log(self.cfg, "me")
+        os.mkdir(mesh.evidence_file(self.cfg, "me"))
+        with contextlib.redirect_stderr(io.StringIO()):
+            mesh._evidence("MESH_CERT from=beta CERT_OK")  # must not raise
+
+    def test_watch_arms_the_sink(self):
+        fd, lock_path = tempfile.mkstemp()
+        os.close(fd)
+        with mock.patch.object(mesh, "load_config", return_value=self.cfg), \
+             mock.patch.object(mesh, "my_node", return_value="me"), \
+             mock.patch.object(mesh, "_acquire_presence_lock",
+                               return_value=lock_path), \
+             mock.patch.object(mesh, "_cmd_watch_owned",
+                               lambda *a, **k: None):
+            mesh.cmd_watch(argparse.Namespace(
+                as_node=None, follow=False, timeout=5))
+        self.assertEqual(mesh._evidence_path,
+                         mesh.evidence_file(self.cfg, "me"))
+
+
 class ControlHandlingTests(unittest.TestCase):
     def setUp(self):
         # #122: the process-posture global is stamped by cmd_watch tests
