@@ -7246,6 +7246,106 @@ class DowngradeRatchetObserveTests(unittest.TestCase):
             return mesh._observe_downgrade(self.cfg, frm, verdict)
 
 
+class VerdictEnforcementTests(unittest.TestCase):
+    """#74 slice 4: the receiver REFUSES a frame that lies. Two verdicts are
+    refused and only two -- a signature that fails against the pinned key, and
+    a pinned signer that went unsigned (signature stripping). Everything else
+    still delivers, which is the migration window the fleet rolls out through.
+
+    Default OFF. This is the first slice where a misjudgement drops real
+    traffic, so the deployment decision stays the owner's."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.cfg = make_cfg(self._tmp.name)
+        mesh._refused_last.clear()
+        self.addCleanup(mesh._refused_last.clear)
+
+    @staticmethod
+    def _fake_pub(fill=1):
+        t = b"ssh-ed25519"
+        blob = (len(t).to_bytes(4, "big") + t
+                + (32).to_bytes(4, "big") + bytes([fill]) * 32)
+        return "ssh-ed25519 " + base64.b64encode(blob).decode()
+
+    def _pin(self, name):
+        pins = mesh._load_pins(self.cfg)
+        pins[name] = self._fake_pub()
+        mesh._write_json_secure(mesh.pins_file(self.cfg), pins)
+
+    def _refusal(self, frm, verdict):
+        with contextlib.redirect_stderr(io.StringIO()):
+            return mesh._refuse_frame(self.cfg, frm, verdict)
+
+    # -- the default-off gate -------------------------------------------
+
+    def test_off_by_default_refuses_nothing(self):
+        self.assertFalse(mesh._enforce_verdicts_enabled(self.cfg))
+        self._pin("beta")
+        self.assertIsNone(self._refusal("beta", mesh.FRAME_MISMATCH))
+        self.assertIsNone(self._refusal("beta", mesh.FRAME_UNSIGNED))
+
+    # -- what enforcement refuses ---------------------------------------
+
+    def test_mismatch_from_pinned_peer_is_refused(self):
+        self.cfg["enforce_verdicts"] = True
+        self._pin("beta")
+        self.assertIsNotNone(self._refusal("beta", mesh.FRAME_MISMATCH))
+
+    def test_downgrade_is_refused(self):
+        """A pinned key IS 'has signed before', so unsigned-after-pinned is
+        signature stripping."""
+        self.cfg["enforce_verdicts"] = True
+        self._pin("beta")
+        self.assertIsNotNone(self._refusal("beta", mesh.FRAME_UNSIGNED))
+
+    # -- what enforcement must NOT refuse (the load-bearing direction) ----
+
+    def test_verified_frame_still_delivers(self):
+        """A ratchet that only ever refuses could be `return False`."""
+        self.cfg["enforce_verdicts"] = True
+        self._pin("beta")
+        self.assertIsNone(self._refusal("beta", mesh.FRAME_VERIFIED))
+
+    def test_first_contact_unverified_still_delivers(self):
+        """The migration window: an unpinned peer is how every node starts."""
+        self.cfg["enforce_verdicts"] = True
+        self.assertIsNone(self._refusal("newbie", mesh.FRAME_UNVERIFIED))
+
+    def test_first_contact_unsigned_still_delivers(self):
+        """Unsigned from an UNPINNED name is a node that never signed, not a
+        downgrade. Refusing it would partition every pre-signing node."""
+        self.cfg["enforce_verdicts"] = True
+        self.assertIsNone(self._refusal("newbie", mesh.FRAME_UNSIGNED))
+
+    def test_unverified_from_pinned_peer_still_delivers(self):
+        self.cfg["enforce_verdicts"] = True
+        self._pin("beta")
+        self.assertIsNone(self._refusal("beta", mesh.FRAME_UNVERIFIED))
+
+    # -- evidence ---------------------------------------------------------
+
+    def test_refusal_emits_throttled_evidence(self):
+        self.cfg["enforce_verdicts"] = True
+        self._pin("beta")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            mesh._refuse_frame(self.cfg, "beta", mesh.FRAME_MISMATCH)
+            mesh._refuse_frame(self.cfg, "beta", mesh.FRAME_MISMATCH)
+        self.assertEqual(err.getvalue().count("MESH_REFUSED"), 1)
+
+    def test_both_receive_loops_share_one_predicate(self):
+        """#133's bug was two sibling arms making the same decision
+        differently. cmd_watch and the daemon loop must both route through
+        _refuse_frame -- not each carry a copy."""
+        src = open(os.path.join(os.path.dirname(mesh.__file__),
+                                "mesh.py"), encoding="utf-8").read()
+        self.assertEqual(
+            src.count("if _refuse_frame(cfg, frm, verdict) is not None:"), 2)
+        self.assertEqual(src.count("def _refuse_frame("), 1)
+
+
 class RenameMigrationTests(unittest.TestCase):
     """#93 Phase B-prime: a KEY-VERIFIED rename migrates the pin to the
     new name and tombstones the old one. Monotonic (one migration per
