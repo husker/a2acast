@@ -23,6 +23,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import urllib.error
 from unittest import mock
@@ -514,9 +515,8 @@ class JoinAlreadyJoinedTests(unittest.TestCase):
         --as in its MCP registration. The rename must not look like it took."""
         out = io.StringIO()
         with mock.patch.object(mesh, "_detect_harness", return_value="codex"), \
-             mock.patch.object(mesh, "_mutate_config"):
-            with contextlib.redirect_stdout(out):
-                mesh.cmd_iam(argparse.Namespace(node="renamed"))
+             mock.patch.object(mesh, "_mutate_config"), contextlib.redirect_stdout(out):
+            mesh.cmd_iam(argparse.Namespace(node="renamed"))
         text = out.getvalue()
         self.assertIn("renamed", text)
         self.assertIn("mesh codex-setup", text)
@@ -529,9 +529,8 @@ class JoinAlreadyJoinedTests(unittest.TestCase):
         out = io.StringIO()
         with mock.patch.object(mesh, "_detect_harness",
                                return_value="claude"), \
-             mock.patch.object(mesh, "_mutate_config"):
-            with contextlib.redirect_stdout(out):
-                mesh.cmd_iam(argparse.Namespace(node="renamed"))
+             mock.patch.object(mesh, "_mutate_config"), contextlib.redirect_stdout(out):
+            mesh.cmd_iam(argparse.Namespace(node="renamed"))
         self.assertNotIn("baked", out.getvalue())
 
     def test_init_in_joined_project_names_the_supported_flow(self):
@@ -2009,10 +2008,9 @@ class WatchTests(MembershipCmdTests):
         out = io.StringIO()
         with mock.patch.object(mesh, "_stream_events", stream), \
              mock.patch.object(mesh, "_post", lambda *a, **k: {"id": "x"}), \
-             contextlib.redirect_stdout(out):
-            with self.assertRaises(KeyboardInterrupt):
-                mesh.cmd_watch(argparse.Namespace(
-                    timeout=None, as_node=None, follow=False))
+             contextlib.redirect_stdout(out), self.assertRaises(KeyboardInterrupt):
+            mesh.cmd_watch(argparse.Namespace(
+                timeout=None, as_node=None, follow=False))
         self.assertIn("first delivery", out.getvalue())
         self.assertIn("second delivery", out.getvalue())
         self.assertNotIn("MESH_WATCH_DONE", out.getvalue())
@@ -3122,10 +3120,9 @@ class WakeHookCheckpointTests(MembershipCmdTests):
              mock.patch.object(mesh, "_post", lambda *a, **k: {"id": "x"}), \
              mock.patch.object(mesh, "_emit_message",
                                side_effect=RuntimeError("boom")), \
-             contextlib.redirect_stdout(io.StringIO()):
-            with self.assertRaises(RuntimeError):
-                mesh.cmd_watch(argparse.Namespace(
-                    timeout=60, as_node=None, follow=False))
+             contextlib.redirect_stdout(io.StringIO()), self.assertRaises(RuntimeError):
+            mesh.cmd_watch(argparse.Namespace(
+                timeout=60, as_node=None, follow=False))
         # A death at the handoff must leave the transport checkpoint behind
         # the frame -- the next arm re-delivers instead of silently eating it.
         self.assertEqual(self._cursor(), {"since": 0, "seen": []})
@@ -3146,10 +3143,9 @@ class WakeHookCheckpointTests(MembershipCmdTests):
              mock.patch.object(mesh, "_post", lambda *a, **k: {"id": "x"}), \
              mock.patch.object(mesh, "_emit_message",
                                side_effect=RuntimeError("boom")), \
-             contextlib.redirect_stdout(io.StringIO()):
-            with self.assertRaises(RuntimeError):
-                mesh.cmd_watch(argparse.Namespace(
-                    timeout=60, as_node=None, follow=False))
+             contextlib.redirect_stdout(io.StringIO()), self.assertRaises(RuntimeError):
+            mesh.cmd_watch(argparse.Namespace(
+                timeout=60, as_node=None, follow=False))
         # Task ingest is the durable handoff and precedes the emit; the
         # transport checkpoint still must not have moved.
         self.assertIn("crash-task", mesh.load_tasks(mesh.load_config()))
@@ -4512,10 +4508,9 @@ class MintProvenanceTests(unittest.TestCase):
         with open(mesh.owner_key_file(self.cfg), "w") as f:
             f.write("this is not a private key")
         err = io.StringIO()
-        with contextlib.redirect_stderr(err):
-            with self.assertRaises(ValueError):
-                mesh._mint_member_cert(self.cfg, "beta",
-                                       self._node_pubkey())
+        with contextlib.redirect_stderr(err), self.assertRaises(ValueError):
+            mesh._mint_member_cert(self.cfg, "beta",
+                                   self._node_pubkey())
         self.assertIn("INCONCLUSIVE", err.getvalue())
         self.assertNotIn("provenance=passphrase-gated", err.getvalue())
 
@@ -4739,9 +4734,8 @@ class CodexHookTests(MembershipCmdTests):
              mock.patch.object(sys, "stdin", io.StringIO(
                  '{"hook_event_name":"Stop"}')), \
              contextlib.redirect_stdout(out), \
-             contextlib.redirect_stderr(err):
-            with self.assertRaises(SystemExit) as cm:
-                mesh.cmd_claude_hook(argparse.Namespace(timeout=30))
+             contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as cm:
+            mesh.cmd_claude_hook(argparse.Namespace(timeout=30))
         self.assertEqual(cm.exception.code, 2)
         self.assertEqual(out.getvalue(), "")
         self.assertIn("MESH_MESSAGE from='beta': hello", err.getvalue())
@@ -5546,12 +5540,11 @@ class SignedApprovalTests(unittest.TestCase):
         block = mesh._owner_trust_block(self.cfg)
         with mock.patch.dict(os.environ,
                              {mesh.OWNER_TRUST_UNATTENDED_ENV: ""},
-                             clear=False):
-            with self._as_member(member), \
+                             clear=False), self._as_member(member), \
                     contextlib.redirect_stdout(io.StringIO()):
-                with self.assertRaises(SystemExit) as caught:
-                    mesh.cmd_owner_trust(
-                        self._trust_args(block, unattended=True))
+            with self.assertRaises(SystemExit) as caught:
+                mesh.cmd_owner_trust(
+                    self._trust_args(block, unattended=True))
         self.assertIn(mesh.OWNER_TRUST_UNATTENDED_ENV, str(caught.exception))
         self.assertFalse(os.path.exists(mesh.owner_trust_file(member)))
 
@@ -5560,11 +5553,10 @@ class SignedApprovalTests(unittest.TestCase):
         block = mesh._owner_trust_block(self.cfg)
         with mock.patch.dict(os.environ,
                              {mesh.OWNER_TRUST_UNATTENDED_ENV: "1"},
-                             clear=False):
-            with self._as_member(member), \
+                             clear=False), self._as_member(member), \
                     mock.patch.object(mesh, "_read_from_terminal") as prompt, \
                     contextlib.redirect_stdout(io.StringIO()):
-                mesh.cmd_owner_trust(self._trust_args(block, unattended=True))
+            mesh.cmd_owner_trust(self._trust_args(block, unattended=True))
         self.assertFalse(prompt.called)
         self.assertEqual(mesh._load_owner_trust(member),
                          mesh._load_owner_trust(self.cfg))
@@ -5675,10 +5667,9 @@ class AgentWatchWarningTests(unittest.TestCase):
                 mock.patch.object(mesh, "_acquire_presence_lock",
                                   return_value=None), \
                 contextlib.redirect_stdout(io.StringIO()), \
-                contextlib.redirect_stderr(err):
-            with self.assertRaises(SystemExit):
-                mesh.cmd_watch(argparse.Namespace(
-                    follow=True, timeout=None, as_node=None))
+                contextlib.redirect_stderr(err), self.assertRaises(SystemExit):
+            mesh.cmd_watch(argparse.Namespace(
+                follow=True, timeout=None, as_node=None))
         self.assertIn(f"MESH_WATCH_START v{mesh.VERSION}", err.getvalue())
 
     def test_cmd_watch_follow_warns_in_agent_session(self):
@@ -5710,10 +5701,9 @@ class AgentWatchWarningTests(unittest.TestCase):
                 mock.patch.object(mesh, "_acquire_presence_lock",
                                   return_value=None), \
                 contextlib.redirect_stdout(io.StringIO()), \
-                contextlib.redirect_stderr(err):
-            with self.assertRaises(SystemExit):
-                mesh.cmd_watch(argparse.Namespace(
-                    follow=True, timeout=None, as_node=None))
+                contextlib.redirect_stderr(err), self.assertRaises(SystemExit):
+            mesh.cmd_watch(argparse.Namespace(
+                follow=True, timeout=None, as_node=None))
         self.assertIn("#86", err.getvalue())
         self.assertIn("mesh watch --timeout 5400", err.getvalue())
 
@@ -6228,6 +6218,145 @@ class DecryptMetaTests(unittest.TestCase):
         pt, ts = mesh._decrypt_meta(self.cfg, wire, expected_topic="mw-wrong")
         self.assertIsNone(pt)
         self.assertIsNone(ts)
+
+
+class EnrollmentTests(unittest.TestCase):
+    """#76 owner-signed enrollment: with `enrollment` on, first contact pins
+    only a key the OWNER has vouched for, closing the TOFU first-contact-MITM
+    window. Default OFF -- an existing mesh upgrades to byte-identical
+    behaviour and the owner turns it on deliberately, fleet-wide.
+
+    The property that makes this shippable ahead of #74: refusing to PIN never
+    refuses DELIVERY. An unenrolled peer stays FRAME_UNVERIFIED, which
+    delivers today and still delivers under enforcement."""
+
+    @classmethod
+    def setUpClass(cls):
+        if not shutil.which("ssh-keygen"):
+            raise unittest.SkipTest("ssh-keygen unavailable")
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.cfg = make_cfg(tmp.name)
+        with contextlib.redirect_stdout(io.StringIO()):
+            mesh._owner_init(self.cfg, allow_unprotected=True)
+        self.sender_cfg = make_cfg(tempfile.mkdtemp())
+        self.sender_cfg["id"] = self.cfg["id"]
+        self.sender_pub = mesh._ensure_node_key(
+            self.sender_cfg, "laptop", "claude")
+        self.to = "all"
+        self.topic = mesh.topic(self.cfg, self.to)
+
+    def _frame(self):
+        payload = {"f": "laptop", "t": self.to, "b": "hi"}
+        ts, signed = mesh._sign_wrapper_payload(
+            self.sender_cfg, self.to, payload, harness="claude")
+        return ts, signed
+
+    def _verify(self, err=None):
+        ts, w = self._frame()
+        with contextlib.redirect_stderr(io.StringIO() if err is None else err):
+            return mesh._verify_frame(
+                self.cfg, "laptop", w.get("k"), w.get("s"),
+                self.topic, ts, mesh._base_payload(w))
+
+    def _enroll(self, name="laptop", pub=None):
+        """Owner-vouch a key into this receiver's cert cache."""
+        block = mesh._mint_member_cert(self.cfg, name,
+                                       self.sender_pub if pub is None else pub)
+        ok, reason, body = mesh._verify_member_cert(self.cfg, block)
+        self.assertTrue(ok, reason)
+        mesh._note_cert(self.cfg, body)
+        return body
+
+    # -- the default-off gate -------------------------------------------
+
+    def test_enrollment_off_still_tofu_pins(self):
+        """Fails if the gate defaults on: every existing mesh relies on this."""
+        self.assertFalse(mesh._enrollment_enabled(self.cfg))
+        self.assertEqual(self._verify(), mesh.FRAME_UNVERIFIED)
+        self.assertEqual(mesh._pinned_peer_key(self.cfg, "laptop"),
+                         mesh._normalize_pubkey(self.sender_pub))
+
+    # -- enrollment on: the legitimate case must still work ---------------
+
+    def test_enrolled_key_pins(self):
+        """The load-bearing 'still permits the honest case' direction: a guard
+        that only ever refuses could be replaced by `return None`."""
+        self.cfg["enrollment"] = True
+        self._enroll()
+        self.assertEqual(self._verify(), mesh.FRAME_UNVERIFIED)
+        self.assertEqual(mesh._pinned_peer_key(self.cfg, "laptop"),
+                         mesh._normalize_pubkey(self.sender_pub))
+
+    # -- enrollment on: the refusals -------------------------------------
+
+    def test_uncertified_key_is_not_pinned(self):
+        """The TOFU-MITM window: no owner cert -> no pin."""
+        self.cfg["enrollment"] = True
+        self.assertEqual(self._verify(), mesh.FRAME_UNVERIFIED)
+        self.assertIsNone(mesh._pinned_peer_key(self.cfg, "laptop"))
+
+    def test_cert_for_a_different_name_is_not_pinned(self):
+        """A cert binds key AND name; presenting beta's cert as laptop fails."""
+        self.cfg["enrollment"] = True
+        self._enroll(name="beta")
+        self.assertEqual(self._verify(), mesh.FRAME_UNVERIFIED)
+        self.assertIsNone(mesh._pinned_peer_key(self.cfg, "laptop"))
+
+    def test_revoked_cert_is_not_pinned(self):
+        self.cfg["enrollment"] = True
+        body = self._enroll()
+        with contextlib.redirect_stdout(io.StringIO()):
+            block = mesh._mint_revocation(self.cfg, body["fpr"], "laptop")
+        ok, _reason, rbody = mesh._verify_revocation(self.cfg, block)
+        self.assertTrue(ok)
+        mesh._note_revocation(self.cfg, rbody)
+        self.assertEqual(self._verify(), mesh.FRAME_UNVERIFIED)
+        self.assertIsNone(mesh._pinned_peer_key(self.cfg, "laptop"))
+
+    def test_expired_cert_is_not_pinned(self):
+        self.cfg["enrollment"] = True
+        body = self._enroll()
+        body["exp"] = int(time.time()) - 1
+        mesh._note_cert(self.cfg, body)
+        self.assertEqual(self._verify(), mesh.FRAME_UNVERIFIED)
+        self.assertIsNone(mesh._pinned_peer_key(self.cfg, "laptop"))
+
+    # -- refusing to pin is not refusing to deliver -----------------------
+
+    def test_refusal_does_not_change_the_verdict(self):
+        """Phase 1 must stay additive: an unenrolled peer gets the SAME verdict
+        an unpinned peer already got, so nothing downstream drops it. Fails if
+        enrollment ever starts returning MISMATCH/UNSIGNED."""
+        self.cfg["enrollment"] = True
+        refused = self._verify()
+        self.cfg["enrollment"] = False
+        cfg2 = make_cfg(tempfile.mkdtemp())
+        cfg2["id"] = self.cfg["id"]
+        ts, w = self._frame()
+        with contextlib.redirect_stderr(io.StringIO()):
+            baseline = mesh._verify_frame(
+                cfg2, "laptop", w.get("k"), w.get("s"),
+                mesh.topic(cfg2, self.to), ts, mesh._base_payload(w))
+        self.assertEqual(refused, baseline)
+
+    def test_refusal_emits_throttled_evidence(self):
+        """#129: a misconfigured fleet must not look identical to a quiet one."""
+        self.cfg["enrollment"] = True
+        mesh._enroll_last.clear()
+        err = io.StringIO()
+        self._verify(err)
+        self._verify(err)
+        self.assertEqual(err.getvalue().count("ENROLL_REFUSED"), 1)
+
+    def test_already_pinned_peer_is_unaffected(self):
+        """Enrollment gates FIRST CONTACT only -- turning it on must not strand
+        peers pinned before it was enabled."""
+        self.assertEqual(self._verify(), mesh.FRAME_UNVERIFIED)
+        self.cfg["enrollment"] = True
+        self.assertEqual(self._verify(), mesh.FRAME_VERIFIED)
 
 
 class PeerPinTests(unittest.TestCase):
@@ -8230,9 +8359,8 @@ class AutoWatchTests(MembershipCmdTests):
         out = io.StringIO()
         with mock.patch.object(mesh, "cmd_status", boom), \
              mock.patch.object(sys, "argv", ["mesh", "status"]), \
-             contextlib.redirect_stdout(out):
-            with self.assertRaises(SystemExit) as cm:
-                mesh.main()
+             contextlib.redirect_stdout(out), self.assertRaises(SystemExit) as cm:
+            mesh.main()
         self.assertEqual(cm.exception.code, 130)
 
 
@@ -11216,7 +11344,7 @@ class WorkerWorktreeTests(unittest.TestCase):
 
     def test_existing_worker_branch_gets_a_non_destructive_suffix(self):
         token = mesh._worker_task_token("task-branch-collision")
-        occupied = "codex/a2acast-{}-copilot".format(token)
+        occupied = f"codex/a2acast-{token}-copilot"
         subprocess.run(
             ["git", "-C", self.repo, "branch", occupied, self.base],
             check=True)
@@ -13641,10 +13769,9 @@ class SupervisorOwnershipTests(unittest.TestCase):
         with mock.patch.object(
                 mesh, "_try_supervisor_advisory_lock",
                 side_effect=mesh.WorkerEvidenceUnsupported("unavailable"),
-                create=True):
-            with self.assertRaisesRegex(
-                    mesh.WorkerEvidenceUnsupported, "unavailable"):
-                mesh._acquire_supervise_lock(self.cfg, self.node)
+                create=True), self.assertRaisesRegex(
+                mesh.WorkerEvidenceUnsupported, "unavailable"):
+            mesh._acquire_supervise_lock(self.cfg, self.node)
 
     def test_stop_rejects_special_pids_and_retains_evidence(self):
         for pid in (0, -1, 1):
@@ -15499,10 +15626,9 @@ class WorkerSuperviseTests(unittest.TestCase):
                  side_effect=lambda *_args, **_kwargs: []), \
              mock.patch.object(
                  mesh.time, "sleep", side_effect=StopLoop), \
-             mock.patch.object(mesh.signal, "signal"):
-            with self.assertRaises(StopLoop):
-                mesh.cmd_worker_supervise(
-                    self._args(once=False, interval=1))
+             mock.patch.object(mesh.signal, "signal"), self.assertRaises(StopLoop):
+            mesh.cmd_worker_supervise(
+                self._args(once=False, interval=1))
 
         self.assertEqual(events, [
             "recovery", "receiver", "start", "stop",
@@ -15576,10 +15702,9 @@ class WorkerSuperviseTests(unittest.TestCase):
              mock.patch.object(mesh.signal, "signal"), \
              mock.patch.object(
                  mesh, "SUPERVISE_RECEIVER_JOIN_TIMEOUT", 0.05), \
-             contextlib.redirect_stderr(stderr):
-            with self.assertRaises(StopLoop):
-                mesh.cmd_worker_supervise(
-                    self._args(once=False, interval=1))
+             contextlib.redirect_stderr(stderr), self.assertRaises(StopLoop):
+            mesh.cmd_worker_supervise(
+                self._args(once=False, interval=1))
 
         contender = mesh._acquire_supervise_lock(
             self.cfg, "worker-copilot")
@@ -15639,10 +15764,9 @@ class WorkerSuperviseTests(unittest.TestCase):
                  mesh, "MeshMCPServer", return_value=receiver), \
              mock.patch.object(mesh.time, "sleep",
                                side_effect=stop_main_loop), \
-             mock.patch.object(mesh.signal, "signal"):
-            with self.assertRaises(StopLoop):
-                mesh.cmd_worker_supervise(
-                    self._args(once=False, interval=1))
+             mock.patch.object(mesh.signal, "signal"), self.assertRaises(StopLoop):
+            mesh.cmd_worker_supervise(
+                self._args(once=False, interval=1))
 
         self.assertFalse(os.path.exists(
             mesh._supervise_pid_file(self.cfg, "worker-copilot")))
@@ -15678,10 +15802,9 @@ class WorkerSuperviseTests(unittest.TestCase):
                  mesh, "MeshMCPServer", return_value=receiver), \
              mock.patch.object(mesh.time, "sleep",
                                side_effect=stop_main_loop), \
-             mock.patch.object(mesh.signal, "signal"):
-            with self.assertRaises(StopLoop):
-                mesh.cmd_worker_supervise(
-                    self._args(once=False, interval=1))
+             mock.patch.object(mesh.signal, "signal"), self.assertRaises(StopLoop):
+            mesh.cmd_worker_supervise(
+                self._args(once=False, interval=1))
 
         self.assertTrue(subscribed.is_set())
         self.assertFalse(os.path.exists(
@@ -15692,11 +15815,10 @@ class WorkerSuperviseTests(unittest.TestCase):
              mock.patch.object(
                  mesh, "load_pool_config", return_value=self.pool,
                  create=True), \
-             mock.patch.object(mesh, "my_node") as resolve:
-            with self.assertRaisesRegex(
-                    SystemExit, "does not match configured node"):
-                mesh.cmd_worker_supervise(
-                    self._args(as_node="worker-goose"))
+             mock.patch.object(mesh, "my_node") as resolve, self.assertRaisesRegex(
+                SystemExit, "does not match configured node"):
+            mesh.cmd_worker_supervise(
+                self._args(as_node="worker-goose"))
         resolve.assert_not_called()
 
     def test_rejects_duplicate_and_coordinator_worker_identities(self):
@@ -15749,9 +15871,8 @@ class WorkerSuperviseTests(unittest.TestCase):
                  mock.patch.object(mesh, "load_config", return_value=self.cfg), \
                  mock.patch.object(
                      mesh, "load_pool_config", return_value=pool,
-                     create=True):
-                with self.assertRaisesRegex(SystemExit, message):
-                    mesh.cmd_worker_supervise(args)
+                     create=True), self.assertRaisesRegex(SystemExit, message):
+                mesh.cmd_worker_supervise(args)
 
     def test_rejects_negative_interval_before_startup(self):
         with mock.patch.object(mesh, "load_config") as load_cfg:
@@ -16210,9 +16331,8 @@ class SuperviseReceiverTests(unittest.TestCase):
              mock.patch.object(
                  mesh, "MeshMCPServer", return_value=receiver), \
              mock.patch.object(mesh.time, "sleep",
-                               side_effect=stop_main_loop):
-            with self.assertRaises(StopLoop):
-                mesh.cmd_codex_supervise(ns)
+                               side_effect=stop_main_loop), self.assertRaises(StopLoop):
+            mesh.cmd_codex_supervise(ns)
 
         self.assertTrue(subscribed.is_set())
         self.assertFalse(os.path.exists(
