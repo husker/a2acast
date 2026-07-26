@@ -43,10 +43,12 @@ format is security-relevant. So is anything on a #62 / #74 / #76 / #93 line.
    Default new wire behaviour to OFF and gate it on an explicit operator assertion that
    the whole fleet is capable — never on something a single sender can observe about itself.
 
-6. **The receive path does not durably mutate trust state.** Inbound frames may be
-   observed, logged, and verified. Writing to the pin store, cert store, or any identity
-   record from a received frame crosses a phase boundary that is still an open design
-   question (#137). Do not cross it in a PR.
+6. **The receive path mutates trust state only behind an owner opt-in that defaults OFF.**
+   Inbound frames may be observed, logged, and verified freely. Writing to the pin store,
+   cert store, or any identity record from a received frame requires an explicit operator
+   opt-in that DEFAULTS OFF (#137 resolved: A). #93's `rename_migration` is the reference --
+   the mechanism ships dormant, and enabling it fleet-wide is a separate owner decision.
+   Never make such a write the default, and never enable it in the same PR that adds it.
 
 7. **Design-first for the signed frame body.** Bring it to review *before* implementing.
    Skipping this is how #131 got built around the wrong gate.

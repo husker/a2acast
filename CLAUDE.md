@@ -19,7 +19,7 @@ Crypto, identity, pins, certs, revocation, verdicts, wire format, or anything on
 3. **A guard must be load-bearing both ways.** Revert the fix → attack test fails. Disable the mechanism → legitimate-use test fails.
 4. **Gate on the property, not a proxy.** "Sender has a list" ≠ "fleet can parse this." "Name is unpinned" ≠ "name is unclaimed."
 5. **Mixed versions are normal.** New signed fields partition older peers. Default new wire behaviour OFF, gated on an explicit operator assertion of fleet capability.
-6. **The receive path does not durably mutate trust state.** Writing identity records from an inbound frame is an open design question (#137) — do not cross it in a PR.
+6. **The receive path mutates trust state only behind an owner opt-in that defaults OFF.** A received frame may write identity records (pins/tombstones) only via an explicit opt-in that defaults off (#137 resolved A; #93's `rename_migration`) — never the default, never enabled in the PR that adds it.
 7. **Design-first for signed-frame-body changes**, before implementing.
 
 ## Review

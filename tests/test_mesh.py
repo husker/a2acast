@@ -7117,6 +7117,212 @@ class DowngradeRatchetObserveTests(unittest.TestCase):
             return mesh._observe_downgrade(self.cfg, frm, verdict)
 
 
+class RenameMigrationTests(unittest.TestCase):
+    """#93 Phase B-prime: a KEY-VERIFIED rename migrates the pin to the
+    new name and tombstones the old one. Monotonic (one migration per
+    old name, ever -- never FROM a tombstone), replay-idempotent, never
+    a silent pin replace, and `old` derives from the signed frm only.
+    Gated on the owner's `rename_migration` opt-in (#130); enabled here
+    to exercise the migration path (default-off is its own test)."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.cfg = make_cfg(self._tmp.name)
+        self.cfg["rename_migration"] = True  # #130: owner-authorized
+
+    @staticmethod
+    def _fake_pub(fill):
+        t = b"ssh-ed25519"
+        blob = (len(t).to_bytes(4, "big") + t
+                + (32).to_bytes(4, "big") + bytes([fill]) * 32)
+        return "ssh-ed25519 " + base64.b64encode(blob).decode()
+
+    def _pin(self, name, pub):
+        pins = mesh._load_pins(self.cfg)
+        pins[name] = pub
+        mesh._write_json_secure(mesh.pins_file(self.cfg), pins)
+
+    def _rename(self, old, new, verdict=None, eid="fr-1"):
+        if verdict is None:
+            verdict = mesh.FRAME_VERIFIED
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            mesh._handle_control(self.cfg, "me", old,
+                                 {"mw": "rename", "new": new, "ts": 1},
+                                 verdict=verdict, ev={"id": eid})
+        return err.getvalue()
+
+    def test_default_is_log_only_migration_disabled(self):
+        # #130 (James's design call): without the owner's opt-in a
+        # key-verified rename does NOT migrate -- it stays today's
+        # log-only WOULD_MIGRATE, and the trust store is untouched.
+        cfg = dict(self.cfg)
+        cfg.pop("rename_migration", None)
+        key = self._fake_pub(1)
+        pins = mesh._load_pins(cfg)
+        pins["beta"] = key
+        mesh._write_json_secure(mesh.pins_file(cfg), pins)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            mesh._handle_control(cfg, "me", "beta",
+                                 {"mw": "rename", "new": "gamma", "ts": 1},
+                                 verdict=mesh.FRAME_VERIFIED, ev={"id": "f"})
+        self.assertIn("WOULD_MIGRATE", err.getvalue())
+        self.assertNotIn("MIGRATED (", err.getvalue())
+        self.assertNotIn("gamma", mesh._load_pins(cfg))
+        self.assertEqual(mesh._load_renames(cfg), {})
+
+    def test_verified_rename_migrates_pin_and_tombstones(self):
+        key = self._fake_pub(1)
+        self._pin("beta", key)
+        out = self._rename("beta", "gamma")
+        self.assertIn("MIGRATED", out)
+        self.assertIn("id=fr-1", out)
+        pins = mesh._load_pins(self.cfg)
+        self.assertEqual(pins.get("gamma"), key)
+        self.assertEqual(pins.get("beta"), key)  # old pin retained
+        renames = mesh._load_renames(self.cfg)
+        self.assertEqual(renames["beta"]["new"], "gamma")
+
+    def test_migration_is_idempotent_on_replay(self):
+        key = self._fake_pub(1)
+        self._pin("beta", key)
+        self._rename("beta", "gamma")
+        out = self._rename("beta", "gamma", eid="fr-2")
+        self.assertIn("ALREADY_MIGRATED", out)
+        self.assertNotIn("REFUSED", out)
+        self.assertEqual(len(mesh._load_renames(self.cfg)), 1)
+
+    def test_second_rename_from_tombstone_is_refused(self):
+        # never FROM a tombstone: the first verified migration wins, ever
+        key = self._fake_pub(1)
+        self._pin("beta", key)
+        self._rename("beta", "gamma")
+        out = self._rename("beta", "delta", eid="fr-3")
+        self.assertIn("TOMBSTONE", out)
+        self.assertNotIn("delta", mesh._load_pins(self.cfg))
+
+    def test_chain_rename_from_the_new_name_is_allowed(self):
+        key = self._fake_pub(1)
+        self._pin("beta", key)
+        self._rename("beta", "gamma")
+        out = self._rename("gamma", "delta")
+        self.assertIn("MIGRATED", out)
+        self.assertEqual(mesh._load_pins(self.cfg).get("delta"), key)
+
+    def test_target_pin_conflict_refuses_without_replacing(self):
+        # _bind_peer's never-silently-replace invariant holds through
+        # migration: a rename cannot steal a name someone else owns.
+        self._pin("beta", self._fake_pub(1))
+        self._pin("gamma", self._fake_pub(2))
+        out = self._rename("beta", "gamma")
+        self.assertIn("TARGET_PIN_CONFLICT", out)
+        self.assertEqual(mesh._load_pins(self.cfg)["gamma"],
+                         self._fake_pub(2))
+        self.assertNotIn("beta", mesh._load_renames(self.cfg))
+
+    def test_revoked_occupant_does_not_block_migration(self):
+        # seam 1 (lodestar): a target pinned to a REVOKED key is not a
+        # legitimate holder -- it must not permanently block a real
+        # migration. The revoked pin is replaced (targeted, non-silent).
+        src = self._fake_pub(1)
+        revoked = self._fake_pub(2)
+        self._pin("beta", src)
+        self._pin("gamma", revoked)
+        # mark gamma's key revoked in the loose store
+        fpr = mesh._key_fingerprint(revoked)
+        mesh._write_json_secure(mesh.revocations_file(self.cfg),
+                                {fpr: {"name": "gamma", "iat": 1}})
+        out = self._rename("beta", "gamma")
+        self.assertIn("TARGET_REVOKED_REPLACED", out)
+        self.assertIn("MIGRATED", out)
+        self.assertEqual(mesh._load_pins(self.cfg)["gamma"], src)
+        self.assertEqual(mesh._load_renames(self.cfg)["beta"]["new"], "gamma")
+
+    def test_clean_and_unknown_occupant_still_block(self):
+        # a different NON-revoked (clean) occupant blocks; an UNKNOWN
+        # revocation status must FAIL SHUT and also block (lodestar B2).
+        self._pin("beta", self._fake_pub(1))
+        self._pin("gamma", self._fake_pub(2))  # clean: no revocations
+        out = self._rename("beta", "gamma")
+        self.assertIn("TARGET_PIN_CONFLICT", out)
+        self.assertEqual(mesh._load_pins(self.cfg)["gamma"], self._fake_pub(2))
+        self.assertNotIn("beta", mesh._load_renames(self.cfg))
+
+    def test_unpinned_but_live_name_is_occupied(self):
+        # seam 2 (lodestar): an UNPINNED name that is a live known identity
+        # (in the roster) must not be TOFU-captured by a rename.
+        self._pin("beta", self._fake_pub(1))
+        self.cfg["nodes"] = list(self.cfg.get("nodes", [])) + ["gamma"]
+        self.assertIsNone(mesh._pinned_peer_key(self.cfg, "gamma"))  # unpinned
+        out = self._rename("beta", "gamma")
+        self.assertIn("TARGET_OCCUPIED", out)
+        self.assertNotIn("gamma", mesh._load_pins(self.cfg))
+        self.assertNotIn("beta", mesh._load_renames(self.cfg))
+
+    def test_unreadable_peer_store_fails_shut_as_occupied(self):
+        # bastion hardening: if the peer store cannot be read, a name that
+        # is not in the roster cannot be PROVEN free -- fail shut (occupied)
+        # rather than let the rename TOFU-capture it.
+        self._pin("beta", self._fake_pub(1))
+        with mock.patch.object(mesh, "load_peers",
+                               side_effect=OSError("corrupt")):
+            out = self._rename("beta", "unknowable")
+        self.assertIn("TARGET_OCCUPIED", out)
+        self.assertNotIn("unknowable", mesh._load_pins(self.cfg))
+
+    def test_unpinned_and_not_live_name_migrates(self):
+        # the happy path stays intact: a genuinely fresh name (not pinned,
+        # not in roster/peers) is free to receive the migration.
+        self._pin("beta", self._fake_pub(1))
+        self.assertNotIn("zeta-fresh", self.cfg.get("nodes", []))
+        out = self._rename("beta", "zeta-fresh")
+        self.assertIn("MIGRATED", out)
+        self.assertEqual(mesh._load_pins(self.cfg)["zeta-fresh"],
+                         self._fake_pub(1))
+
+    def test_migration_onto_a_tombstoned_name_is_refused(self):
+        key = self._fake_pub(1)
+        self._pin("beta", key)
+        self._rename("beta", "gamma")
+        self._pin("zeta", self._fake_pub(3))
+        out = self._rename("zeta", "beta", eid="fr-4")
+        self.assertIn("TOMBSTONE", out)
+        self.assertNotIn("beta", {
+            k: v for k, v in mesh._load_renames(self.cfg).items()
+            if k == "zeta"})
+
+    def test_non_verified_verdicts_migrate_nothing(self):
+        key = self._fake_pub(1)
+        self._pin("beta", key)
+        for verdict in (mesh.FRAME_MISMATCH, mesh.FRAME_UNVERIFIED,
+                        mesh.FRAME_UNSIGNED):
+            out = self._rename("beta", "gamma", verdict=verdict)
+            self.assertNotIn("MIGRATED", out)
+        self.assertNotIn("gamma", mesh._load_pins(self.cfg))
+        self.assertEqual(mesh._load_renames(self.cfg), {})
+
+    def test_unpinned_source_stays_an_observation(self):
+        # verdict says verified but no pin exists (test harnesses, store
+        # corruption): nothing to carry, nothing written.
+        out = self._rename("beta", "gamma")
+        self.assertIn("WOULD_MIGRATE", out)
+        self.assertNotIn("MIGRATED (", out)
+        self.assertEqual(mesh._load_pins(self.cfg), {})
+        self.assertEqual(mesh._load_renames(self.cfg), {})
+
+    def test_certified_tier_is_recorded_at_migration(self):
+        key = self._fake_pub(1)
+        self._pin("beta", key)
+        fpr = mesh._key_fingerprint(key)
+        mesh._write_json_secure(mesh.certs_file(self.cfg), {
+            fpr: {"v": 1, "kind": "membercert", "name": "beta",
+                  "key": key, "fpr": fpr, "iat": 1, "exp": 2**31}})
+        self._rename("beta", "gamma")
+        self.assertTrue(mesh._load_renames(self.cfg)["beta"]["certified"])
+
+
 class ControlHandlingTests(unittest.TestCase):
     def setUp(self):
         # #122: the process-posture global is stamped by cmd_watch tests
