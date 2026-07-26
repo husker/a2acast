@@ -2367,7 +2367,13 @@ def _sign_wrapper_payload(cfg, to, payload, harness=None):
     if not cfg.get("key") or not cfg.get("_dir"):
         return timestamp, payload
     if harness is None:
-        harness = _detect_harness()
+        # #144: a long-running server (mcp-serve) carries no harness env
+        # marker, so _detect_harness() returns None there and every send would
+        # fall back to the generic (unpinned) key -> unsigned or KEY_MISMATCH
+        # against the per-harness key the CLI uses and peers pinned. The
+        # process records its explicitly-passed --harness on cfg at startup;
+        # prefer that pin before env auto-detection.
+        harness = cfg.get("_harness") or _detect_harness()
     try:
         # Ensure this node has a signing key, generating it once if absent.
         # Nodes that joined BEFORE signing existed have no key (it is created
@@ -9068,8 +9074,16 @@ def _run_mcp_server(args, label, idle_hint):
     # --harness pins identity to that harness's pin file, resolved fresh here
     # at startup, so `mesh iam` renames take effect on restart. --as still
     # overrides (legacy registrations); harness=None keeps env auto-detection.
-    me = my_node(cfg, getattr(args, "as_node", None),
-                 harness=getattr(args, "harness", None))
+    harness = getattr(args, "harness", None)
+    me = my_node(cfg, getattr(args, "as_node", None), harness=harness)
+    if harness:
+        # #144: pin the signing key to the SAME per-harness key the CLI uses
+        # for the life of this process. Without this, every send resolves the
+        # harness via _detect_harness() -> None (mcp-serve has no harness env
+        # marker) -> the generic (unpinned) key. Process-only: _-prefixed cfg
+        # keys are never written to disk (_save_config / _mutate_config strip
+        # them), so this cannot pollute .meshwire.json.
+        cfg["_harness"] = harness
     _set_evidence_log(cfg, me)  # #129: durable soak evidence
     # Log the RUNNING version, not just the installed one: enforcement (#74)
     # keys on the live receive process, so an operator needs to see which code
@@ -9271,7 +9285,13 @@ def _setup_workspace_mcp(args, harness):
     if not isinstance(servers, dict):
         servers = {}
     server = {"command": "mesh",
-              "args": ["mcp-serve", "--config", os.path.abspath(cfg_path)]}
+              # #144: pin the watcher to THIS harness's signing key. The
+              # server's env carries no harness marker, so without --harness
+              # every frame it sends resolves to the generic (unpinned) key ->
+              # unsigned or KEY_MISMATCH vs the key peers pinned. (codex-setup
+              # already threads this; claude/copilot go through here.)
+              "args": ["mcp-serve", "--config", os.path.abspath(cfg_path),
+                       "--harness", spec.name]}
     if spec.mcp_server_type:
         server["type"] = spec.mcp_server_type
     if spec.mcp_all_tools:

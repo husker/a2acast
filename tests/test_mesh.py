@@ -6020,6 +6020,65 @@ class SignOnSendTests(unittest.TestCase):
         self.assertIn("ssh-keygen refused the key", err.getvalue())
 
 
+class HarnessPinnedSigningTests(unittest.TestCase):
+    """#144: a long-running server (mcp-serve) carries no harness env marker,
+    so _detect_harness() is None there. It records its explicit --harness on
+    cfg at startup; the send path must prefer that pin so frames sign with the
+    SAME per-harness key the CLI uses, never the generic (unpinned) one."""
+
+    @classmethod
+    def setUpClass(cls):
+        if not shutil.which("ssh-keygen"):
+            raise unittest.SkipTest("ssh-keygen unavailable")
+
+    def _cfg(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        return make_cfg(tmp.name)
+
+    def test_process_harness_pins_signing_key_when_env_blind(self):
+        # The core fix. Env detection is None (mcp-serve); cfg["_harness"]
+        # must select the claude key. Reverting the `cfg.get("_harness") or`
+        # read makes this sign with the generic key -> k mismatches -> FAILS.
+        cfg = self._cfg()
+        mesh._ensure_node_key(cfg, "laptop", "claude")
+        # k carries the normalized (comment-stripped) pubkey, so compare
+        # against _own_node_pubkey, not the with-comment _ensure_node_key value.
+        claude_pub = mesh._own_node_pubkey(cfg, "claude")
+        cfg["_harness"] = "claude"
+        with mock.patch.object(mesh, "_detect_harness", return_value=None):
+            _ts, signed = mesh._sign_wrapper_payload(
+                cfg, "all", {"f": "laptop", "t": "all", "b": "hi"})
+        self.assertEqual(signed.get("k"), claude_pub)
+
+    def test_process_harness_mints_no_generic_key(self):
+        # The footgun guard. With the harness correctly pinned, the send must
+        # NOT mint a second (generic) key beside the claude one -- a generic
+        # key would sign frames peers read as KEY_MISMATCH. Without the fix the
+        # env-blind path mints .meshwire.key -> this assertion FAILS.
+        cfg = self._cfg()
+        mesh._ensure_node_key(cfg, "laptop", "claude")
+        cfg["_harness"] = "claude"
+        with mock.patch.object(mesh, "_detect_harness", return_value=None):
+            mesh._sign_wrapper_payload(
+                cfg, "all", {"f": "laptop", "t": "all", "b": "hi"})
+        self.assertFalse(os.path.isfile(mesh.node_key_file(cfg)),
+                         "send minted a generic key despite a pinned harness")
+        self.assertTrue(os.path.isfile(mesh.node_key_file(cfg, "claude")))
+
+    def test_no_process_harness_is_unchanged(self):
+        # Regression guard (passes both ways): with no _harness AND env blind,
+        # the fix adds nothing -- harness stays None and the generic path
+        # applies exactly as before.
+        cfg = self._cfg()
+        mesh._ensure_node_key(cfg, "laptop", None)
+        generic_pub = mesh._own_node_pubkey(cfg, None)
+        with mock.patch.object(mesh, "_detect_harness", return_value=None):
+            _ts, signed = mesh._sign_wrapper_payload(
+                cfg, "all", {"f": "laptop", "t": "all", "b": "hi"})
+        self.assertEqual(signed.get("k"), generic_pub)
+
+
 class VerifyFrameTests(unittest.TestCase):
     """Slice 3: classifying a received frame's authenticity. The security
     property is that verification runs against the local pin for the claimed
@@ -10239,6 +10298,10 @@ class ClaudeSetupTests(unittest.TestCase):
         self.assertEqual(srv["command"], "mesh")
         self.assertEqual(srv["args"][:2], ["mcp-serve", "--config"])
         self.assertTrue(os.path.isabs(srv["args"][2]))
+        # #144: the pin must thread --harness so the watcher signs with the
+        # SAME per-harness key the CLI uses (its process env has no harness
+        # marker). Without it, sends resolve to the generic (unpinned) key.
+        self.assertEqual(srv["args"][3:5], ["--harness", "claude"])
 
     def test_idempotent_and_preserves_other_servers(self):
         with open(".mcp.json", "w") as f:
