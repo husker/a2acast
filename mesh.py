@@ -4765,8 +4765,7 @@ def _worker_candidates(cfg, pool, requested, job):
 def _worker_journal_file(cfg, node, task_id):
     return os.path.join(
         cfg["_dir"],
-        ".meshwire.worker-journal.{}.{}.json".format(
-            _worker_node_token(node), _worker_task_token(task_id)),
+        f".meshwire.worker-journal.{_worker_node_token(node)}.{_worker_task_token(task_id)}.json",
     )
 
 
@@ -5158,8 +5157,7 @@ def _load_worker_journal(cfg, node, task_id, expected=None):
 def _worker_output_file(cfg, node, task_id):
     return os.path.join(
         cfg["_dir"],
-        ".meshwire.worker-output.{}.{}.log".format(
-            _worker_node_token(node), _worker_task_token(task_id)),
+        f".meshwire.worker-output.{_worker_node_token(node)}.{_worker_task_token(task_id)}.log",
     )
 
 
@@ -5637,9 +5635,7 @@ def _claim_worker_execution(cfg, me, task_id, task, binding, job,
             if _load_worker_execution_marker(
                     cfg, task_id, expected=expected_marker) != expected_marker:
                 return False
-        elif not latest or latest != prior_journal:
-            return False
-        elif marker != expected_marker:
+        elif not latest or latest != prior_journal or marker != expected_marker:
             return False
         _write_worker_phase(
             cfg, me, task_id, binding, "validated",
@@ -11102,7 +11098,7 @@ class _ManagedDirectoryPath:
     readers use there (#50 Phase C).
     """
 
-    __slots__ = ("path", "label", "identity")
+    __slots__ = ("identity", "label", "path")
 
     def __init__(self, path, label, identity):
         self.path = path
