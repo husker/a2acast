@@ -3600,6 +3600,273 @@ class MemberCertTests(unittest.TestCase):
         self.assertIn("no pinned key", str(caught.exception))
 
 
+class RevlistPullTests(unittest.TestCase):
+    """#76 leg 2: the pull transport that makes distribution non-
+    suppressible. A node behind a peer requests its list, verifies the
+    owner signature, and adopts if newer; a peer that asserts an iat it
+    cannot substantiate is struck and backed off."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.cfg = make_cfg(tmp.name)
+        with contextlib.redirect_stdout(io.StringIO()):
+            mesh._owner_init(self.cfg, allow_unprotected=True)
+        for d in (mesh._revgap_last, mesh._revpull_last, mesh._revpull_expect,
+                  mesh._revpull_strikes, mesh._revserve_last):
+            d.clear()
+            self.addCleanup(d.clear)
+
+    def _node_pub(self):
+        d = tempfile.mkdtemp(dir=self.cfg["_dir"])
+        key = os.path.join(d, "nk")
+        subprocess.run([shutil.which("ssh-keygen"), "-q", "-t", "ed25519",
+                        "-N", "", "-C", "n", "-f", key],
+                       check=True, capture_output=True, timeout=60)
+        with open(key + ".pub", encoding="utf-8") as f:
+            return f.read().strip()
+
+    def _mint_list(self):
+        fpr = mesh._key_fingerprint(mesh._normalize_pubkey(self._node_pub()))
+        blk = mesh._mint_revocation(self.cfg, fpr, name="mallory")
+        ok, _r, body = mesh._verify_revocation(self.cfg, blk)
+        self.assertTrue(ok)
+        mesh._note_revocation(self.cfg, body)
+        return mesh._mint_revlist(self.cfg)  # (block, body)
+
+    def _capture_send(self, store):
+        def fake(cfg, me, to, body, title=None, ctl=None):
+            store.append({"to": to, "ctl": ctl})
+            return {"id": "x"}
+        return fake
+
+    # -- trigger: behind a peer -> a rate-limited pull request --
+
+    def test_gap_triggers_a_pull_request(self):
+        sent = []
+        with mock.patch.object(mesh, "send_raw", self._capture_send(sent)), \
+             contextlib.redirect_stderr(io.StringIO()):
+            mesh._observe_revlist_freshness(
+                self.cfg, "me", "beta", {"f": "beta", "rl": 9000},
+                mesh.FRAME_VERIFIED, now=1.0)
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(sent[0]["to"], "beta")
+        self.assertEqual(sent[0]["ctl"]["mw"], "revlist-req")
+
+    def test_pull_request_is_rate_limited_per_peer(self):
+        sent = []
+        with mock.patch.object(mesh, "send_raw", self._capture_send(sent)), \
+             contextlib.redirect_stderr(io.StringIO()):
+            base = {"f": "beta", "rl": 9000}
+            mesh._observe_revlist_freshness(self.cfg, "me", "beta", base,
+                                            mesh.FRAME_VERIFIED, now=1.0)
+            mesh._observe_revlist_freshness(self.cfg, "me", "beta", base,
+                                            mesh.FRAME_VERIFIED, now=5.0)
+            mesh._observe_revlist_freshness(
+                self.cfg, "me", "beta", base, mesh.FRAME_VERIFIED,
+                now=1.0 + mesh.REVPULL_MIN_INTERVAL + 1)
+        self.assertEqual(len(sent), 2)
+
+    # -- suppression vector (bastion): an UNVERIFIED assertion is inert --
+
+    def test_unverified_assertion_neither_pulls_nor_poisons(self):
+        # A shared-key-trusted but UNSIGNED frame spoofed from=victim with an
+        # inflated rl must NOT pull or write _revpull_expect. Without the
+        # verdict gate it would, and the victim's honest verified reply (a
+        # lower real iat) would then be struck -- the strike-hardening
+        # weaponized. REVGAP still logs; only the pull is gated.
+        sent = []
+        err = io.StringIO()
+        with mock.patch.object(mesh, "send_raw", self._capture_send(sent)), \
+             contextlib.redirect_stderr(err):
+            for v in (mesh.FRAME_UNSIGNED, mesh.FRAME_UNVERIFIED,
+                      mesh.FRAME_MISMATCH, None):
+                mesh._observe_revlist_freshness(
+                    self.cfg, "me", "victim",
+                    {"f": "victim", "rl": 9000}, v, now=1.0)
+        self.assertEqual(sent, [])                        # no pull emitted
+        self.assertNotIn("victim", mesh._revpull_expect)  # not poisoned
+        self.assertIn("MESH_REVGAP", err.getvalue())      # gap still observed
+
+    def test_verified_assertion_still_pulls(self):
+        # the other direction of the guard: a VERIFIED assertion drives the
+        # pull exactly as before, so the fix is not a blanket disable.
+        sent = []
+        with mock.patch.object(mesh, "send_raw", self._capture_send(sent)), \
+             contextlib.redirect_stderr(io.StringIO()):
+            mesh._observe_revlist_freshness(
+                self.cfg, "me", "beta", {"f": "beta", "rl": 9000},
+                mesh.FRAME_VERIFIED, now=1.0)
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(mesh._revpull_expect.get("beta"), 9000)
+
+    def test_spoofed_expectation_cannot_suppress_the_victim(self):
+        # End to end: attacker inflates the expectation over an UNSIGNED
+        # frame; because it never lands, the victim's genuine list (arriving
+        # on a real verified resp) adopts and the victim is NOT struck.
+        block, body = self._mint_list()   # body["iat"] = victim's REAL iat
+        with mock.patch.object(mesh, "send_raw", lambda *a, **k: {"id": "x"}), \
+             contextlib.redirect_stderr(io.StringIO()):
+            mesh._observe_revlist_freshness(
+                self.cfg, "me", "victim",
+                {"f": "victim", "rl": body["iat"] + 10_000},
+                mesh.FRAME_UNSIGNED, now=1.0)
+        self.assertNotIn("victim", mesh._revpull_expect)
+        with contextlib.redirect_stderr(io.StringIO()):
+            mesh._handle_control(self.cfg, "me", "victim",
+                                 {"mw": "revlist-resp", "block": block},
+                                 verdict=mesh.FRAME_VERIFIED)
+        self.assertEqual(mesh._load_revlist(self.cfg)[0]["iat"], body["iat"])
+        self.assertNotIn("victim", mesh._revpull_strikes)
+
+    # -- serve: answer a request with our adopted, re-verified block --
+
+    def test_request_is_served_our_verified_block(self):
+        block, body = self._mint_list()
+        mesh._note_revlist(self.cfg, body, block)
+        sent = []
+        with mock.patch.object(mesh, "send_raw", self._capture_send(sent)):
+            mesh._handle_control(self.cfg, "me", "beta",
+                                 {"mw": "revlist-req", "have": 0})
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(sent[0]["ctl"]["mw"], "revlist-resp")
+        self.assertEqual(sent[0]["ctl"]["block"], block)
+
+    def test_request_not_served_when_peer_is_current(self):
+        block, body = self._mint_list()
+        mesh._note_revlist(self.cfg, body, block)
+        sent = []
+        with mock.patch.object(mesh, "send_raw", self._capture_send(sent)):
+            mesh._handle_control(self.cfg, "me", "beta",
+                                 {"mw": "revlist-req", "have": body["iat"]})
+        self.assertEqual(sent, [])
+
+    def test_serving_is_rate_limited(self):
+        block, body = self._mint_list()
+        mesh._note_revlist(self.cfg, body, block)
+        sent = []
+        with mock.patch.object(mesh, "send_raw", self._capture_send(sent)):
+            for _ in range(3):
+                mesh._handle_control(self.cfg, "me", "beta",
+                                     {"mw": "revlist-req", "have": 0})
+        self.assertEqual(len(sent), 1)
+
+    # -- adopt: a verified newer list is adopted end-to-end --
+
+    def test_response_verifies_and_adopts(self):
+        block, body = self._mint_list()
+        mesh._revpull_expect["beta"] = body["iat"]
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            mesh._handle_control(self.cfg, "me", "beta",
+                                 {"mw": "revlist-resp", "block": block},
+                                 verdict=mesh.FRAME_VERIFIED)
+        got, _ = mesh._load_revlist(self.cfg)
+        self.assertEqual(got["iat"], body["iat"])
+        self.assertIn("MESH_REVLIST_PULLED", err.getvalue())
+
+    def test_forged_block_is_rejected_and_struck(self):
+        block, body = self._mint_list()
+        forged = block[:-6] + "AAAAAA"  # corrupt the signature tail
+        mesh._revpull_expect["beta"] = body["iat"]
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            mesh._handle_control(self.cfg, "me", "beta",
+                                 {"mw": "revlist-resp", "block": forged},
+                                 verdict=mesh.FRAME_VERIFIED)
+        self.assertIsNone(mesh._load_revlist(self.cfg)[0])
+        self.assertIn("MESH_REVLIST_UNSUBSTANTIATED", err.getvalue())
+        self.assertEqual(mesh._revpull_strikes["beta"], 1)
+
+    def test_short_served_iat_is_unsubstantiated(self):
+        # peer asserted a high iat but served a lower (older) list -> strike
+        block, body = self._mint_list()
+        mesh._revpull_expect["beta"] = body["iat"] + 10_000
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            mesh._handle_control(self.cfg, "me", "beta",
+                                 {"mw": "revlist-resp", "block": block},
+                                 verdict=mesh.FRAME_VERIFIED)
+        self.assertIn("MESH_REVLIST_UNSUBSTANTIATED", err.getvalue())
+        self.assertIsNone(mesh._load_revlist(self.cfg)[0])
+
+    def test_unverified_frame_never_strikes(self):
+        # bastion seat: a forged revlist-resp on an UNVERIFIED carrier must
+        # not strike the honest node it claims to be from.
+        block, body = self._mint_list()
+        forged = block[:-6] + "AAAAAA"
+        mesh._revpull_expect["beta"] = body["iat"]
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            for v in (mesh.FRAME_UNVERIFIED, mesh.FRAME_UNSIGNED,
+                      mesh.FRAME_MISMATCH, None):
+                mesh._handle_control(self.cfg, "me", "beta",
+                                     {"mw": "revlist-resp", "block": forged},
+                                     verdict=v)
+        self.assertNotIn("MESH_REVLIST_UNSUBSTANTIATED", err.getvalue())
+        self.assertNotIn("beta", mesh._revpull_strikes)
+
+    def test_unsolicited_response_strikes_nobody_but_still_adopts(self):
+        # no outstanding pull (expected is None): a valid owner-signed list
+        # is adopted (gossip), but a bad one strikes nobody.
+        block, body = self._mint_list()
+        with contextlib.redirect_stderr(io.StringIO()):
+            mesh._handle_control(self.cfg, "me", "beta",
+                                 {"mw": "revlist-resp", "block": block},
+                                 verdict=mesh.FRAME_VERIFIED)
+        self.assertEqual(mesh._load_revlist(self.cfg)[0]["iat"], body["iat"])
+        self.assertNotIn("beta", mesh._revpull_strikes)
+        # and a forged unsolicited one strikes nobody either
+        forged = block[:-6] + "AAAAAA"
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            mesh._handle_control(self.cfg, "me", "gamma",
+                                 {"mw": "revlist-resp", "block": forged},
+                                 verdict=mesh.FRAME_VERIFIED)
+        self.assertNotIn("MESH_REVLIST_UNSUBSTANTIATED", err.getvalue())
+        self.assertNotIn("gamma", mesh._revpull_strikes)
+
+    def test_struck_peer_is_backed_off_from_pulling(self):
+        mesh._revpull_strikes["beta"] = mesh.REVPULL_STRIKE_MAX
+        sent = []
+        with mock.patch.object(mesh, "send_raw", self._capture_send(sent)), \
+             contextlib.redirect_stderr(io.StringIO()):
+            mesh._observe_revlist_freshness(
+                self.cfg, "me", "beta", {"f": "beta", "rl": 9000},
+                mesh.FRAME_VERIFIED, now=1.0)
+        self.assertEqual(sent, [])  # no pull; gap still logged
+
+    def test_substantiated_pull_clears_strikes(self):
+        block, body = self._mint_list()
+        mesh._revpull_strikes["beta"] = 2
+        mesh._revpull_expect["beta"] = body["iat"]
+        with contextlib.redirect_stderr(io.StringIO()):
+            mesh._handle_control(self.cfg, "me", "beta",
+                                 {"mw": "revlist-resp", "block": block},
+                                 verdict=mesh.FRAME_VERIFIED)
+        self.assertNotIn("beta", mesh._revpull_strikes)
+
+    def test_full_cycle_two_nodes_converge(self):
+        # A (blind) pulls from B (holds the list); the served block adopts.
+        block, body = self._mint_list()
+        # self.cfg plays BOTH nodes here (same owner trust); the point is the
+        # served block round-trips through verify+adopt, not the identities.
+        mesh._note_revlist(self.cfg, body, block)
+        relay = []
+        with mock.patch.object(mesh, "send_raw", self._capture_send(relay)):
+            mesh._handle_control(self.cfg, "B", "A",
+                                 {"mw": "revlist-req", "have": 0})
+        self.assertEqual(relay[0]["ctl"]["mw"], "revlist-resp")
+        served_block = relay[0]["ctl"]["block"]
+        # A verifies and adopts it (A shares the owner trust via same cfg id)
+        mesh._revpull_expect["B"] = body["iat"]
+        with contextlib.redirect_stderr(io.StringIO()):
+            mesh._handle_control(self.cfg, "A", "B",
+                                 {"mw": "revlist-resp", "block": served_block},
+                                 verdict=mesh.FRAME_VERIFIED)
+        self.assertEqual(mesh._load_revlist(self.cfg)[0]["iat"], body["iat"])
+
+
 class RevlistFreshnessTests(unittest.TestCase):
     """#76 distribution, sender-asserted freshness (observe-only): a node
     with an adopted list stamps a SIGNED `rl`=iat; a receiver behind that
@@ -3612,8 +3879,15 @@ class RevlistFreshnessTests(unittest.TestCase):
         self.cfg = make_cfg(tmp.name)
         with contextlib.redirect_stdout(io.StringIO()):
             mesh._owner_init(self.cfg, allow_unprotected=True)
-        mesh._revgap_last.clear()
-        self.addCleanup(mesh._revgap_last.clear)
+        for d in (mesh._revgap_last, mesh._revpull_last, mesh._revpull_expect,
+                  mesh._revpull_strikes, mesh._revserve_last):
+            d.clear()
+            self.addCleanup(d.clear)
+        # leg 2: the observer now sends a pull request on a gap; keep these
+        # freshness-only tests off the network.
+        p = mock.patch.object(mesh, "send_raw", lambda *a, **k: {"id": "x"})
+        p.start()
+        self.addCleanup(p.stop)
 
     def _adopt(self, iat=5000):
         body = {"v": 1, "kind": "revlist", "mesh": self.cfg["id"],
@@ -3669,7 +3943,7 @@ class RevlistFreshnessTests(unittest.TestCase):
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
             mesh._observe_revlist_freshness(
-                self.cfg, "beta", {"f": "beta", "b": "x", "rl": 9000})
+                self.cfg, "me", "beta", {"f": "beta", "b": "x", "rl": 9000})
         self.assertIn("MESH_REVGAP", err.getvalue())
         self.assertIn("from=beta", err.getvalue())
         self.assertIn("peer_iat=9000", err.getvalue())
@@ -3679,9 +3953,9 @@ class RevlistFreshnessTests(unittest.TestCase):
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
             mesh._observe_revlist_freshness(
-                self.cfg, "beta", {"f": "beta", "rl": 9000})
+                self.cfg, "me", "beta", {"f": "beta", "rl": 9000})
             mesh._observe_revlist_freshness(
-                self.cfg, "beta", {"f": "beta", "rl": 100})
+                self.cfg, "me", "beta", {"f": "beta", "rl": 100})
         self.assertNotIn("REVGAP", err.getvalue())
 
     def test_blind_receiver_still_sees_a_peer_gap(self):
@@ -3689,7 +3963,7 @@ class RevlistFreshnessTests(unittest.TestCase):
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
             mesh._observe_revlist_freshness(
-                self.cfg, "beta", {"f": "beta", "rl": 3})
+                self.cfg, "me", "beta", {"f": "beta", "rl": 3})
         self.assertIn("MESH_REVGAP", err.getvalue())
         self.assertIn("mine=0", err.getvalue())
 
@@ -3697,13 +3971,13 @@ class RevlistFreshnessTests(unittest.TestCase):
         self._adopt(iat=1000)
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
-            mesh._observe_revlist_freshness(self.cfg, "beta",
+            mesh._observe_revlist_freshness(self.cfg, "me", "beta",
                                             {"f": "beta", "b": "x"})
-            mesh._observe_revlist_freshness(self.cfg, "beta",
+            mesh._observe_revlist_freshness(self.cfg, "me", "beta",
                                             {"f": "beta", "rl": "soon"})
-            mesh._observe_revlist_freshness(self.cfg, "beta",
+            mesh._observe_revlist_freshness(self.cfg, "me", "beta",
                                             {"f": "beta", "rl": True})
-            mesh._observe_revlist_freshness(self.cfg, "beta", None)
+            mesh._observe_revlist_freshness(self.cfg, "me", "beta", None)
         self.assertNotIn("REVGAP", err.getvalue())
 
     def test_revgap_is_throttled_per_peer(self):
@@ -3711,10 +3985,10 @@ class RevlistFreshnessTests(unittest.TestCase):
         base = {"f": "beta", "rl": 9000}
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
-            mesh._observe_revlist_freshness(self.cfg, "beta", base, now=1.0)
-            mesh._observe_revlist_freshness(self.cfg, "beta", base, now=5.0)
+            mesh._observe_revlist_freshness(self.cfg, "me", "beta", base, now=1.0)
+            mesh._observe_revlist_freshness(self.cfg, "me", "beta", base, now=5.0)
             mesh._observe_revlist_freshness(
-                self.cfg, "beta", base,
+                self.cfg, "me", "beta", base,
                 now=1.0 + mesh.REVGAP_LOG_INTERVAL + 1)
         self.assertEqual(err.getvalue().count("MESH_REVGAP"), 2)
 
@@ -3723,8 +3997,9 @@ class RevlistFreshnessTests(unittest.TestCase):
         before = os.listdir(self.cfg["_dir"])
         with contextlib.redirect_stderr(io.StringIO()):
             mesh._observe_revlist_freshness(
-                self.cfg, "beta", {"f": "beta", "rl": 9000})
+                self.cfg, "me", "beta", {"f": "beta", "rl": 9000})
         self.assertEqual(sorted(os.listdir(self.cfg["_dir"])), sorted(before))
+
 
 
 class RevlistTests(unittest.TestCase):
