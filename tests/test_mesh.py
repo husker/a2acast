@@ -3,6 +3,7 @@
 Run from the repo root:  python3 -m unittest discover -s tests -v
 """
 import argparse
+import ast
 import base64
 import contextlib
 import dataclasses
@@ -16529,6 +16530,61 @@ class SuperviseReceiverTests(unittest.TestCase):
 
         self.assertFalse(watch_thread.is_alive())
         self.assertEqual(seen_timeouts, [300])
+
+
+class StdlibOnlyTests(unittest.TestCase):
+    """mesh.py stays stdlib-only on every supported Python, locally.
+
+    The CI `stdlib_only` job (#140) enforces this on Python 3.13 only —
+    a third-party import, or a version-skewed stdlib addition (e.g.
+    `import tomllib` on 3.8), slips past it on the other matrix
+    versions. These meta-tests close that gap: they run on every Python
+    in the dev loop (`python3 -m unittest discover -s tests`), so a
+    violation fails before push. They are a safety net, not a license to
+    be careless — the property still relies on contributor attention.
+    """
+
+    ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    MESH_PATH = os.path.join(ROOT, "mesh.py")
+
+    def test_mesh_imports_with_site_packages_disabled(self):
+        # `-S` drops site-packages from sys.path, so a third-party import
+        # in mesh.py fails here. Runs on every supported Python (3.8-3.14,
+        # incl. Windows), catching both third-party imports AND
+        # version-skewed stdlib (e.g. `import tomllib` on 3.8) at module
+        # load — something the 3.13-only AST scan below cannot catch.
+        proc = subprocess.run(
+            [sys.executable, "-S", "-c", "import mesh"],
+            cwd=self.ROOT, capture_output=True, timeout=60)
+        self.assertEqual(
+            proc.returncode, 0,
+            "mesh.py is not importable without site-packages; a "
+            "third-party import may have crept in.\n"
+            "stderr:\n" + proc.stderr.decode("utf-8", "replace"))
+
+    def test_every_import_resolves_to_stdlib(self):
+        # Belt-and-braces: mirrors the CI `stdlib_only` AST scan
+        # (ci.yml:91-111). Catches a lazy or nested import that the -S
+        # import above would not execute at module load time.
+        if not hasattr(sys, "stdlib_module_names"):
+            self.skipTest(
+                "sys.stdlib_module_names is 3.10+; "
+                "the -S import test above covers 3.8/3.9 at module load")
+        with open(self.MESH_PATH, encoding="utf-8") as f:
+            tree = ast.parse(f.read())
+        allowed = set(sys.stdlib_module_names) | {"mesh", "__future__"}
+        bad = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    bad.add(alias.name.split(".")[0])
+            elif isinstance(node, ast.ImportFrom) and node.level == 0 \
+                    and node.module:
+                bad.add(node.module.split(".")[0])
+        bad -= allowed
+        self.assertFalse(
+            bad,
+            f"mesh.py imports non-stdlib module(s): {sorted(bad)}")
 
 
 if __name__ == "__main__":

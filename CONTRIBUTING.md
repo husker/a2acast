@@ -22,7 +22,7 @@ No build step and no dependencies. `mesh.py` runs as-is.
 
 **`mesh.py` is stdlib-only.** The single-file, dependency-free property is the point of
 the project — you can `curl` it, read it end to end, and audit it. A third-party import
-destroys that. CI does not currently enforce this; please don't be the one who breaks it.
+destroys that. CI enforces this (`stdlib_only` job, #140) and the local suite enforces it too (`StdlibOnlyTests`); a third-party import fails before push. Stay vigilant — the test catches imports, not subtle misuse of a stdlib facility, so please don't be the one who breaks it.
 
 **Python 3.8+.** `requires-python = ">=3.8"`. No `match` statements, no `X | Y` unions
 evaluated at runtime, no 3.9-and-later stdlib additions.

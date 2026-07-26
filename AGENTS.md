@@ -9,7 +9,7 @@ writing code, not after.
 ## Hard constraints
 
 - **`mesh.py` is stdlib-only.** No third-party imports, ever. It is meant to be
-  `curl`-able and readable end to end. CI does not currently catch a violation — you must.
+  `curl`-able and readable end to end. CI catches this (`stdlib_only` job, #140) and the local suite does too (`StdlibOnlyTests`); a third-party import fails before push. Stay vigilant — the test catches imports, not subtle misuse of a stdlib facility.
 - **Python 3.8+.** `requires-python = ">=3.8"`. No `match` statements, no `X | Y`
   unions evaluated at runtime, no 3.9+ stdlib.
 - **Tests:** `python3 -m unittest discover -s tests` (`python` on Windows)
