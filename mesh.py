@@ -2393,7 +2393,14 @@ def _sign_wrapper_payload(cfg, to, payload, harness=None):
         relay_topic = topic(cfg, to) if to is not None else ""
         signature = _sign_as_node(cfg, harness, relay_topic, timestamp,
                                   payload)
-    except (ValueError, OSError, subprocess.SubprocessError):
+    except (ValueError, OSError, subprocess.SubprocessError) as exc:
+        # Best-effort signing degraded to unsigned. The migration window
+        # keeps the send-anyway behaviour, but a silent degradation
+        # undermines the signing model — warn loudly so a node that ships
+        # unsigned frames is noticeable (#145).
+        print(f"MESH_WARN: could not sign this frame "
+              f"({_single_line(str(exc))}); sent UNSIGNED",
+              file=sys.stderr)
         return timestamp, payload
     signed = dict(payload)
     signed["s"] = signature

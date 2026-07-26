@@ -5995,6 +5995,29 @@ class SignOnSendTests(unittest.TestCase):
         self.assertNotIn("s", out)
         self.assertEqual(out, payload)
 
+    def test_signing_failure_warns_on_stderr(self):
+        """A best-effort signing degradation warns on stderr (#145).
+
+        The migration window keeps the send-anyway behaviour, but a silent
+        fall-back to unsigned is the defect #145 files: the node shipped
+        unsigned frames for days with no indication. Reverting the print
+        makes this test fail (stderr stays empty).
+        """
+        payload = {"f": "laptop", "t": "hello"}
+        with mock.patch.object(mesh, "_sign_as_node",
+                               side_effect=OSError("ssh-keygen refused the key")):
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                timestamp, out = mesh._sign_wrapper_payload(
+                    self.cfg, "peer", payload, harness="claude")
+        # Send-any-way behaviour preserved: frame is unsigned.
+        self.assertNotIn("s", out)
+        self.assertEqual(out, payload)
+        # The degradation is loud, not silent (#145).
+        self.assertIn("MESH_WARN: could not sign this frame", err.getvalue())
+        self.assertIn("sent UNSIGNED", err.getvalue())
+        self.assertIn("ssh-keygen refused the key", err.getvalue())
+
 
 class VerifyFrameTests(unittest.TestCase):
     """Slice 3: classifying a received frame's authenticity. The security
