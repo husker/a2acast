@@ -1805,6 +1805,24 @@ def _enrollment_enabled(cfg):
     return bool(cfg.get("enrollment"))
 
 
+def _enforce_verdicts_enabled(cfg):
+    """Whether a lying frame is REFUSED or merely reported (#74 slice 4).
+
+    Default OFF, and this default carries more weight than the others: every
+    slice up to here was additive and revertible, because the worst a
+    misjudgement did was log a wrong line. This is the first one where being
+    wrong DROPS REAL TRAFFIC, so it cannot inherit the earlier slices'
+    safety -- #74 re-argues it from deployment state up.
+
+    The preconditions are deployment facts, not code: the whole fleet
+    signing, pins settled, and enforcement turned on FLEET-WIDE rather than
+    per node. A single node enforcing early refuses every peer that has not
+    caught up -- it partitions itself, loudly, against an otherwise healthy
+    mesh. Hence owner-gated: the mechanism ships correct and dormant, and
+    the deploy decision stays with the person who can see the fleet."""
+    return bool(cfg.get("enforce_verdicts"))
+
+
 ENROLL_LOG_INTERVAL = 300        # s; per-peer ENROLL_REFUSED log throttle
 _enroll_last = {}
 _enroll_lock = threading.Lock()
@@ -2269,6 +2287,55 @@ def _observe_downgrade(cfg, frm, verdict, now=None):
           f"exists for this name but the frame arrived UNSIGNED -- "
           f"signature-stripping is what the #74 ratchet will refuse; "
           f"observe-only)", file=sys.stderr)
+
+
+ENFORCE_LOG_INTERVAL = 300       # s; per-peer MESH_REFUSED log throttle
+_refused_last = {}
+_refused_lock = threading.Lock()
+
+
+def _refuse_frame(cfg, frm, verdict):
+    """#74 slice 4. Reason this frame is REFUSED, or None to deliver it.
+
+    ONE predicate, called from both receive loops. The two must never each
+    carry their own copy of this decision: #133 shipped exactly that bug --
+    the revlist-resp arm acted on a sender-asserted name while its sibling
+    three lines up gated on FRAME_VERIFIED, and the inconsistency inside one
+    function was the whole vulnerability. A test asserts both call sites
+    route through here.
+
+    Refused, and only these two:
+      MISMATCH from a pinned peer -- the signature does not verify against
+        the key we hold. Forgery or corruption; the one verdict that is
+        unambiguously wrong rather than merely unproven.
+      UNSIGNED from a PINNED peer -- the downgrade. A pin is only ever
+        established from a signed frame, so 'pinned' IS 'has signed before',
+        and going unsigned afterwards is signature stripping.
+
+    Everything else delivers, deliberately. UNVERIFIED is first contact or
+    an unsettled pin -- how every node in a rolling fleet starts, and
+    refusing it would partition the mesh on upgrade day. UNSIGNED from an
+    UNPINNED name is a node that has never signed, not one that stopped."""
+    if not _enforce_verdicts_enabled(cfg):
+        return None
+    if not isinstance(frm, str) or not frm:
+        return None
+    reason = None
+    if verdict == FRAME_MISMATCH:
+        reason = "signature does not verify against the pinned key"
+    elif verdict == FRAME_UNSIGNED and _pinned_peer_key(cfg, frm) is not None:
+        reason = ("a pinned signing key exists but this frame is unsigned "
+                  "(signature stripping)")
+    if reason is None:
+        return None
+    now = time.time()
+    with _refused_lock:
+        last = _refused_last.get(frm)
+        if last is None or now - last >= ENFORCE_LOG_INTERVAL:
+            _refused_last[frm] = now
+            _evidence("MESH_REFUSED from=%s verdict=%s (%s -- frame DROPPED, "
+                      "not delivered)" % (_single_line(frm), verdict, reason))
+    return reason
 
 def _own_node_pubkey(cfg, harness):
     """This node's own normalized public key, or None if it has no key."""
@@ -8181,6 +8248,8 @@ def _cmd_watch_owned(args, cfg, me):
         _report_verdict(frm, ev, verdict)
         _observe_revlist_freshness(cfg, me, frm, _sbase, verdict)
         _observe_downgrade(cfg, frm, verdict)
+        if _refuse_frame(cfg, frm, verdict) is not None:
+            continue  # #74: refused frames are not delivered
         if verdict == FRAME_VERIFIED:
             # #76 Phase A: log-only cert observability for verified frames,
             # against the LOCAL pin (the key that actually verified).
@@ -8882,6 +8951,8 @@ class MeshMCPServer:
             _report_verdict(frm, ev, verdict)
             _observe_revlist_freshness(cfg, me, frm, _sbase, verdict)
             _observe_downgrade(cfg, frm, verdict)
+            if _refuse_frame(cfg, frm, verdict) is not None:
+                continue  # #74: refused frames are not delivered
             if verdict == FRAME_VERIFIED:
                 # #76 Phase A: log-only cert observability (see cmd_watch).
                 _report_cert_status(cfg, frm, _load_pins(cfg).get(frm))
