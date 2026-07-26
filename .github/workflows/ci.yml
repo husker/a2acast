@@ -74,6 +74,42 @@ jobs:
           print("all version fields agree:", mesh_v)
           EOF
 
+  stdlib_only:
+    name: mesh.py is stdlib-only
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: import with site-packages disabled
+        # -S drops site-packages from sys.path, so a third-party import in
+        # mesh.py fails here. The single-file, curl-able, dependency-free
+        # property was previously enforced only by reviewer attention (#138).
+        run: python -S -c "import mesh"
+      - name: every import resolves to the standard library
+        # Belt-and-braces: catches a lazy or nested import that the -S
+        # import above would not execute at module load time.
+        run: |
+          python3 - <<'EOF'
+          import ast, sys
+          allowed = set(sys.stdlib_module_names) | {"mesh", "__future__"}
+          bad = set()
+          for node in ast.walk(ast.parse(open("mesh.py").read())):
+              if isinstance(node, ast.Import):
+                  for alias in node.names:
+                      bad.add(alias.name.split(".")[0])
+              elif isinstance(node, ast.ImportFrom) and node.level == 0 \
+                      and node.module:
+                  bad.add(node.module.split(".")[0])
+          bad -= allowed
+          if bad:
+              sys.exit("mesh.py imports non-stdlib module(s): %s"
+                       % sorted(bad))
+          print("mesh.py imports only the standard library")
+          EOF
+
   gitleaks:
     name: secrets scan (full history)
     runs-on: ubuntu-latest
