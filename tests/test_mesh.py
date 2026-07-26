@@ -6763,6 +6763,17 @@ class RenameMigrationTests(unittest.TestCase):
         self.assertNotIn("gamma", mesh._load_pins(self.cfg))
         self.assertNotIn("beta", mesh._load_renames(self.cfg))
 
+    def test_unreadable_peer_store_fails_shut_as_occupied(self):
+        # bastion hardening: if the peer store cannot be read, a name that
+        # is not in the roster cannot be PROVEN free -- fail shut (occupied)
+        # rather than let the rename TOFU-capture it.
+        self._pin("beta", self._fake_pub(1))
+        with mock.patch.object(mesh, "load_peers",
+                               side_effect=OSError("corrupt")):
+            out = self._rename("beta", "unknowable")
+        self.assertIn("TARGET_OCCUPIED", out)
+        self.assertNotIn("unknowable", mesh._load_pins(self.cfg))
+
     def test_unpinned_and_not_live_name_migrates(self):
         # the happy path stays intact: a genuinely fresh name (not pinned,
         # not in roster/peers) is free to receive the migration.

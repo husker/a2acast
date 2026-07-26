@@ -1771,7 +1771,10 @@ def _name_is_live(cfg, name):
     try:
         return name in load_peers(cfg)
     except (OSError, ValueError):
-        return False
+        # Fail SHUT (codebase convention, bastion seat): a peer store we
+        # cannot read cannot prove the name is NOT a live identity, so treat
+        # it as occupied rather than let a rename capture it.
+        return True
 
 
 def _rename_migration_enabled(cfg):
