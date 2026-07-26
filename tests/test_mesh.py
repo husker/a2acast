@@ -7142,12 +7142,24 @@ class ChunkedPayloadTests(unittest.TestCase):
             self.assertIsNone(mesh._absorb_chunk(bad, now=1.0))
         self.assertEqual(len(mesh._chunk_sets), 0)
 
-    def test_conflicting_total_poisons_the_whole_set(self):
-        cid = "b" * 32
-        mesh._absorb_chunk(f"{mesh.CHUNK_PREFIX}{cid}:0:3:d1", now=1.0)
-        self.assertIsNone(
-            mesh._absorb_chunk(f"{mesh.CHUNK_PREFIX}{cid}:1:2:d2", now=1.0))
-        self.assertNotIn(cid, mesh._chunk_sets)
+    def test_conflicting_total_piece_is_ignored_set_kept(self):
+        # #128 follow-up: a piece whose total count disagrees with the
+        # established set is ignored (returns None) and the set is KEPT
+        # intact, so one malformed piece cannot discard a legitimate
+        # in-flight message. Fails against the pre-fix code, which discarded
+        # the whole set on any count mismatch.
+        p, cid = mesh.CHUNK_PREFIX, "b" * 32
+        mesh._absorb_chunk(f"{p}{cid}:0:3:d1", now=1.0)
+        self.assertIsNone(mesh._absorb_chunk(f"{p}{cid}:1:2:d2", now=1.0))
+        # the established 3-piece set survives, and the conflicting data was
+        # not absorbed
+        self.assertIn(cid, mesh._chunk_sets)
+        self.assertEqual(mesh._chunk_sets[cid]["n"], 3)
+        self.assertEqual(mesh._chunk_sets[cid]["parts"], {0: "d1"})
+        # the genuine remaining pieces still complete the message
+        self.assertIsNone(mesh._absorb_chunk(f"{p}{cid}:1:3:d2", now=1.0))
+        self.assertEqual(
+            mesh._absorb_chunk(f"{p}{cid}:2:3:d3", now=1.0), "d1d2d3")
 
 
 class DowngradeRatchetObserveTests(unittest.TestCase):
