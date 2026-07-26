@@ -3020,8 +3020,14 @@ class WakeHookCheckpointTests(MembershipCmdTests):
         with mock.patch.object(mesh, "_post",
                                return_value={"id": "x"}), \
                 contextlib.redirect_stderr(err):
-            mesh.send_raw(cfg, "alpha", "beta", "x" * 5000)
+            mesh.send_raw(cfg, "alpha", "beta", "x" * 80000)
         self.assertIn("~3h TTL", err.getvalue())
+        mid = io.StringIO()
+        with mock.patch.object(mesh, "_post",
+                               return_value={"id": "m"}), \
+                contextlib.redirect_stderr(mid):
+            mesh.send_raw(cfg, "alpha", "beta", "x" * 5000)
+        self.assertNotIn("TTL", mid.getvalue())  # chunked now (#66 tier 2)
         err2 = io.StringIO()
         with mock.patch.object(mesh, "_post",
                                return_value={"id": "y"}), \
@@ -6602,6 +6608,142 @@ class BlockingWaitTests(unittest.TestCase):
         self.assertTrue(calls[1][1].wait)
         self.assertEqual(calls[1][1].from_node, "beta")
         self.assertEqual(calls[1][1].timeout, 9)
+
+
+class ChunkedPayloadTests(unittest.TestCase):
+    """#66 tier 2: oversize wire chunks under the relay inline limit so
+    normal retention carries the CONTENT, not just the wake. Framing
+    sits below the crypto -- a forged or garbled piece can only make the
+    reassembled frame fail decrypt."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.cfg = make_cfg(self._tmp.name)
+        mesh._chunk_sets.clear()
+        self.addCleanup(mesh._chunk_sets.clear)
+
+    def _send(self, body):
+        posts = []
+
+        def fake_post(cfg, tpc, data, headers):
+            posts.append(data.decode("utf-8"))
+            return {"id": f"r{len(posts)}"}
+
+        err = io.StringIO()
+        with mock.patch.object(mesh, "_post", fake_post), \
+             contextlib.redirect_stderr(err):
+            resp = mesh.send_raw(self.cfg, "alpha", "beta", body)
+        return posts, resp, err.getvalue()
+
+    @staticmethod
+    def _event(piece, eid, t=500):
+        return {"event": "message", "id": eid, "time": t, "message": piece}
+
+    def test_oversize_send_chunks_under_the_inline_limit(self):
+        posts, resp, err = self._send("x" * 9000)
+        self.assertGreater(len(posts), 1)
+        for piece in posts:
+            self.assertTrue(piece.startswith(mesh.CHUNK_PREFIX))
+            self.assertLessEqual(len(piece.encode("utf-8")),
+                                 mesh.NTFY_INLINE_LIMIT)
+        self.assertEqual(resp["id"], f"r{len(posts)}")  # last piece's id
+        self.assertNotIn("TTL", err)  # durable now: no attachment cliff
+
+    def test_small_send_stays_a_single_unprefixed_post(self):
+        posts, _resp, _err = self._send("hello")
+        self.assertEqual(len(posts), 1)
+        self.assertFalse(posts[0].startswith(mesh.CHUNK_PREFIX))
+
+    def test_past_the_chunk_ceiling_falls_back_to_attachment_warn(self):
+        posts, _resp, err = self._send("x" * 80000)
+        self.assertEqual(len(posts), 1)  # single oversize post, ntfy attaches
+        self.assertIn("~3h TTL", err)
+
+    def test_chunks_reassemble_to_the_original_frame(self):
+        body = "y" * 9000
+        posts, _resp, _err = self._send(body)
+        results = [mesh._open(self._event(p, f"e{i}"), self.cfg, "beta")
+                   for i, p in enumerate(posts)]
+        for frm, got, trusted, _ctl in results[:-1]:
+            # pending pieces are silently not-a-message-yet: empty body
+            # never triggers the unauthenticated-drop warn
+            self.assertEqual((frm, got, trusted), (None, "", False))
+        frm, got, trusted, _ctl = results[-1]
+        self.assertEqual(frm, "alpha")
+        self.assertEqual(got, body)
+        self.assertTrue(trusted)
+
+    def test_out_of_order_pieces_still_complete(self):
+        body = "z" * 9000
+        posts, _resp, _err = self._send(body)
+        shuffled = [posts[-1]] + posts[:-1]
+        results = [mesh._open(self._event(p, f"o{i}"), self.cfg, "beta")
+                   for i, p in enumerate(shuffled)]
+        self.assertEqual(results[-1][1], body)
+
+    def test_replayed_set_reassembles_to_the_same_fingerprint(self):
+        posts, _resp, _err = self._send("r" * 9000)
+
+        def complete_fingerprint(tag):
+            fp = None
+            for i, piece in enumerate(posts):
+                opened = mesh._open_with_fingerprint(
+                    self._event(piece, f"{tag}{i}"), self.cfg, "beta")
+                if opened[2]:
+                    fp = opened[4]
+            return fp
+
+        first, second = complete_fingerprint("a"), complete_fingerprint("b")
+        self.assertIsNotNone(first)
+        self.assertEqual(first, second)  # replay ledger dedupes downstream
+
+    def test_duplicate_piece_cannot_poison_a_set(self):
+        body = "q" * 9000
+        posts, _resp, _err = self._send(body)
+        cid, i_s, n_s, data = posts[0][len(mesh.CHUNK_PREFIX):].split(":", 3)
+        evil = f"{mesh.CHUNK_PREFIX}{cid}:{i_s}:{n_s}:" + "A" * len(data)
+        feed = [posts[0], evil] + posts[1:]  # first write wins
+        results = [mesh._open(self._event(p, f"p{i}"), self.cfg, "beta")
+                   for i, p in enumerate(feed)]
+        self.assertEqual(results[-1][1], body)
+        self.assertTrue(results[-1][2])
+
+    def test_set_ttl_expires_stale_partials(self):
+        posts, _resp, _err = self._send("t" * 9000)
+        t0 = 1000.0
+        self.assertIsNone(mesh._absorb_chunk(posts[0], now=t0))
+        # past the TTL the stale set is pruned; this piece opens a new one
+        self.assertIsNone(mesh._absorb_chunk(
+            posts[1], now=t0 + mesh.CHUNK_SET_TTL + 1))
+        self.assertEqual(len(mesh._chunk_sets), 1)
+        remaining = next(iter(mesh._chunk_sets.values()))
+        self.assertEqual(len(remaining["parts"]), 1)
+
+    def test_concurrent_set_count_is_bounded(self):
+        for k in range(mesh.CHUNK_MAX_SETS + 1):
+            cid = format(k, "032x")
+            mesh._absorb_chunk(f"{mesh.CHUNK_PREFIX}{cid}:0:2:data",
+                               now=1000.0 + k)
+        self.assertLessEqual(len(mesh._chunk_sets), mesh.CHUNK_MAX_SETS)
+        self.assertNotIn(format(0, "032x"), mesh._chunk_sets)  # oldest out
+
+    def test_malformed_chunk_headers_are_silently_dropped(self):
+        cid = "a" * 32
+        for bad in (f"{mesh.CHUNK_PREFIX}short",
+                    f"{mesh.CHUNK_PREFIX}not-hex-cid!:0:2:d",
+                    f"{mesh.CHUNK_PREFIX}{cid}:5:2:d",
+                    f"{mesh.CHUNK_PREFIX}{cid}:0:99:d",
+                    f"{mesh.CHUNK_PREFIX}{cid}:0:2:"):
+            self.assertIsNone(mesh._absorb_chunk(bad, now=1.0))
+        self.assertEqual(len(mesh._chunk_sets), 0)
+
+    def test_conflicting_total_poisons_the_whole_set(self):
+        cid = "b" * 32
+        mesh._absorb_chunk(f"{mesh.CHUNK_PREFIX}{cid}:0:3:d1", now=1.0)
+        self.assertIsNone(
+            mesh._absorb_chunk(f"{mesh.CHUNK_PREFIX}{cid}:1:2:d2", now=1.0))
+        self.assertNotIn(cid, mesh._chunk_sets)
 
 
 class ControlHandlingTests(unittest.TestCase):
