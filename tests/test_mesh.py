@@ -9457,7 +9457,12 @@ class MCPServeTests(unittest.TestCase):
         request = next(m for m in self._sent(out)
                        if m.get("method") == "sampling/createMessage")
         srv.handle({"jsonrpc": "2.0", "id": request["id"], "result": {}})
-        for _ in range(100):
+        # The working->listening flip happens on a background thread; poll
+        # generously (~10s cap, breaks early on success) so a heavily-loaded
+        # CI runner -- Windows py3.14 has been seen at ~90s/suite -- doesn't
+        # time out before the thread is scheduled. Breaks immediately when
+        # the status settles, so the cap is only ever hit on a real failure.
+        for _ in range(1000):
             if mesh.local_status(srv.cfg, "alpha") == "listening":
                 break
             mesh.time.sleep(0.01)
