@@ -1,0 +1,507 @@
+- generic [active] [ref=e1]:
+  - banner:
+    - generic [ref=e2]:
+      - link "Skip to main content":
+        - /url: "#main"
+      - generic [ref=e4]:
+        - link "OpenAI Home" [ref=e5] [cursor=pointer]:
+          - /url: /
+        - generic [ref=e10]:
+          - navigation "Main Navigation" [ref=e12]:
+            - list [ref=e13]:
+              - listitem [ref=e14]:
+                - link "Research" [ref=e15] [cursor=pointer]:
+                  - /url: /research/index/
+                - button "Research menu"
+              - listitem [ref=e18]:
+                - button "Products" [ref=e19] [cursor=pointer]
+                - button "Products menu"
+              - listitem [ref=e22]:
+                - link "Business" [ref=e23] [cursor=pointer]:
+                  - /url: /business/
+                - button "Business menu"
+              - listitem [ref=e26]:
+                - link "Developers" [ref=e27] [cursor=pointer]:
+                  - /url: /api/
+                - button "Developers menu"
+              - listitem [ref=e30]:
+                - link "Company" [ref=e31] [cursor=pointer]:
+                  - /url: /about/
+                - button "Company menu"
+              - listitem [ref=e34]:
+                - link "Foundation (opens in a new window)" [ref=e35] [cursor=pointer]:
+                  - /url: https://openaifoundation.org
+                  - generic [ref=e36]: Foundation
+                  - generic [ref=e38]: (opens in a new window)
+          - generic [ref=e40]:
+            - button "Open Search" [ref=e42] [cursor=pointer]
+            - button "Close Search" [ref=e45] [cursor=pointer]
+          - generic [ref=e49]:
+            - button "Log in" [ref=e50] [cursor=pointer]
+            - link "Try ChatGPT (opens in a new window)" [ref=e53] [cursor=pointer]:
+              - /url: https://chatgpt.com/
+              - text: Try ChatGPT
+              - generic [ref=e56]: (opens in a new window)
+  - generic [ref=e57]:
+    - main [ref=e58]:
+      - generic [ref=e59]: OpenAI
+      - article [ref=e60]:
+        - generic [ref=e64]:
+          - generic [ref=e65]: Select language
+          - combobox "Select language" [disabled] [ref=e68]:
+            - option "…" [selected]
+        - generic [ref=e73]:
+          - paragraph [ref=e75]: "Published: January 1, 2026"
+          - heading "Terms of Use" [level=1] [ref=e76]
+        - generic [ref=e78]:
+          - paragraph [ref=e80]:
+            - text: "Effective: January 1, 2026 ("
+            - link "Previous version⁠" [ref=e81] [cursor=pointer]:
+              - /url: https://openai.com/policies/row-terms-of-use/revisions/2024-12-11/
+            - text: )
+          - paragraph [ref=e83]: Thank you for using OpenAI!
+          - paragraph [ref=e85]:
+            - text: These Terms of Use apply to your use of ChatGPT, DALL·E, and OpenAI’s other services for individuals, along with any associated software applications and websites (all together, “Services”). These Terms form an agreement between you and OpenAI OpCo, LLC, a Delaware company, and they include our
+            - link "Service Terms⁠⁠" [ref=e86] [cursor=pointer]:
+              - /url: https://openai.com/policies/service-terms/
+              - generic [ref=e87]: Service Terms⁠
+              - text: ⁠
+            - text: and important provisions for resolving disputes through arbitration. By using our Services, you agree to these Terms.
+          - paragraph [ref=e89]:
+            - text: If you reside in the European Economic Area, Switzerland, or the UK, your use of the Services is governed by
+            - link "these terms⁠⁠" [ref=e90] [cursor=pointer]:
+              - /url: https://openai.com/policies/eu-terms-of-use/
+              - generic [ref=e91]: these terms⁠
+              - text: ⁠
+            - text: .
+          - paragraph [ref=e93]:
+            - text: Our
+            - link "Business Terms⁠⁠" [ref=e94] [cursor=pointer]:
+              - /url: https://openai.com/policies/business-terms/
+              - generic [ref=e95]: Business Terms⁠
+              - text: ⁠
+            - text: govern use of ChatGPT Enterprise, our APIs, and our other services for businesses and developers.
+          - paragraph [ref=e97]:
+            - text: Our
+            - link "Privacy Policy⁠⁠" [ref=e98] [cursor=pointer]:
+              - /url: https://openai.com/policies/privacy-policy/
+              - generic [ref=e99]: Privacy Policy⁠
+              - text: ⁠
+            - text: explains how we collect and use personal information. Although it does not form part of these Terms, it is an important document that you should read.
+          - heading "Who we are" [level=2] [ref=e103]
+          - paragraph [ref=e105]:
+            - text: OpenAI is an AI research and deployment company. Our mission is to ensure that artificial general intelligence benefits all of humanity. For more information about OpenAI, please visit
+            - link "https://openai.com/about⁠⁠" [ref=e106] [cursor=pointer]:
+              - /url: https://openai.com/about/
+              - generic [ref=e107]: https://openai.com/about⁠
+              - text: ⁠
+            - text: .
+          - heading "Registration and access" [level=2] [ref=e111]
+          - paragraph [ref=e113]: Minimum age. You must be at least 13 years old or the minimum age required in your country to consent to use the Services. If you are under 18 you must have your parent or legal guardian’s permission to use the Services.
+          - paragraph [ref=e115]: Registration. You must provide accurate and complete information to register for an account to use our Services. You may not share your account credentials or make your account available to anyone else and are responsible for all activities that occur under your account. If you create an account or use the Services on behalf of another person or entity, you must have the authority to accept these Terms on their behalf.
+          - heading "Using our Services" [level=2] [ref=e119]
+          - paragraph [ref=e121]:
+            - text: What you can do. Subject to your compliance with these Terms, you may access and use our Services. In using our Services, you must comply with all applicable laws as well as our
+            - link "Sharing & Publication Policy⁠⁠" [ref=e122] [cursor=pointer]:
+              - /url: https://openai.com/policies/sharing-publication-policy/
+              - generic [ref=e123]: Sharing & Publication Policy⁠
+              - text: ⁠
+            - text: ","
+            - link "Usage Policies⁠⁠" [ref=e124] [cursor=pointer]:
+              - /url: https://openai.com/policies/usage-policies/
+              - generic [ref=e125]: Usage Policies⁠
+              - text: ⁠
+            - text: ", and any other documentation, guidelines, or policies we make available to you."
+          - paragraph [ref=e127]: "What you cannot do. You may not use our Services for any illegal, harmful, or abusive activity. For example, you may not:"
+          - list [ref=e129]:
+            - listitem [ref=e130]: Use our Services in a way that infringes, misappropriates or violates anyone’s rights.
+            - listitem [ref=e131]: Modify, copy, lease, sell or distribute any of our Services.
+            - listitem [ref=e132]: Attempt to or assist anyone to reverse engineer, decompile or discover the source code or underlying components of our Services, including our models, algorithms, or systems (except to the extent this restriction is prohibited by applicable law).
+            - listitem [ref=e133]: Automatically or programmatically extract data or Output (defined below).
+            - listitem [ref=e134]: Represent that Output was human-generated when it was not.
+            - listitem [ref=e135]: Interfere with or disrupt our Services, including circumvent any rate limits or restrictions or bypass any protective measures or safety mitigations we put on our Services.
+            - listitem [ref=e136]: Use Output to develop models that compete with OpenAI.
+          - paragraph [ref=e138]: Software. Our Services may allow you to download software, such as mobile applications, which may update automatically to ensure you’re using the latest version. Our software may include open source software that is governed by its own licenses that we’ve made available to you.
+          - paragraph [ref=e140]: Corporate domains. If you create an account using an email address owned by an organization (for example, your employer), that account may be added to the organization's business account with us, in which case we will provide notice to you so that you can help facilitate the transfer of your account (unless your organization has already provided notice to you that it may monitor and control your account). Once your account is transferred, the organization’s administrator will be able to control your account, including being able to access Content (defined below) and restrict or remove your access to the account.
+          - paragraph [ref=e142]: Third party Services. Our services may include third party software, products, or services, (“Third Party Services”) and some parts of our Services, like our browse feature, may include output from those services (“Third Party Output”). Third Party Services and Third Party Output are subject to their own terms, and we are not responsible for them.
+          - paragraph [ref=e144]: Feedback. We appreciate your feedback, and you agree that we may use it without restriction or compensation to you.
+          - heading "Content" [level=2] [ref=e148]
+          - paragraph [ref=e150]: Your content. You may provide input to the Services (“Input”), and receive output from the Services based on the Input (“Output”). Input and Output are collectively “Content.” You are responsible for Content, including ensuring that it does not violate any applicable law or these Terms. You represent and warrant that you have all rights, licenses, and permissions needed to provide Input to our Services.
+          - paragraph [ref=e152]: Ownership of content. As between you and OpenAI, and to the extent permitted by applicable law, you (a) retain your ownership rights in Input and (b) own the Output. We hereby assign to you all our right, title, and interest, if any, in and to Output.
+          - paragraph [ref=e154]: Similarity of content. Due to the nature of our Services and artificial intelligence generally, output may not be unique and other users may receive similar output from our Services. Our assignment above does not extend to other users’ output or any Third Party Output.
+          - paragraph [ref=e156]:
+            - text: Our use of content. We may use Content to provide, maintain, develop, and improve our Services, comply with applicable law, enforce our terms and policies, and keep our Services safe. If you're using ChatGPT through Apple's integrations, see
+            - link "this Help Center article⁠⁠ (opens in a new window)" [ref=e157] [cursor=pointer]:
+              - /url: https://help.openai.com/en/articles/9737562
+              - generic [ref=e158]: this Help Center article⁠
+              - text: ⁠
+              - generic [ref=e159]: (opens in a new window)
+            - text: for how we handle your Content.
+          - paragraph [ref=e161]:
+            - text: Opt out. If you do not want us to use your Content to train our models, you can opt out by following the instructions in
+            - link "this article⁠" [ref=e162] [cursor=pointer]:
+              - /url: https://openai.com/policies/how-your-data-is-used-to-improve-model-performance/
+              - generic [ref=e163]: this article
+              - text: ⁠
+            - text: . Please note that in some cases this may limit the ability of our Services to better address your specific use case.
+          - paragraph [ref=e165]: Accuracy. Artificial intelligence and machine learning are rapidly evolving fields of study. We are constantly working to improve our Services to make them more accurate, reliable, safe, and beneficial. Given the probabilistic nature of machine learning, use of our Services may, in some situations, result in Output that does not accurately reflect real people, places, or facts.
+          - paragraph [ref=e167]: "When you use our Services you understand and agree:"
+          - list [ref=e169]:
+            - listitem [ref=e170]: Output may not always be accurate. You should not rely on Output from our Services as a sole source of truth or factual information, or as a substitute for professional advice.
+            - listitem [ref=e171]: You must evaluate Output for accuracy and appropriateness for your use case, including using human review as appropriate, before using or sharing Output from the Services.
+            - listitem [ref=e172]: You must not use any Output relating to a person for any purpose that could have a legal or material impact on that person, such as making credit, educational, employment, housing, insurance, legal, medical, or other important decisions about them.
+            - listitem [ref=e173]: Our Services may provide incomplete, incorrect, or offensive Output that does not represent OpenAI’s views. If Output references any third party products or services, it doesn’t mean the third party endorses or is affiliated with OpenAI.
+          - heading "Our IP rights" [level=2] [ref=e177]
+          - paragraph [ref=e179]:
+            - text: We and our affiliates own all rights, title, and interest in and to the Services. You may only use our name and logo in accordance with our
+            - link "Brand Guidelines⁠⁠" [ref=e180] [cursor=pointer]:
+              - /url: https://openai.com/brand/
+              - generic [ref=e181]: Brand Guidelines⁠
+              - text: ⁠
+            - text: .
+          - heading "Paid accounts" [level=2] [ref=e185]
+          - paragraph [ref=e187]: Billing. If you purchase any Services, you will provide complete and accurate billing information, including a valid payment method. For paid subscriptions, we will automatically charge your payment method on each agreed-upon periodic renewal until you cancel. You’re responsible for all applicable taxes, and we’ll charge tax when required. If your payment cannot be completed, we may downgrade your account or suspend your access to our Services until payment is received.
+          - paragraph [ref=e189]:
+            - text: Service credits. You can pay for some Services in advance by purchasing service credits. All service credits are subject to our
+            - link "Service Credit Terms⁠⁠" [ref=e190] [cursor=pointer]:
+              - /url: https://openai.com/policies/service-credit-terms/
+              - generic [ref=e191]: Service Credit Terms⁠
+              - text: ⁠
+            - text: .
+          - paragraph [ref=e193]:
+            - text: Cancellation. You can
+            - link "cancel⁠⁠ (opens in a new window)" [ref=e194] [cursor=pointer]:
+              - /url: https://help.openai.com/en/articles/7232927-how-do-i-cancel-my-chatgpt-plus-subscription
+              - generic [ref=e195]: cancel⁠
+              - text: ⁠
+              - generic [ref=e196]: (opens in a new window)
+            - text: your paid subscription at any time. Payments are non-refundable, except where required by law. These Terms do not override any mandatory local laws regarding your cancellation rights.
+          - paragraph [ref=e198]: Changes. We may change our prices from time to time. If we increase our subscription prices, we will give you at least 30 days’ notice and any price increase will take effect on your next renewal so that you can cancel if you do not agree to the price increase.
+          - heading "Termination and suspension" [level=2] [ref=e202]
+          - paragraph [ref=e204]: "Termination. You are free to stop using our Services at any time. We reserve the right to suspend or terminate your access to our Services or delete your account if we determine:"
+          - list [ref=e206]:
+            - listitem [ref=e207]:
+              - text: You breached these Terms or our
+              - link "Usage Policies⁠⁠" [ref=e208] [cursor=pointer]:
+                - /url: https://openai.com/policies/usage-policies/
+                - generic [ref=e209]: Usage Policies⁠
+                - text: ⁠
+              - text: .
+            - listitem [ref=e210]: We must do so to comply with the law.
+            - listitem [ref=e211]: Your use of our Services could cause risk or harm to OpenAI, our users, or anyone else.
+          - paragraph [ref=e213]: We also may terminate your account if it has been inactive for over a year and you do not have a paid account. If we do, we will provide you with advance notice.
+          - paragraph [ref=e215]:
+            - text: Appeals. If you believe we have suspended or terminated your account in error, you can file an appeal with us by
+            - link "contacting our Support team⁠⁠ (opens in a new window)" [ref=e216] [cursor=pointer]:
+              - /url: https://help.openai.com/en/articles/6614161-how-can-i-contact-support
+              - generic [ref=e217]: contacting our Support team⁠
+              - text: ⁠
+              - generic [ref=e218]: (opens in a new window)
+            - text: .
+          - heading "Discontinuation of Services" [level=2] [ref=e222]
+          - paragraph [ref=e224]: We may decide to discontinue our Services, but if we do, we will give you advance notice and a refund for any prepaid, unused Services.
+          - heading "Disclaimer of warranties" [level=2] [ref=e228]
+          - paragraph [ref=e230]: OUR SERVICES ARE PROVIDED “AS IS.” EXCEPT TO THE EXTENT PROHIBITED BY LAW, WE AND OUR AFFILIATES AND LICENSORS MAKE NO WARRANTIES (EXPRESS, IMPLIED, STATUTORY OR OTHERWISE) WITH RESPECT TO THE SERVICES, AND DISCLAIM ALL WARRANTIES INCLUDING, BUT NOT LIMITED TO, WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, SATISFACTORY QUALITY, NON-INFRINGEMENT, AND QUIET ENJOYMENT, AND ANY WARRANTIES ARISING OUT OF ANY COURSE OF DEALING OR TRADE USAGE. WE DO NOT WARRANT THAT THE SERVICES WILL BE UNINTERRUPTED, ACCURATE OR ERROR FREE, OR THAT ANY CONTENT WILL BE SECURE OR NOT LOST OR ALTERED.
+          - paragraph [ref=e232]: YOU ACCEPT AND AGREE THAT ANY USE OF OUTPUTS FROM OUR SERVICE IS AT YOUR SOLE RISK AND YOU WILL NOT RELY ON OUTPUT AS A SOLE SOURCE OF TRUTH OR FACTUAL INFORMATION, OR AS A SUBSTITUTE FOR PROFESSIONAL ADVICE.
+          - heading "Limitation of liability" [level=2] [ref=e236]
+          - paragraph [ref=e238]: NEITHER WE NOR ANY OF OUR AFFILIATES OR LICENSORS WILL BE LIABLE FOR ANY INDIRECT, INCIDENTAL, SPECIAL, CONSEQUENTIAL, OR EXEMPLARY DAMAGES, INCLUDING DAMAGES FOR LOSS OF PROFITS, GOODWILL, USE, OR DATA OR OTHER LOSSES, EVEN IF WE HAVE BEEN ADVISED OF THE POSSIBILITY OF SUCH DAMAGES. OUR AGGREGATE LIABILITY UNDER THESE TERMS WILL NOT EXCEED THE GREATER OF THE AMOUNT YOU PAID FOR THE SERVICE THAT GAVE RISE TO THE CLAIM DURING THE 12 MONTHS BEFORE THE LIABILITY AROSE OR ONE HUNDRED DOLLARS ($100). THE LIMITATIONS IN THIS SECTION APPLY ONLY TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW.
+          - paragraph [ref=e240]: Some countries and states do not allow the disclaimer of certain warranties or the limitation of certain damages, so some or all of the terms above may not apply to you, and you may have additional rights. In that case, these Terms only limit our responsibilities to the maximum extent permissible in your country of residence.
+          - paragraph [ref=e242]: OPENAI’S AFFILIATES, SUPPLIERS, LICENSORS, AND DISTRIBUTORS ARE INTENDED THIRD PARTY BENEFICIARIES OF THIS SECTION.
+          - heading "Indemnity" [level=2] [ref=e246]
+          - paragraph [ref=e248]: If you are a business or organization, to the extent permitted by law, you will indemnify and hold harmless us, our affiliates, and our personnel, from and against any costs, losses, liabilities, and expenses (including attorneys’ fees) from third party claims arising out of or relating to your use of the Services and Content or any violation of these Terms.
+          - heading "Dispute resolution" [level=2] [ref=e252]
+          - paragraph [ref=e254]: "YOU AND OPENAI AGREE TO THE FOLLOWING MANDATORY ARBITRATION AND CLASS ACTION WAIVER PROVISIONS:"
+          - paragraph [ref=e256]:
+            - text: MANDATORY ARBITRATION. You and OpenAI agree to resolve any claims arising out of or relating to these Terms or our Services, regardless of when the claim arose, even if it was before these Terms existed (a “Dispute”), through final and binding arbitration. You may opt out of arbitration within 30 days of account creation or of any updates to these arbitration terms within 30 days after the update has taken effect by filling out
+            - link "this form⁠" [ref=e257] [cursor=pointer]:
+              - /url: https://openai.com/form/arbitration-opt-out/
+              - generic [ref=e258]: this form
+              - text: ⁠
+            - text: . If you opt out of an update, the last set of agreed upon arbitration terms will apply.
+          - paragraph [ref=e260]:
+            - text: Informal dispute resolution. We would like to understand and try to address your concerns prior to formal legal action. Before either of us files a claim against the other, we both agree to try to resolve the Dispute informally. You agree to do so by sending us notice through
+            - link "this form⁠" [ref=e261] [cursor=pointer]:
+              - /url: https://openai.com/form/informal-dispute/
+              - generic [ref=e262]: this form
+              - text: ⁠
+            - text: . We will do so by sending you notice to the email address associated with your account. If we are unable to resolve a Dispute within 60 days, either of us has the right to initiate arbitration. We also both agree to attend an individual settlement conference if either party requests one during this time. Any statute of limitations will be tolled during this informal resolution process.
+          - paragraph [ref=e264]:
+            - text: Arbitration forum. If we are unable to resolve the Dispute, either of us may commence arbitration with National Arbitration and Mediation (“NAM”) under its Comprehensive Dispute Resolution Rules and Procedures and/or Supplemental Rules for Mass Arbitration Filings, as applicable (available
+            - link "here⁠⁠ (opens in a new window)" [ref=e265] [cursor=pointer]:
+              - /url: https://www.namadr.com/resources/rules-fees-forms/
+              - generic [ref=e266]: here⁠
+              - text: ⁠
+              - generic [ref=e267]: (opens in a new window)
+            - text: ).
+          - paragraph [ref=e269]: OpenAI will not seek attorneys’ fees and costs in arbitration unless the arbitrator determines that your claim is frivolous. The activities described in these Terms involve interstate commerce and the Federal Arbitration Act will govern the interpretation and enforcement of these arbitration terms and any arbitration.
+          - paragraph [ref=e271]: Arbitration procedures. The arbitration will be conducted by videoconference if possible, but if the arbitrator determines a hearing should be conducted in person, the location will be mutually agreed upon, in the county where you reside, or as determined by the arbitrator, unless the batch arbitration process applies. The arbitration will be conducted by a sole arbitrator. The arbitrator will be either a retired judge or an attorney licensed to practice law in the state of California. The arbitrator will have exclusive authority to resolve any Dispute, except the state or federal courts of San Francisco, California have the authority to determine any Dispute about enforceability, validity of the class action waiver, or requests for public injunctive relief, as set out below. Any settlement offer amounts will not be disclosed to the arbitrator by either party until after the arbitrator determines the final award, if any. The arbitrator has the authority to grant motions dispositive of all or part of any Dispute.
+          - paragraph [ref=e273]: "Exceptions. This section does not require informal dispute resolution or arbitration of the following claims: (i) individual claims brought in small claims court; and (ii) injunctive or other equitable relief to stop unauthorized use or abuse of the Services or intellectual property infringement or misappropriation."
+          - paragraph [ref=e275]: CLASS AND JURY TRIAL WAIVERS. You and OpenAI agree that Disputes must be brought on an individual basis only, and may not be brought as a plaintiff or class member in any purported class, consolidated, or representative proceeding. Class arbitrations, class actions, and representative actions are prohibited. Only individual relief is available. The parties agree to sever and litigate in court any request for public injunctive relief after completing arbitration for the underlying claim and all other claims. This does not prevent either party from participating in a class-wide settlement. You and OpenAI knowingly and irrevocably waive any right to trial by jury in any action, proceeding, or counterclaim.
+          - paragraph [ref=e277]: Batch arbitration. If 25 or more claimants represented by the same or similar counsel file demands for arbitration raising substantially similar Disputes within 90 days of each other, then you and OpenAI agree that NAM will administer them in batches of up to 50 claimants each (“Batch”), unless there are less than 50 claimants in total or after batching, which will comprise a single Batch. NAM will administer each Batch as a single consolidated arbitration with one arbitrator, one set of arbitration fees, and one hearing held by videoconference or in a location decided by the arbitrator for each Batch. If any part of this section is found to be invalid or unenforceable as to a particular claimant or Batch, it will be severed and arbitrated in individual proceedings.
+          - paragraph [ref=e279]: Severability. If any part of these arbitration terms is found to be illegal or unenforceable, the remainder will remain in effect, except that if a finding of partial illegality or unenforceability would allow class arbitration, class action, or representative action, this entire dispute resolution section will be unenforceable in its entirety.
+          - heading "Copyright complaints" [level=2] [ref=e283]
+          - paragraph [ref=e285]:
+            - text: If you believe that your intellectual property rights have been infringed, please send notice to the address below or fill out
+            - link "this form⁠" [ref=e286] [cursor=pointer]:
+              - /url: https://openai.com/form/copyright-disputes/
+              - generic [ref=e287]: this form
+              - text: ⁠
+            - text: . We may delete or disable content that we believe violates these Terms or is alleged to be infringing and will terminate accounts of repeat infringers where appropriate.
+          - paragraph [ref=e289]:
+            - generic [ref=e290]: "OpenAI OpCo, LLC1455 3rd StreetSan Francisco, CA 94158Attn: General Counsel / Copyright Agent"
+          - paragraph [ref=e293]: "Written claims concerning copyright infringement must include the following information:"
+          - list [ref=e295]:
+            - listitem [ref=e296]: A physical or electronic signature of the person authorized to act on behalf of the owner of the copyright interest
+            - listitem [ref=e297]: A description of the copyrighted work that you claim has been infringed upon
+            - listitem [ref=e298]: A description of where the allegedly infringing material is located on our site so we can find it
+            - listitem [ref=e299]: Your address, telephone number, and e-mail address
+            - listitem [ref=e300]: A statement by you that you have a good-faith belief that the disputed use is not authorized by the copyright owner, its agent, or the law
+            - listitem [ref=e301]: A statement by you that the above information in your notice is accurate and, under penalty of perjury, that you are the copyright owner or authorized to act on the copyright owner’s behalf
+          - heading "General Terms" [level=2] [ref=e305]
+          - paragraph [ref=e307]: Assignment. You may not assign or transfer any rights or obligations under these Terms and any attempt to do so will be void. We may assign our rights or obligations under these Terms to any affiliate, subsidiary, or successor in interest of any business associated with our Services.
+          - paragraph [ref=e309]: "Changes to these Terms or our Services. We are continuously working to develop and improve our Services. We may update these Terms or our Services accordingly from time to time. For example, we may make changes to these Terms or the Services due to:"
+          - list [ref=e311]:
+            - listitem [ref=e312]: Changes to the law or regulatory requirements.
+            - listitem [ref=e313]: Security or safety reasons.
+            - listitem [ref=e314]: Circumstances beyond our reasonable control.
+            - listitem [ref=e315]: Changes we make in the usual course of developing our Services.
+            - listitem [ref=e316]: To adapt to new technologies.
+          - paragraph [ref=e318]: We will give you at least 30 days advance notice of changes to these Terms that materially adversely impact you either via email or an in-product notification. All other changes will be effective as soon as we post them to our website. If you do not agree to the changes, you must stop using our Services.
+          - paragraph [ref=e320]: Delay in enforcing these Terms. Our failure to enforce a provision is not a waiver of our right to do so later. Except as provided in the dispute resolution section above, if any portion of these Terms is determined to be invalid or unenforceable, that portion will be enforced to the maximum extent permissible and it will not affect the enforceability of any other terms.
+          - paragraph [ref=e322]: Trade controls. You must comply with all applicable trade laws, including sanctions and export control laws. Our Services may not be used in or for the benefit of, or exported or re-exported to (a) any U.S. embargoed country or territory or (b) any individual or entity with whom dealings are prohibited or restricted under applicable trade laws. Our Services may not be used for any end use prohibited by applicable trade laws, and your Input may not include material or information that requires a government license for release or export.
+          - paragraph [ref=e324]: Entire agreement. These Terms contain the entire agreement between you and OpenAI regarding the Services and, other than any Service-specific terms, supersedes any prior or contemporaneous agreements between you and OpenAI.
+          - paragraph [ref=e326]: Governing law. California law will govern these Terms except for its conflicts of laws principles. Except as provided in the dispute resolution section above, all claims arising out of or relating to these Terms will be brought exclusively in the federal or state courts of San Francisco, California.
+    - contentinfo [ref=e327]:
+      - generic [ref=e329]:
+        - generic [ref=e330]:
+          - generic [ref=e331]:
+            - heading "Research" [level=2] [ref=e332]
+            - list [ref=e333]:
+              - listitem [ref=e334]:
+                - link "Research Index" [ref=e335] [cursor=pointer]:
+                  - /url: /research/index/
+              - listitem [ref=e336]:
+                - link "Research Overview" [ref=e337] [cursor=pointer]:
+                  - /url: /research/
+              - listitem [ref=e338]:
+                - link "Economic Research" [ref=e339] [cursor=pointer]:
+                  - /url: /signals/
+          - generic [ref=e340]:
+            - heading "Latest Advancements" [level=2] [ref=e341]
+            - list [ref=e342]:
+              - listitem [ref=e343]:
+                - link "GPT-5.6" [ref=e344] [cursor=pointer]:
+                  - /url: /index/gpt-5-6/
+              - listitem [ref=e345]:
+                - link "GPT-5.5" [ref=e346] [cursor=pointer]:
+                  - /url: /index/introducing-gpt-5-5/
+              - listitem [ref=e347]:
+                - link "GPT-5.4" [ref=e348] [cursor=pointer]:
+                  - /url: /index/introducing-gpt-5-4/
+          - generic [ref=e349]:
+            - heading "Safety" [level=2] [ref=e350]
+            - list [ref=e351]:
+              - listitem [ref=e352]:
+                - link "Safety Approach" [ref=e353] [cursor=pointer]:
+                  - /url: /safety/
+              - listitem [ref=e354]:
+                - link "Deployment Safety (opens in a new window)" [ref=e355] [cursor=pointer]:
+                  - /url: https://deploymentsafety.openai.com/
+                  - text: Deployment Safety
+                  - generic [ref=e358]: (opens in a new window)
+              - listitem [ref=e359]:
+                - link "Security & Privacy" [ref=e360] [cursor=pointer]:
+                  - /url: /security-and-privacy/
+              - listitem [ref=e361]:
+                - link "Trust & Transparency" [ref=e362] [cursor=pointer]:
+                  - /url: /trust-and-transparency/
+        - generic [ref=e363]:
+          - generic [ref=e364]:
+            - heading "Products" [level=2] [ref=e365]
+            - list [ref=e366]:
+              - listitem [ref=e367]:
+                - link "ChatGPT (opens in a new window)" [ref=e368] [cursor=pointer]:
+                  - /url: https://chatgpt.com/
+                  - text: ChatGPT
+                  - generic [ref=e371]: (opens in a new window)
+              - listitem [ref=e372]:
+                - link "ChatGPT Business (opens in a new window)" [ref=e373] [cursor=pointer]:
+                  - /url: https://chatgpt.com/business/
+                  - text: ChatGPT Business
+                  - generic [ref=e376]: (opens in a new window)
+              - listitem [ref=e377]:
+                - link "ChatGPT Enterprise (opens in a new window)" [ref=e378] [cursor=pointer]:
+                  - /url: https://chatgpt.com/business/enterprise/
+                  - text: ChatGPT Enterprise
+                  - generic [ref=e381]: (opens in a new window)
+              - listitem [ref=e382]:
+                - link "ChatGPT for Education (opens in a new window)" [ref=e383] [cursor=pointer]:
+                  - /url: https://chatgpt.com/business/education/
+                  - text: ChatGPT for Education
+                  - generic [ref=e386]: (opens in a new window)
+              - listitem [ref=e387]:
+                - link "Codex" [ref=e388] [cursor=pointer]:
+                  - /url: /codex/
+              - listitem [ref=e389]:
+                - link "Release Notes" [ref=e390] [cursor=pointer]:
+                  - /url: /products/release-notes/
+          - generic [ref=e391]:
+            - heading "API Platform" [level=2] [ref=e392]
+            - list [ref=e393]:
+              - listitem [ref=e394]:
+                - link "Overview" [ref=e395] [cursor=pointer]:
+                  - /url: /api/
+              - listitem [ref=e396]:
+                - link "API Log In (opens in a new window)" [ref=e397] [cursor=pointer]:
+                  - /url: https://platform.openai.com/login
+                  - text: API Log In
+                  - generic [ref=e400]: (opens in a new window)
+              - listitem [ref=e401]:
+                - link "Docs (opens in a new window)" [ref=e402] [cursor=pointer]:
+                  - /url: https://developers.openai.com/api/docs
+                  - text: Docs
+                  - generic [ref=e405]: (opens in a new window)
+        - generic [ref=e406]:
+          - generic [ref=e407]:
+            - heading "Business" [level=2] [ref=e408]
+            - list [ref=e409]:
+              - listitem [ref=e410]:
+                - link "Overview" [ref=e411] [cursor=pointer]:
+                  - /url: /business/
+              - listitem [ref=e412]:
+                - link "Solutions" [ref=e413] [cursor=pointer]:
+                  - /url: /solutions/
+              - listitem [ref=e414]:
+                - link "Resources" [ref=e415] [cursor=pointer]:
+                  - /url: /business/learn/
+              - listitem [ref=e416]:
+                - link "Customer Stories" [ref=e417] [cursor=pointer]:
+                  - /url: /business/customer-stories/
+              - listitem [ref=e418]:
+                - link "Partner Network" [ref=e419] [cursor=pointer]:
+                  - /url: /business/partners/
+              - listitem [ref=e420]:
+                - link "Contact Sales" [ref=e421] [cursor=pointer]:
+                  - /url: /contact-sales/
+          - generic [ref=e422]:
+            - heading "Developers" [level=2] [ref=e423]
+            - list [ref=e424]:
+              - listitem [ref=e425]:
+                - link "Apps SDK (opens in a new window)" [ref=e426] [cursor=pointer]:
+                  - /url: https://developers.openai.com/apps-sdk
+                  - text: Apps SDK
+                  - generic [ref=e429]: (opens in a new window)
+              - listitem [ref=e430]:
+                - link "Open Models" [ref=e431] [cursor=pointer]:
+                  - /url: /open-models/
+              - listitem [ref=e432]:
+                - link "Docs (opens in a new window)" [ref=e433] [cursor=pointer]:
+                  - /url: https://developers.openai.com/
+                  - text: Docs
+                  - generic [ref=e436]: (opens in a new window)
+              - listitem [ref=e437]:
+                - link "Resources (opens in a new window)" [ref=e438] [cursor=pointer]:
+                  - /url: https://developers.openai.com/learn
+                  - text: Resources
+                  - generic [ref=e441]: (opens in a new window)
+              - listitem [ref=e442]:
+                - link "Developer Forum (opens in a new window)" [ref=e443] [cursor=pointer]:
+                  - /url: https://community.openai.com/
+                  - text: Developer Forum
+                  - generic [ref=e446]: (opens in a new window)
+        - generic [ref=e447]:
+          - generic [ref=e448]:
+            - heading "Company" [level=2] [ref=e449]
+            - list [ref=e450]:
+              - listitem [ref=e451]:
+                - link "About Us" [ref=e452] [cursor=pointer]:
+                  - /url: /about/
+              - listitem [ref=e453]:
+                - link "Our Charter" [ref=e454] [cursor=pointer]:
+                  - /url: /charter/
+              - listitem [ref=e455]:
+                - link "Careers" [ref=e456] [cursor=pointer]:
+                  - /url: /careers/
+              - listitem [ref=e457]:
+                - link "News" [ref=e458] [cursor=pointer]:
+                  - /url: /news/
+          - generic [ref=e459]:
+            - heading "Support" [level=2] [ref=e460]
+            - list [ref=e461]:
+              - listitem [ref=e462]:
+                - link "Help Center (opens in a new window)" [ref=e463] [cursor=pointer]:
+                  - /url: https://help.openai.com/
+                  - text: Help Center
+                  - generic [ref=e466]: (opens in a new window)
+        - generic [ref=e467]:
+          - generic [ref=e468]:
+            - heading "More" [level=2] [ref=e469]
+            - list [ref=e470]:
+              - listitem [ref=e471]:
+                - link "Stories" [ref=e472] [cursor=pointer]:
+                  - /url: /stories/
+              - listitem [ref=e473]:
+                - link "Academy" [ref=e474] [cursor=pointer]:
+                  - /url: /academy/
+              - listitem [ref=e475]:
+                - link "Supply Co." [ref=e476] [cursor=pointer]:
+                  - /url: /supply/
+              - listitem [ref=e477]:
+                - link "Livestreams" [ref=e478] [cursor=pointer]:
+                  - /url: /live/
+              - listitem [ref=e479]:
+                - link "Podcast" [ref=e480] [cursor=pointer]:
+                  - /url: /podcast/
+              - listitem [ref=e481]:
+                - link "RSS" [ref=e482] [cursor=pointer]:
+                  - /url: https://openai.com/news/rss.xml
+          - generic [ref=e483]:
+            - heading "Terms & Policies" [level=2] [ref=e484]
+            - list [ref=e485]:
+              - listitem [ref=e486]:
+                - link "Terms of Use" [ref=e487] [cursor=pointer]:
+                  - /url: /policies/terms-of-use/
+              - listitem [ref=e488]:
+                - link "Privacy Policy" [ref=e489] [cursor=pointer]:
+                  - /url: /policies/privacy-policy/
+              - listitem [ref=e490]:
+                - link "Other Policies" [ref=e491] [cursor=pointer]:
+                  - /url: /policies/
+      - generic [ref=e492]:
+        - generic [ref=e493]:
+          - link "X" [ref=e494] [cursor=pointer]:
+            - /url: https://x.com/OpenAI
+            - generic [ref=e497]: (opens in a new window)
+          - link "YouTube" [ref=e498] [cursor=pointer]:
+            - /url: https://www.youtube.com/OpenAI
+            - generic [ref=e501]: (opens in a new window)
+          - link "LinkedIn" [ref=e502] [cursor=pointer]:
+            - /url: https://www.linkedin.com/company/openai
+            - generic [ref=e505]: (opens in a new window)
+          - link "GitHub" [ref=e506] [cursor=pointer]:
+            - /url: https://github.com/openai
+            - generic [ref=e509]: (opens in a new window)
+          - link "Instagram" [ref=e510] [cursor=pointer]:
+            - /url: https://www.instagram.com/openai/
+            - generic [ref=e513]: (opens in a new window)
+          - link "TikTok" [ref=e514] [cursor=pointer]:
+            - /url: https://www.tiktok.com/@openai
+            - generic [ref=e517]: (opens in a new window)
+          - link "Discord" [ref=e518] [cursor=pointer]:
+            - /url: https://discord.gg/openai
+            - generic [ref=e521]: (opens in a new window)
+        - generic [ref=e522]:
+          - generic [ref=e523]: OpenAI © 2015–2026
+          - button "Manage Cookies" [ref=e524] [cursor=pointer]
+        - generic [ref=e525]:
+          - button "Change language" [ref=e526] [cursor=pointer]:
+            - generic [ref=e531]:
+              - text: English
+              - generic [ref=e532]: United States
+          - generic:
+            - generic:
+              - generic:
+                - generic:
+                  - generic:
+                    - textbox "Search locales by name or region":
+                      - /placeholder: Search

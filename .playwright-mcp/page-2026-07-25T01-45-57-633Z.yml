@@ -1,0 +1,420 @@
+- generic [active] [ref=f3e1]:
+  - banner:
+    - generic [ref=f3e2]:
+      - link "Skip to main content":
+        - /url: "#main"
+      - generic [ref=f3e4]:
+        - link "OpenAI Home" [ref=f3e5] [cursor=pointer]:
+          - /url: /
+        - generic [ref=f3e10]:
+          - navigation "Main Navigation" [ref=f3e12]:
+            - list [ref=f3e13]:
+              - listitem [ref=f3e14]:
+                - link "Research" [ref=f3e15] [cursor=pointer]:
+                  - /url: /research/index/
+                - button "Research menu"
+              - listitem [ref=f3e18]:
+                - button "Products" [ref=f3e19] [cursor=pointer]
+                - button "Products menu"
+              - listitem [ref=f3e22]:
+                - link "Business" [ref=f3e23] [cursor=pointer]:
+                  - /url: /business/
+                - button "Business menu"
+              - listitem [ref=f3e26]:
+                - link "Developers" [ref=f3e27] [cursor=pointer]:
+                  - /url: /api/
+                - button "Developers menu"
+              - listitem [ref=f3e30]:
+                - link "Company" [ref=f3e31] [cursor=pointer]:
+                  - /url: /about/
+                - button "Company menu"
+              - listitem [ref=f3e34]:
+                - link "Foundation (opens in a new window)" [ref=f3e35] [cursor=pointer]:
+                  - /url: https://openaifoundation.org
+                  - generic [ref=f3e36]: Foundation
+                  - generic [ref=f3e38]: (opens in a new window)
+          - generic [ref=f3e40]:
+            - button "Open Search" [ref=f3e42] [cursor=pointer]
+            - button "Close Search" [ref=f3e45] [cursor=pointer]
+          - generic [ref=f3e49]:
+            - button "Log in" [ref=f3e50] [cursor=pointer]
+            - link "Try ChatGPT (opens in a new window)" [ref=f3e53] [cursor=pointer]:
+              - /url: https://chatgpt.com/
+              - text: Try ChatGPT
+              - generic [ref=f3e56]: (opens in a new window)
+  - generic [ref=f3e57]:
+    - main [ref=f3e58]:
+      - generic [ref=f3e59]: OpenAI
+      - article [ref=f3e60]:
+        - generic [ref=f3e64]:
+          - generic [ref=f3e65]: Select language
+          - combobox "Select language" [disabled] [ref=f3e68]:
+            - option "…" [selected]
+        - generic [ref=f3e73]:
+          - paragraph [ref=f3e75]: "Effective: October 29, 2025"
+          - heading "Usage policies" [level=1] [ref=f3e76]
+        - generic [ref=f3e78]:
+          - paragraph [ref=f3e80]: We aim for our tools to be used safely and responsibly, while maximizing your control over how you use them. In building our Usage Policies, we keep a few important things in mind.
+          - paragraph [ref=f3e82]:
+            - generic [ref=f3e83]: We empower users to innovate with AI
+            - text: . We build AI products that maximize helpfulness and freedom, while ensuring safety. Usage Policies are just one way we set clear expectations for the use of our products within a broader safety ecosystem that sets responsible guardrails across our services. You can
+            - link "learn more" [ref=f3e84] [cursor=pointer]:
+              - /url: /safety/how-we-think-about-safety-alignment/
+            - text: about our safety approach and
+            - link "our commitment to" [ref=f3e85] [cursor=pointer]:
+              - /url: /index/introducing-the-model-spec/
+            - text: customizability, transparency, and intellectual freedom to explore, debate, and create with AI.
+          - paragraph [ref=f3e87]:
+            - generic [ref=f3e88]: Responsible use is a shared priority
+            - text: . We assume the very best of our users. Our
+            - link "terms and policies" [ref=f3e89] [cursor=pointer]:
+              - /url: /policies/
+            - text: —including these Usage Policies—set a reasonable bar for acceptable use. Our rules are no substitute for legal requirements, professional duties, or ethical obligations that should influence how people use AI. We hold people accountable for inappropriate use of our services, and breaking or circumventing our rules and safeguards may mean you lose access to our systems or experience other penalties.
+          - paragraph [ref=f3e91]:
+            - generic [ref=f3e92]: We build with safety first
+            - text: . We
+            - link "monitor and enforce" [ref=f3e93] [cursor=pointer]:
+              - /url: /transparency-and-content-moderation/
+            - text: policies with privacy safeguards in place and clear review processes. We give developers practical
+            - link "moderation tools⁠ (opens in a new window)" [ref=f3e94] [cursor=pointer]:
+              - /url: https://platform.openai.com/docs/guides/moderation
+              - text: moderation tools⁠
+              - generic [ref=f3e95]: (opens in a new window)
+            - text: and guidance so they can support their end users. We
+            - link "publish" [ref=f3e96] [cursor=pointer]:
+              - /url: /safety/
+            - text: what our systems can and can’t do, share
+            - link "research" [ref=f3e97] [cursor=pointer]:
+              - /url: /research/index/
+            - text: and
+            - link "updates" [ref=f3e98] [cursor=pointer]:
+              - /url: /news/
+            - text: ", and provide a simple way to"
+            - link "report misuse" [ref=f3e99] [cursor=pointer]:
+              - /url: /form/report-content/
+            - text: .
+          - paragraph [ref=f3e101]:
+            - generic [ref=f3e102]: We update as we learn
+            - text: . People are using our systems in new ways every day, and we update our rules to ensure they are not overly restrictive or to better protect our users. We reserve all rights to withhold access where we reasonably believe it necessary to protect our service or users or anyone else. You can
+            - link "appeal⁠" [ref=f3e103] [cursor=pointer]:
+              - /url: https://openai.com/transparency-and-content-moderation/#:~:text=determining%20enforcement%20actions.-,Appeals%20process,-If%20we%20take
+            - text: if you think we have made a mistake enforcing policy, and we will work to make things right. If you’d like to keep up with Usage Policies updates,
+            - link "complete this form" [ref=f3e104] [cursor=pointer]:
+              - /url: /form/usage-policy-update/
+            - text: .
+          - paragraph [ref=f3e106]:
+            - generic [ref=f3e107]: "Your use of OpenAI services must follow these Usage Policies:"
+          - list [ref=f3e109]:
+            - listitem [ref=f3e110]:
+              - generic [ref=f3e111]: Protect people
+              - text: ". Everyone has a right to safety and security. So you cannot use our services for:"
+              - list [ref=f3e112]:
+                - listitem [ref=f3e113]: threats, intimidation, harassment, or defamation
+                - listitem [ref=f3e114]: suicide, self-harm, or disordered eating promotion or facilitation
+                - listitem [ref=f3e115]: sexual violence or non-consensual intimate content
+                - listitem [ref=f3e116]: terrorism or violence, including hate-based violence
+                - listitem [ref=f3e117]: weapons development, procurement, or use, including conventional weapons or CBRNE
+                - listitem [ref=f3e118]: illicit activities, goods, or services
+                - listitem [ref=f3e119]: destruction, compromise, or breach of another’s system or property, including malicious or abusive cyber activity or attempts to infringe on intellectual property rights of others
+                - listitem [ref=f3e120]: real money gambling
+                - listitem [ref=f3e121]: provision of tailored advice that requires a license, such as legal or medical advice, without appropriate involvement by a licensed professional
+                - listitem [ref=f3e122]: unsolicited safety testing
+                - listitem [ref=f3e123]: circumventing our safeguards
+                - listitem [ref=f3e124]: national security or intelligence purposes without our review and approval
+            - listitem [ref=f3e125]:
+              - generic [ref=f3e126]: Respect privacy
+              - text: ". People are entitled to privacy. So, we don’t allow attempts to compromise the privacy of others, including to aggregate, monitor, profile, or distribute individuals’ private or sensitive information without their authorization. And, you may never use our services for:"
+              - list [ref=f3e127]:
+                - listitem [ref=f3e128]: facial recognition databases without data subject consent
+                - listitem [ref=f3e129]: real-time remote biometric identification in public spaces
+                - listitem [ref=f3e130]: use of someone’s likeness, including their photorealistic image or voice, without their consent in ways that could confuse authenticity
+                - listitem [ref=f3e131]: evaluation or classification of individuals based on their social behavior, personal traits, or biometric data (including social scoring, profiling, or inferring sensitive attributes)
+                - listitem [ref=f3e132]: inference regarding an individual’s emotions in the workplace and educational settings, except when necessary for medical or safety reasons
+                - listitem [ref=f3e133]: assessment or prediction of the risk of an individual committing a criminal offense based solely on their personal traits or on profiling
+            - listitem [ref=f3e134]:
+              - generic [ref=f3e135]: Keep minors safe
+              - text: .Children and teens deserve special protection. Our services are designed to prevent harm and support their well-being, and must never be used to exploit, endanger, or sexualize anyone under 18 years old.
+              - link "We report" [ref=f3e137] [cursor=pointer]:
+                - /url: /index/combating-online-child-sexual-exploitation-abuse/
+              - text: "apparent child sexual abuse material and child endangerment to the National Center for Missing and Exploited Children. We prohibit use of our services for:"
+              - list [ref=f3e138]:
+                - listitem [ref=f3e139]: child sexual abuse material (CSAM), whether or not any portion is AI generated
+                - listitem [ref=f3e140]: grooming of minors
+                - listitem [ref=f3e141]: exposing minors to age-inappropriate content, such as graphic self-harm, sexual, or violent content
+                - listitem [ref=f3e142]: promoting unhealthy dieting or exercise behavior to minors
+                - listitem [ref=f3e143]: shaming or otherwise stigmatizing the body type or appearance of minors
+                - listitem [ref=f3e144]: dangerous challenges for minors
+                - listitem [ref=f3e145]: underaged sexual or violent roleplay
+                - listitem [ref=f3e146]: underaged access to age-restricted goods or activities
+            - listitem [ref=f3e147]:
+              - generic [ref=f3e148]: Empower people
+              - text: ". People should be able to make decisions about their lives and their communities. So we don’t allow our services to be used to manipulate or deceive people, to interfere with their exercise of human rights, to exploit people’s vulnerabilities, or to interfere with their ability to get an education or access critical services, including any use for:"
+              - list [ref=f3e149]:
+                - listitem [ref=f3e150]: academic dishonesty
+                - listitem [ref=f3e151]: deceit, fraud, scams, spam, or impersonation
+                - listitem [ref=f3e152]: political campaigning, lobbying, foreign or domestic election interference, or demobilization activities
+                - listitem [ref=f3e153]:
+                  - text: automation of high-stakes decisions in sensitive areas without human review
+                  - list [ref=f3e154]:
+                    - listitem [ref=f3e155]: critical infrastructure
+                    - listitem [ref=f3e156]: education
+                    - listitem [ref=f3e157]: housing
+                    - listitem [ref=f3e158]: employment
+                    - listitem [ref=f3e159]: financial activities and credit
+                    - listitem [ref=f3e160]: insurance
+                    - listitem [ref=f3e161]: legal
+                    - listitem [ref=f3e162]: medical
+                    - listitem [ref=f3e163]: essential government services
+                    - listitem [ref=f3e164]: product safety components
+                    - listitem [ref=f3e165]: national security
+                    - listitem [ref=f3e166]: migration
+                    - listitem [ref=f3e167]: law enforcement
+          - heading "Changelog" [level=2] [ref=f3e171]
+          - list [ref=f3e173]:
+            - listitem [ref=f3e174]: "2025-10-29: We've updated our Usage Policies to reflect a universal set of policies across OpenAI products and services."
+            - listitem [ref=f3e175]: "2025-01-29: We've updated our Universal Policies to clarify prohibitions under applicable laws."
+            - listitem [ref=f3e176]: "2024-01-10: We've updated our Usage Policies to be clearer and provide more service-specific guidance."
+            - listitem [ref=f3e177]: "2023-02-15: We’ve combined our use case and content policies into a single set of usage policies, and have provided more specific guidance on what activity we disallow in industries we’ve considered high risk."
+            - listitem [ref=f3e178]: "2022-11-09: We no longer require you to register your applications with OpenAI. Instead, we'll be using a combination of automated and manual methods to monitor for policy violations."
+            - listitem [ref=f3e179]: "2022-10-25: Updated App Review process (devs no longer need to wait for approval after submitting as long as they comply with our policies). Moved to an outcomes-based approach and updated Safety Best Practices."
+            - listitem [ref=f3e180]: "2022-06-07: Refactored into categories of applications and corresponding requirements."
+            - listitem [ref=f3e181]: "2022-03-09: Refactored into “App Review”."
+            - listitem [ref=f3e182]: "2022-01-19: Simplified copywriting and article writing/editing guidelines."
+            - listitem [ref=f3e183]: "2021-11-15: Addition of “Content guidelines” section; changes to bullets on almost always approved uses and disallowed uses; renaming document from “Use case guidelines” to “Usage guidelines”."
+            - listitem [ref=f3e184]: "2021-08-04: Updated with information related to code generation."
+            - listitem [ref=f3e185]: "2021-03-12: Added detailed case-by-case requirements; small copy and ordering edits."
+            - listitem [ref=f3e186]: "2021-02-26: Clarified the impermissibility of Tweet and Instagram generators."
+    - contentinfo [ref=f3e187]:
+      - generic [ref=f3e189]:
+        - generic [ref=f3e190]:
+          - generic [ref=f3e191]:
+            - heading "Research" [level=2] [ref=f3e192]
+            - list [ref=f3e193]:
+              - listitem [ref=f3e194]:
+                - link "Research Index" [ref=f3e195] [cursor=pointer]:
+                  - /url: /research/index/
+              - listitem [ref=f3e196]:
+                - link "Research Overview" [ref=f3e197] [cursor=pointer]:
+                  - /url: /research/
+              - listitem [ref=f3e198]:
+                - link "Economic Research" [ref=f3e199] [cursor=pointer]:
+                  - /url: /signals/
+          - generic [ref=f3e200]:
+            - heading "Latest Advancements" [level=2] [ref=f3e201]
+            - list [ref=f3e202]:
+              - listitem [ref=f3e203]:
+                - link "GPT-5.6" [ref=f3e204] [cursor=pointer]:
+                  - /url: /index/gpt-5-6/
+              - listitem [ref=f3e205]:
+                - link "GPT-5.5" [ref=f3e206] [cursor=pointer]:
+                  - /url: /index/introducing-gpt-5-5/
+              - listitem [ref=f3e207]:
+                - link "GPT-5.4" [ref=f3e208] [cursor=pointer]:
+                  - /url: /index/introducing-gpt-5-4/
+          - generic [ref=f3e209]:
+            - heading "Safety" [level=2] [ref=f3e210]
+            - list [ref=f3e211]:
+              - listitem [ref=f3e212]:
+                - link "Safety Approach" [ref=f3e213] [cursor=pointer]:
+                  - /url: /safety/
+              - listitem [ref=f3e214]:
+                - link "Deployment Safety (opens in a new window)" [ref=f3e215] [cursor=pointer]:
+                  - /url: https://deploymentsafety.openai.com/
+                  - text: Deployment Safety
+                  - generic [ref=f3e218]: (opens in a new window)
+              - listitem [ref=f3e219]:
+                - link "Security & Privacy" [ref=f3e220] [cursor=pointer]:
+                  - /url: /security-and-privacy/
+              - listitem [ref=f3e221]:
+                - link "Trust & Transparency" [ref=f3e222] [cursor=pointer]:
+                  - /url: /trust-and-transparency/
+        - generic [ref=f3e223]:
+          - generic [ref=f3e224]:
+            - heading "Products" [level=2] [ref=f3e225]
+            - list [ref=f3e226]:
+              - listitem [ref=f3e227]:
+                - link "ChatGPT (opens in a new window)" [ref=f3e228] [cursor=pointer]:
+                  - /url: https://chatgpt.com/
+                  - text: ChatGPT
+                  - generic [ref=f3e231]: (opens in a new window)
+              - listitem [ref=f3e232]:
+                - link "ChatGPT Business (opens in a new window)" [ref=f3e233] [cursor=pointer]:
+                  - /url: https://chatgpt.com/business/
+                  - text: ChatGPT Business
+                  - generic [ref=f3e236]: (opens in a new window)
+              - listitem [ref=f3e237]:
+                - link "ChatGPT Enterprise (opens in a new window)" [ref=f3e238] [cursor=pointer]:
+                  - /url: https://chatgpt.com/business/enterprise/
+                  - text: ChatGPT Enterprise
+                  - generic [ref=f3e241]: (opens in a new window)
+              - listitem [ref=f3e242]:
+                - link "ChatGPT for Education (opens in a new window)" [ref=f3e243] [cursor=pointer]:
+                  - /url: https://chatgpt.com/business/education/
+                  - text: ChatGPT for Education
+                  - generic [ref=f3e246]: (opens in a new window)
+              - listitem [ref=f3e247]:
+                - link "Codex" [ref=f3e248] [cursor=pointer]:
+                  - /url: /codex/
+              - listitem [ref=f3e249]:
+                - link "Release Notes" [ref=f3e250] [cursor=pointer]:
+                  - /url: /products/release-notes/
+          - generic [ref=f3e251]:
+            - heading "API Platform" [level=2] [ref=f3e252]
+            - list [ref=f3e253]:
+              - listitem [ref=f3e254]:
+                - link "Overview" [ref=f3e255] [cursor=pointer]:
+                  - /url: /api/
+              - listitem [ref=f3e256]:
+                - link "API Log In (opens in a new window)" [ref=f3e257] [cursor=pointer]:
+                  - /url: https://platform.openai.com/login
+                  - text: API Log In
+                  - generic [ref=f3e260]: (opens in a new window)
+              - listitem [ref=f3e261]:
+                - link "Docs (opens in a new window)" [ref=f3e262] [cursor=pointer]:
+                  - /url: https://developers.openai.com/api/docs
+                  - text: Docs
+                  - generic [ref=f3e265]: (opens in a new window)
+        - generic [ref=f3e266]:
+          - generic [ref=f3e267]:
+            - heading "Business" [level=2] [ref=f3e268]
+            - list [ref=f3e269]:
+              - listitem [ref=f3e270]:
+                - link "Overview" [ref=f3e271] [cursor=pointer]:
+                  - /url: /business/
+              - listitem [ref=f3e272]:
+                - link "Solutions" [ref=f3e273] [cursor=pointer]:
+                  - /url: /solutions/
+              - listitem [ref=f3e274]:
+                - link "Resources" [ref=f3e275] [cursor=pointer]:
+                  - /url: /business/learn/
+              - listitem [ref=f3e276]:
+                - link "Customer Stories" [ref=f3e277] [cursor=pointer]:
+                  - /url: /business/customer-stories/
+              - listitem [ref=f3e278]:
+                - link "Partner Network" [ref=f3e279] [cursor=pointer]:
+                  - /url: /business/partners/
+              - listitem [ref=f3e280]:
+                - link "Contact Sales" [ref=f3e281] [cursor=pointer]:
+                  - /url: /contact-sales/
+          - generic [ref=f3e282]:
+            - heading "Developers" [level=2] [ref=f3e283]
+            - list [ref=f3e284]:
+              - listitem [ref=f3e285]:
+                - link "Apps SDK (opens in a new window)" [ref=f3e286] [cursor=pointer]:
+                  - /url: https://developers.openai.com/apps-sdk
+                  - text: Apps SDK
+                  - generic [ref=f3e289]: (opens in a new window)
+              - listitem [ref=f3e290]:
+                - link "Open Models" [ref=f3e291] [cursor=pointer]:
+                  - /url: /open-models/
+              - listitem [ref=f3e292]:
+                - link "Docs (opens in a new window)" [ref=f3e293] [cursor=pointer]:
+                  - /url: https://developers.openai.com/
+                  - text: Docs
+                  - generic [ref=f3e296]: (opens in a new window)
+              - listitem [ref=f3e297]:
+                - link "Resources (opens in a new window)" [ref=f3e298] [cursor=pointer]:
+                  - /url: https://developers.openai.com/learn
+                  - text: Resources
+                  - generic [ref=f3e301]: (opens in a new window)
+              - listitem [ref=f3e302]:
+                - link "Developer Forum (opens in a new window)" [ref=f3e303] [cursor=pointer]:
+                  - /url: https://community.openai.com/
+                  - text: Developer Forum
+                  - generic [ref=f3e306]: (opens in a new window)
+        - generic [ref=f3e307]:
+          - generic [ref=f3e308]:
+            - heading "Company" [level=2] [ref=f3e309]
+            - list [ref=f3e310]:
+              - listitem [ref=f3e311]:
+                - link "About Us" [ref=f3e312] [cursor=pointer]:
+                  - /url: /about/
+              - listitem [ref=f3e313]:
+                - link "Our Charter" [ref=f3e314] [cursor=pointer]:
+                  - /url: /charter/
+              - listitem [ref=f3e315]:
+                - link "Careers" [ref=f3e316] [cursor=pointer]:
+                  - /url: /careers/
+              - listitem [ref=f3e317]:
+                - link "News" [ref=f3e318] [cursor=pointer]:
+                  - /url: /news/
+          - generic [ref=f3e319]:
+            - heading "Support" [level=2] [ref=f3e320]
+            - list [ref=f3e321]:
+              - listitem [ref=f3e322]:
+                - link "Help Center (opens in a new window)" [ref=f3e323] [cursor=pointer]:
+                  - /url: https://help.openai.com/
+                  - text: Help Center
+                  - generic [ref=f3e326]: (opens in a new window)
+        - generic [ref=f3e327]:
+          - generic [ref=f3e328]:
+            - heading "More" [level=2] [ref=f3e329]
+            - list [ref=f3e330]:
+              - listitem [ref=f3e331]:
+                - link "Stories" [ref=f3e332] [cursor=pointer]:
+                  - /url: /stories/
+              - listitem [ref=f3e333]:
+                - link "Academy" [ref=f3e334] [cursor=pointer]:
+                  - /url: /academy/
+              - listitem [ref=f3e335]:
+                - link "Supply Co." [ref=f3e336] [cursor=pointer]:
+                  - /url: /supply/
+              - listitem [ref=f3e337]:
+                - link "Livestreams" [ref=f3e338] [cursor=pointer]:
+                  - /url: /live/
+              - listitem [ref=f3e339]:
+                - link "Podcast" [ref=f3e340] [cursor=pointer]:
+                  - /url: /podcast/
+              - listitem [ref=f3e341]:
+                - link "RSS" [ref=f3e342] [cursor=pointer]:
+                  - /url: https://openai.com/news/rss.xml
+          - generic [ref=f3e343]:
+            - heading "Terms & Policies" [level=2] [ref=f3e344]
+            - list [ref=f3e345]:
+              - listitem [ref=f3e346]:
+                - link "Terms of Use" [ref=f3e347] [cursor=pointer]:
+                  - /url: /policies/terms-of-use/
+              - listitem [ref=f3e348]:
+                - link "Privacy Policy" [ref=f3e349] [cursor=pointer]:
+                  - /url: /policies/privacy-policy/
+              - listitem [ref=f3e350]:
+                - link "Other Policies" [ref=f3e351] [cursor=pointer]:
+                  - /url: /policies/
+      - generic [ref=f3e352]:
+        - generic [ref=f3e353]:
+          - link "X" [ref=f3e354] [cursor=pointer]:
+            - /url: https://x.com/OpenAI
+            - generic [ref=f3e357]: (opens in a new window)
+          - link "YouTube" [ref=f3e358] [cursor=pointer]:
+            - /url: https://www.youtube.com/OpenAI
+            - generic [ref=f3e361]: (opens in a new window)
+          - link "LinkedIn" [ref=f3e362] [cursor=pointer]:
+            - /url: https://www.linkedin.com/company/openai
+            - generic [ref=f3e365]: (opens in a new window)
+          - link "GitHub" [ref=f3e366] [cursor=pointer]:
+            - /url: https://github.com/openai
+            - generic [ref=f3e369]: (opens in a new window)
+          - link "Instagram" [ref=f3e370] [cursor=pointer]:
+            - /url: https://www.instagram.com/openai/
+            - generic [ref=f3e373]: (opens in a new window)
+          - link "TikTok" [ref=f3e374] [cursor=pointer]:
+            - /url: https://www.tiktok.com/@openai
+            - generic [ref=f3e377]: (opens in a new window)
+          - link "Discord" [ref=f3e378] [cursor=pointer]:
+            - /url: https://discord.gg/openai
+            - generic [ref=f3e381]: (opens in a new window)
+        - generic [ref=f3e382]:
+          - generic [ref=f3e383]: OpenAI © 2015–2026
+          - button "Manage Cookies" [ref=f3e384] [cursor=pointer]
+        - generic [ref=f3e385]:
+          - button "Change language" [ref=f3e386] [cursor=pointer]:
+            - generic [ref=f3e391]:
+              - text: English
+              - generic [ref=f3e392]: United States
+          - generic:
+            - generic:
+              - generic:
+                - generic:
+                  - generic:
+                    - textbox "Search locales by name or region":
+                      - /placeholder: Search
