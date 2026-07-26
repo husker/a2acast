@@ -135,6 +135,11 @@ VERSION = "0.16.1"
 USER_AGENT = f"a2acast/{VERSION}"
 ACK_WAIT = 5   # seconds a sender listens for delivery acks
 MAX_ATTACHMENT = 512 * 1024  # bytes we're willing to fetch for a wrapped body
+CHUNK_PREFIX = "mwchunk1:"      # #66 tier 2: transport framing version
+CHUNK_HEADER_ROOM = 128         # prefix + cid + indexes + separators
+CHUNK_MAX_COUNT = 16            # ceiling ~63 KB of wire; beyond -> attachment
+CHUNK_SET_TTL = 600             # seconds a partial set may wait for pieces
+CHUNK_MAX_SETS = 32             # concurrent partial sets (~2 MB worst case)
 NTFY_INLINE_LIMIT = 4096  # ntfy stores larger posts as ATTACHMENTS with a
 # ~3h TTL instead of the normal cache retention -- delivery durability
 # silently depends on size past this line (#66)
@@ -1668,13 +1673,20 @@ def _pin_cap(cfg):
     return max(PIN_STORE_CAP_FLOOR, 4 * certified)
 
 
-def _bind_peer(cfg, node, pub):
+def _bind_peer(cfg, node, pub, replacing=None):
     """Trust-on-first-use pin of node -> public key; returns the bound key.
 
     Raises ValueError when `node` is already pinned to a different key. Never
     a silent replace: the pin is the identity, so a changed key is either a
     rotation nobody authorised or an impersonation, and both must surface
     rather than be adopted. Same shape as _apply_owner_trust's refusal.
+
+    `replacing` (a specific key) permits ONE explicit, non-silent overwrite:
+    the caller has already decided, under its own policy, that the existing
+    pin may be replaced (e.g. a proven-revoked occupant, #130 seam 1). It is
+    targeted -- the existing pin must still equal `replacing` when re-checked
+    under the lock, or the normal reject-a-different-key invariant fires --
+    so it cannot race into replacing a key the caller never validated.
 
     The read-check-write runs under a lock, re-reading the pin store inside
     it. Without that, two processes first-contacting the same node
@@ -1695,11 +1707,18 @@ def _bind_peer(cfg, node, pub):
         pins = _load_pins(cfg)  # fresh read INSIDE the lock
         existing = pins.get(node)
         if isinstance(existing, str) and existing.strip():
-            if existing.strip() != pub:
+            if existing.strip() == pub:
+                return existing.strip()
+            if not (replacing is not None
+                    and existing.strip() == _normalize_pubkey(replacing)):
                 raise ValueError(
                     f"peer '{node}' is already pinned to a different key; "
                     f"refusing to replace it")
-            return existing.strip()
+            # validated targeted replacement: overwrite in place (count
+            # unchanged, so the cap does not apply).
+            pins[node] = pub
+            _write_json_secure(pins_file(cfg), pins)
+            return pub
         cap = _pin_cap(cfg)
         if len(pins) >= cap:
             # #76 c4: growth past the fleet-scaled bound is the attack
@@ -1718,6 +1737,140 @@ def _bind_peer(cfg, node, pub):
             os.unlink(lock)
         except OSError:
             pass
+
+
+RENAMES_NAME = ".meshwire.renames.json"
+RENAMES_FILE_MAX = 256 * 1024
+
+
+def renames_file(cfg):
+    return os.path.join(cfg["_dir"], RENAMES_NAME)
+
+
+def _load_renames(cfg):
+    """Tombstone ledger: old name -> its one-and-only migration (#93
+    Phase B-prime). Growth needs a KEY-VERIFIED rename from a PINNED
+    source, so it is bounded by the pin store; the byte cap is the
+    same store discipline as everything else fed by the wire (#106)."""
+    try:
+        value = _load_json_regular(renames_file(cfg), require_private=False,
+                                   max_bytes=RENAMES_FILE_MAX)
+    except (OSError, ValueError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _name_is_live(cfg, name):
+    """Whether `name` is a known live identity even WITHOUT a pin -- present
+    in the roster or with a peer sighting. A rename must not TOFU-capture
+    such a name (#130 seam 2, lodestar): migrating onto an unpinned-but-live
+    name binds the renamer's key to an identity someone else is actively
+    using -- an impersonation / identity-DoS."""
+    if not isinstance(name, str) or not name:
+        return False
+    if name in cfg.get("nodes", []):
+        return True
+    try:
+        return name in load_peers(cfg)
+    except (OSError, ValueError):
+        # Fail SHUT (codebase convention, bastion seat): a peer store we
+        # cannot read cannot prove the name is NOT a live identity, so treat
+        # it as occupied rather than let a rename capture it.
+        return True
+
+
+def _rename_migration_enabled(cfg):
+    """Whether a key-verified rename may MIGRATE the pin, or only be
+    observed. Default OFF: a node does not get to rename itself in the
+    fleet's trust store on its own key alone -- migration is a durable
+    identity-store write driven by a received frame, and the OWNER
+    authorizes that policy by setting `rename_migration` (James's design
+    call, #130/#93). Off => today's log-only WOULD_MIGRATE; the mechanism
+    is present but dormant until the owner turns it on fleet-wide."""
+    return bool(cfg.get("rename_migration"))
+
+
+def _migrate_pin(cfg, old, new, head):
+    """#93 Phase B-prime: carry a KEY-VERIFIED rename's pin to the new
+    name and tombstone the old one. Every refusal is loud and names the
+    frame (`head` carries the id). Invariants, from the recorded design:
+    `old` is the SIGNED sender (the caller passes frm, never ctl['old']);
+    monotonic -- one migration per old name, ever, so a replayed or
+    conflicting rename can never flip a migration (never FROM a
+    tombstone); a tombstoned name is never a migration TARGET either;
+    _bind_peer's never-silently-replace invariant decides target
+    conflicts; continuity tier (owner-certified vs TOFU) is inherited by
+    RECORD -- the cert itself stays bound to the old name until the
+    owner re-mints."""
+    src_key = _pinned_peer_key(cfg, old)
+    if src_key is None:
+        # verdict said verified but no pin exists (harness-driven or a
+        # corrupted store): nothing to carry, keep it an observation.
+        print(f"{head} WOULD_MIGRATE (source pin missing -- nothing to "
+              f"migrate)", file=sys.stderr)
+        return
+    renames = _load_renames(cfg)
+    prior = renames.get(old)
+    if isinstance(prior, dict):
+        if prior.get("new") == new:
+            print(f"{head} ALREADY_MIGRATED (replay of a recorded "
+                  f"migration; ledger unchanged)", file=sys.stderr)
+        else:
+            print(f"{head} REFUSED_TOMBSTONE ('{_single_line(old)}' "
+                  f"already migrated to "
+                  f"'{_single_line(str(prior.get('new')))}' -- a second "
+                  f"migration FROM a tombstone never happens)",
+                  file=sys.stderr)
+        return
+    if isinstance(renames.get(new), dict):
+        print(f"{head} REFUSED_TOMBSTONE (target "
+              f"'{_single_line(new)}' is itself a tombstoned name)",
+              file=sys.stderr)
+        return
+    # Target-occupancy predicate (lodestar seams). A rename may only land on
+    # a name that is genuinely FREE:
+    target_key = _pinned_peer_key(cfg, new)
+    replacing = None
+    if target_key is not None and target_key != src_key:
+        # Pinned to a DIFFERENT key. A PROVEN-revoked occupant is not a
+        # legitimate holder and must not permanently block a real migration
+        # (seam 1, availability); a clean-or-UNKNOWN occupant DOES block --
+        # unknown fails shut, never read as free (lodestar B2).
+        if _revocation_status(cfg, target_key) == "revoked":
+            replacing = target_key
+            print(f"{head} TARGET_REVOKED_REPLACED (target was pinned to a "
+                  f"REVOKED key -- freeing it for the migration)",
+                  file=sys.stderr)
+        else:
+            print(f"{head} TARGET_PIN_CONFLICT (target pinned to a "
+                  f"different, non-revoked key -- a rename cannot steal a "
+                  f"name; no migration)", file=sys.stderr)
+            return
+    elif target_key is None and _name_is_live(cfg, new):
+        # UNPINNED but a live known identity: migrating here would
+        # TOFU-capture a name someone else is using (seam 2, impersonation
+        # / identity-DoS).
+        print(f"{head} TARGET_OCCUPIED (target is an unpinned but LIVE "
+              f"identity -- refusing to capture it; no migration)",
+              file=sys.stderr)
+        return
+    try:
+        _bind_peer(cfg, new, src_key, replacing=replacing)
+    except ValueError:
+        print(f"{head} TARGET_PIN_CONFLICT (target name is pinned to a "
+              f"DIFFERENT key -- a rename cannot steal a name; no "
+              f"migration)", file=sys.stderr)
+        return
+    except RuntimeError as exc:
+        print(f"{head} REFUSED ({_single_line(str(exc))}; no migration)",
+              file=sys.stderr)
+        return
+    renames[old] = {"new": new, "fpr": _key_fingerprint(src_key),
+                    "iat": int(time.time()),
+                    "certified": _cert_for_key(cfg, src_key) is not None}
+    _write_json_secure(renames_file(cfg), renames)
+    print(f"{head} MIGRATED (pin carried to '{_single_line(new)}'; "
+          f"'{_single_line(old)}' tombstoned)", file=sys.stderr)
 
 
 def _node_sig_message(cfg, relay_topic, timestamp, payload):
@@ -1885,6 +2038,167 @@ def _report_verdict(frm, ev, verdict):
               f"from={_single_line(frm)} status={verdict}", file=sys.stderr)
 
 
+REVGAP_LOG_INTERVAL = 300       # s; per-peer REVGAP log throttle
+REVPULL_MIN_INTERVAL = 60       # s; per-peer pull-request rate limit
+REVSERVE_MIN_INTERVAL = 60      # s; per-peer serve rate limit (anti-reflection)
+REVPULL_STRIKE_MAX = 3          # unsubstantiated assertions before back-off
+_revgap_last = {}
+_revpull_last = {}              # peer -> last pull-request ts
+_revpull_expect = {}            # peer -> the iat it asserted when we pulled
+_revpull_strikes = {}           # peer -> unsubstantiated-assertion count
+_revserve_last = {}             # peer -> last time we served it a list
+_revgap_lock = threading.Lock()
+
+
+def _my_revlist_iat(cfg):
+    """This node's adopted-list iat, or None when it holds no readable
+    list (blind -- asserts nothing, enforces nothing). An unreadable
+    cache is treated as no-assertion here, NOT fail-shut: this is the
+    observe-only freshness path, never a delivery gate."""
+    try:
+        body, _ = _load_revlist(cfg)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(body, dict):
+        return None
+    iat = body.get("iat")
+    return iat if isinstance(iat, int) and not isinstance(iat, bool) else None
+
+
+def _revlist_freshness_enabled(cfg):
+    """Whether this node may stamp the freshness `rl` field. It is a NEW
+    signed wrapper field, and a peer still on the pre-#120 fixed-field
+    rebuild MISMATCHES a frame that carries it (rollout ordering, recorded
+    on _frame_verdict). A node CANNOT detect a peer's version unilaterally
+    -- 0.16.1 predates #120 and the fleet runs mixed versions -- so
+    stamping is gated on an explicit operator assertion that the WHOLE
+    fleet reconstructs the base (#120), the `revlist_freshness` config
+    flag, NOT on merely holding a list (bastion seat). Off by default: a
+    fresh mesh stamps nothing and stays byte-identical to today."""
+    return bool(cfg.get("revlist_freshness"))
+
+
+def _assert_revlist_freshness(cfg, payload):
+    """Return payload with a signed `rl` = adopted-list iat, or unchanged
+    when freshness stamping is not enabled for this fleet or this node
+    holds no readable list. Copies before mutating so the caller's dict is
+    untouched."""
+    if not _revlist_freshness_enabled(cfg):
+        return payload
+    iat = _my_revlist_iat(cfg)
+    if iat is None:
+        return payload
+    out = dict(payload)
+    out["rl"] = iat
+    return out
+
+
+def _revlist_strike(frm, expected, reason):
+    """#76 leg 2: record a peer failing to substantiate an asserted `iat`.
+    Past REVPULL_STRIKE_MAX the observer stops pulling from it. Loud: an
+    honest node never asserts freshness it cannot back, so this is its own
+    evidence line (lodestar)."""
+    with _revgap_lock:
+        n = _revpull_strikes.get(frm, 0) + 1
+        _revpull_strikes[frm] = n
+        _revpull_expect.pop(frm, None)
+    print(f"MESH_REVLIST_UNSUBSTANTIATED from={_single_line(frm)} "
+          f"asserted={expected} strike={n}/{REVPULL_STRIKE_MAX} "
+          f"({_single_line(str(reason))}) -- #76", file=sys.stderr)
+
+
+def _observe_revlist_freshness(cfg, me, frm, signed_base, verdict=None,
+                               now=None):
+    """#76 distribution: a peer's frame asserts its revocation-list `iat`.
+    REVGAP is logged on any trusted frame, but the PULL -- which writes
+    _revpull_expect[frm] and emits a request -- fires ONLY on a
+    signature-VERIFIED frame (bastion seat). `trusted` here is shared-key
+    membership, not authorship: an UNSIGNED frame passes it. `rl` rides
+    _base_payload, which keeps the field even on an unsigned wrapper, so
+    without the verdict gate any member could spoof from=victim with an
+    inflated iat, poison _revpull_expect[victim], and turn the victim's
+    OWN truthful verified reply (a lower real iat) into a strike -- a
+    suppression vector that weaponizes the strike-hardening. The verdict
+    is the only thing separating a real assertion from a forged one."""
+    if not isinstance(signed_base, dict):
+        return
+    peer_iat = signed_base.get("rl")
+    if not isinstance(peer_iat, int) or isinstance(peer_iat, bool):
+        return
+    mine = _my_revlist_iat(cfg) or 0
+    if peer_iat <= mine:
+        return
+    now = time.time() if now is None else now
+    with _revgap_lock:
+        last = _revgap_last.get(frm)
+        if last is None or now - last >= REVGAP_LOG_INTERVAL:
+            _revgap_last[frm] = now
+            # Split the line by verdict so it never claims a pull it did not
+            # do (bastion, CLAUDE.md rule 1): only a verified assertion pulls.
+            act = ("pulling to converge" if verdict == FRAME_VERIFIED
+                   else "not pulling -- unverified assertion")
+            print(f"MESH_REVGAP from={_single_line(frm)} peer_iat={peer_iat} "
+                  f"mine={mine} (peer holds a newer owner-signed revocation "
+                  f"list; {act} -- #76)", file=sys.stderr)
+        # The pull mutates _revpull_expect and emits a request. Only a
+        # signature-VERIFIED assertion may drive it: an unsigned frame is
+        # trusted only by shared-key membership and is spoofable
+        # from=victim, so acting on its iat is the suppression vector.
+        if verdict != FRAME_VERIFIED:
+            return  # fail closed: only a verified assertion drives a pull
+        if _revpull_strikes.get(frm, 0) >= REVPULL_STRIKE_MAX:
+            return
+        pulled = _revpull_last.get(frm)
+        if pulled is not None and now - pulled < REVPULL_MIN_INTERVAL:
+            return
+        _revpull_last[frm] = now
+        _revpull_expect[frm] = peer_iat
+    try:
+        send_raw(cfg, me, frm, "revlist-req",
+                 ctl=_stamp_posture({"mw": "revlist-req", "have": mine}))
+    except (urllib.error.URLError, socket.timeout, UnicodeError, ValueError,
+            OSError):
+        pass
+
+
+
+DOWNGRADE_LOG_INTERVAL = 300     # s; per-peer MESH_DOWNGRADE log throttle
+_downgrade_last = {}
+_downgrade_lock = threading.Lock()
+
+
+def _observe_downgrade(cfg, frm, verdict, now=None):
+    """#74 downgrade ratchet, OBSERVE-ONLY: a name whose signing key is
+    already PINNED (so it has been seen to sign) sending an UNSIGNED
+    frame is the signature-stripping shape enforcement will refuse. A
+    pin is only ever established from a signed frame, so 'pinned' IS
+    'has signed before' -- no new state store. Log-only here: it drops
+    nothing, and the #62 soak needs to witness how often a legitimate
+    unsigned-after-signed occurs (a node that later cannot sign) BEFORE
+    enforcement gates delivery on it. Enforcement itself is BLOCKED on
+    the recorded #74 preconditions (non-suppressible revocation
+    distribution seated) and is not wired here.
+
+    Throttled per peer, matching REVGAP (bastion seat): a node that
+    genuinely cannot sign would otherwise emit one line per frame and
+    drown the soak's real signal."""
+    if verdict != FRAME_UNSIGNED:
+        return
+    if not isinstance(frm, str) or not frm:
+        return
+    if _pinned_peer_key(cfg, frm) is None:
+        return
+    now = time.time() if now is None else now
+    with _downgrade_lock:
+        last = _downgrade_last.get(frm)
+        if last is not None and now - last < DOWNGRADE_LOG_INTERVAL:
+            return
+        _downgrade_last[frm] = now
+    print(f"MESH_DOWNGRADE from={_single_line(frm)} (a pinned signing key "
+          f"exists for this name but the frame arrived UNSIGNED -- "
+          f"signature-stripping is what the #74 ratchet will refuse; "
+          f"observe-only)", file=sys.stderr)
+
 def _own_node_pubkey(cfg, harness):
     """This node's own normalized public key, or None if it has no key."""
     try:
@@ -1927,6 +2241,17 @@ def _sign_wrapper_payload(cfg, to, payload, harness=None):
         pub = _own_node_pubkey(cfg, harness)
         if pub is None:
             return timestamp, payload
+        # #76 distribution: assert this node's revocation-list freshness so a
+        # peer can detect it is behind and pull. Signed (inside the payload,
+        # covered by the node signature -- the first NEW signed wrapper field,
+        # which _base_payload carries forward-compatibly), and substantiable:
+        # `iat` is bounded by what the owner actually published, so a node
+        # cannot assert one it can't back at pull time. A node with no
+        # readable adopted list asserts NOTHING -- honest blindness, and it
+        # keeps a fresh mesh's frames byte-identical to today (no rl field),
+        # which is what gates this behind an operator's deliberate
+        # revlist-trust rather than tripping the mixed-version rollout.
+        payload = _assert_revlist_freshness(cfg, payload)
         relay_topic = topic(cfg, to) if to is not None else ""
         signature = _sign_as_node(cfg, harness, relay_topic, timestamp,
                                   payload)
@@ -3172,6 +3497,77 @@ def http(url, data=None, headers=None, timeout=15):
     return urllib.request.urlopen(req, timeout=timeout)
 
 
+CHUNK_DATA_MAX = NTFY_INLINE_LIMIT - CHUNK_HEADER_ROOM
+_chunk_sets = {}
+_chunk_lock = threading.Lock()
+
+
+def _chunk_wire(wire):
+    """#66 tier 2: split an encrypted wire string into prefixed pieces
+    that each fit the relay's inline limit, or None when it would take
+    more than CHUNK_MAX_COUNT pieces (caller falls back to the
+    attachment path and its TTL warning). Framing sits BELOW the
+    crypto: signature and ciphertext cover the whole frame, so chunking
+    adds no authenticated surface -- a garbled or forged piece can only
+    make the reassembled frame fail decrypt."""
+    pieces = [wire[i:i + CHUNK_DATA_MAX]
+              for i in range(0, len(wire), CHUNK_DATA_MAX)]
+    if not 2 <= len(pieces) <= CHUNK_MAX_COUNT:
+        return None
+    cid = uuid.uuid4().hex
+    total = len(pieces)
+    return [f"{CHUNK_PREFIX}{cid}:{i}:{total}:{piece}"
+            for i, piece in enumerate(pieces)]
+
+
+def _absorb_chunk(message, now=None):
+    """Buffer one chunk piece; return the reassembled wire when this
+    piece completes its set, else None (pending or malformed -- callers
+    treat both as silently not-a-message-yet).
+
+    Bounded like every store fed by the wire (#106 discipline): sets
+    expire after CHUNK_SET_TTL, at most CHUNK_MAX_SETS concurrent sets
+    with the oldest evicted, first write wins per slot so a later
+    duplicate cannot poison a set, and a set whose pieces disagree on
+    the total is dropped whole. The pieces are UNAUTHENTICATED framing;
+    nothing here is trusted until the reassembled frame decrypts."""
+    if now is None:
+        now = time.time()
+    parts = message[len(CHUNK_PREFIX):].split(":", 3)
+    if len(parts) != 4:
+        return None
+    cid, index_s, total_s, data = parts
+    if len(cid) != 32 or any(ch not in "0123456789abcdef" for ch in cid):
+        return None
+    try:
+        index, total = int(index_s), int(total_s)
+    except ValueError:
+        return None
+    if not (0 < total <= CHUNK_MAX_COUNT and 0 <= index < total
+            and 0 < len(data) <= CHUNK_DATA_MAX):
+        return None
+    with _chunk_lock:
+        for stale in [c for c, s in _chunk_sets.items()
+                      if now - s["born"] > CHUNK_SET_TTL]:
+            del _chunk_sets[stale]
+        entry = _chunk_sets.get(cid)
+        if entry is None:
+            if len(_chunk_sets) >= CHUNK_MAX_SETS:
+                oldest = min(_chunk_sets,
+                             key=lambda c: _chunk_sets[c]["born"])
+                del _chunk_sets[oldest]
+            entry = _chunk_sets[cid] = {"born": now, "n": total,
+                                        "parts": {}}
+        if entry["n"] != total:
+            del _chunk_sets[cid]  # self-contradictory set: poison, drop
+            return None
+        entry["parts"].setdefault(index, data)
+        if len(entry["parts"]) < entry["n"]:
+            return None
+        del _chunk_sets[cid]
+        return "".join(entry["parts"][i] for i in range(total))
+
+
 def _unwrap(ev, cfg, node=None):
     """ntfy wraps large bodies into attachments. Return the effective body
     text of a message event, fetching the attachment when needed. Return None
@@ -3249,6 +3645,14 @@ def _open_details(ev, cfg, me=None):
     body = _unwrap(ev, cfg, node=me)
     if not isinstance(body, str):
         return None, None, "", False, None, None, None, None, None, None
+    if body.startswith(CHUNK_PREFIX):
+        # #66 tier 2: buffer the piece; only a completed set proceeds to
+        # decrypt (fingerprint and replay dedupe then cover the whole
+        # reassembled frame). Pending or malformed pieces are silently
+        # not-a-message-yet: empty untrusted body never warns.
+        body = _absorb_chunk(body)
+        if body is None:
+            return None, None, "", False, None, None, None, None, None, None
     relay_topic = ev.get("topic") if isinstance(ev.get("topic"), str) else None
     pt, wire_ts = _decrypt_meta(cfg, body, expected_topic=relay_topic)
     if pt is not None:
@@ -5869,11 +6273,26 @@ def send_raw(cfg, sender, to, body, title=None, ctl=None):
         wire = encrypt(cfg, json.dumps(payload), to=to, timestamp=timestamp)
         headers = {"Title": cfg["mesh"]}
         if len(wire) > NTFY_INLINE_LIMIT:
+            pieces = _chunk_wire(wire)
+            if pieces is not None:
+                # #66 tier 2: every piece stays under the inline limit, so
+                # the relay's NORMAL retention carries the content -- the
+                # attachment TTL cliff no longer applies to this send. The
+                # returned relay id is the last piece's: in-order delivery
+                # makes it the completing piece, so ack --wait still keys
+                # correctly (out-of-order completion can time the wait out
+                # while still delivering; accepted, documented on #66).
+                resp = None
+                for piece in pieces:
+                    resp = _post(cfg, topic(cfg, to),
+                                 piece.encode("utf-8"), headers)
+                return resp
             print(f"MESH_WARN: payload exceeds the relay's ~{NTFY_INLINE_LIMIT}B "
-                  f"inline limit and will ride an attachment with a ~3h TTL -- "
-                  f"a receiver offline past that window loses the CONTENT "
-                  f"(the wake survives). Prefer smaller messages or a durable "
-                  f"channel for bulk (#66)", file=sys.stderr)
+                  f"inline limit and the {CHUNK_MAX_COUNT}-chunk ceiling, so "
+                  f"it will ride an attachment with a ~3h TTL -- a receiver "
+                  f"offline past that window loses the CONTENT (the wake "
+                  f"survives). Prefer smaller messages or a durable channel "
+                  f"for bulk (#66)", file=sys.stderr)
     else:
         wire = body
         headers = {"Title": title or f"{cfg['mesh']}: {sender} -> {to}",
@@ -7320,15 +7739,14 @@ def _handle_control(cfg, me, frm, ctl, verdict=None, ev=None):
                   posture=ctl.get("posture"))
         return f"MESH_NODE_JOINED node={_single_line(frm)}"
     if kind == "rename":
-        # #93/#76 slice 2, LOG-ONLY: a node announces old->new signed by its
-        # UNCHANGED key, sent AS the old name so the signature verifies
-        # against the pin peers already hold. In Phase A we OBSERVE and log
-        # WOULD_MIGRATE -- we migrate no pin and write no tombstone; real
-        # migration is a gated later phase. Continuity is only as strong as
-        # the source pin (B3): a verified source is a real key-continuity
-        # rename, anything else is an unproven claim. `old` is the SIGNED
-        # frm, never ctl['old'] (which is not even minted) -- reading an
-        # unauthenticated old would be a pin hijack.
+        # #93: a node announces old->new signed by its UNCHANGED key,
+        # sent AS the old name so the signature verifies against the pin
+        # peers already hold. A VERIFIED source migrates (Phase B-prime,
+        # _migrate_pin -- monotonic, tombstoned, never a silent replace);
+        # anything else stays an observation. Continuity is only as
+        # strong as the source pin (B3). `old` is the SIGNED frm, never
+        # ctl['old'] -- reading an unauthenticated old would be a
+        # pin hijack.
         old, new = frm, ctl.get("new")
         if not isinstance(new, str) or not new or new == BROADCAST:
             return None
@@ -7339,8 +7757,16 @@ def _handle_control(cfg, me, frm, ctl, verdict=None, ev=None):
         fid = _single_line(ev.get("id")) if isinstance(ev, dict) else "?"
         head = f"MESH_RENAME id={fid} {_single_line(old)} -> {_single_line(new)}"
         if verdict == FRAME_VERIFIED:
-            _evidence(f"{head} WOULD_MIGRATE (key-verified; Phase A log-only, "
-                  f"pin NOT migrated)")
+            # #93 Phase B-prime: verified continuity MIGRATES -- but only
+            # when the owner has authorized it (#130). Default is log-only:
+            # a node cannot rename itself in the trust store unbidden. The
+            # WOULD_MIGRATE line rides the durable evidence log (#129).
+            if _rename_migration_enabled(cfg):
+                _migrate_pin(cfg, old, new, head)
+            else:
+                _evidence(f"{head} WOULD_MIGRATE (key-verified; migration "
+                          f"not enabled -- owner sets `rename_migration` to "
+                          f"allow, #130)")
         elif verdict == FRAME_MISMATCH:
             # A DIFFERENT key than the one pinned for `old` is asking the
             # fleet to carry old's identity to `new` -- the exact
@@ -7370,6 +7796,77 @@ def _handle_control(cfg, me, frm, ctl, verdict=None, ev=None):
     if kind == "pong":
         note_peer(cfg, frm, "pong", ctl.get("status"),
                   posture=ctl.get("posture"))
+        return None
+    if kind == "revlist-req":
+        # #76 leg 2: a peer is behind and asked for our list. Serve our
+        # adopted block only when it is genuinely newer than what the peer
+        # has (`have`), and re-VERIFY it before serving -- the confused-
+        # deputy note on _load_revlist: body and cached block are not bound,
+        # so never serve a block we have not just checked. Rate-limited per
+        # peer so a stream of requests cannot make us a 128KB reflector.
+        want = ctl.get("have")
+        want = want if isinstance(want, int) and not isinstance(want, bool) else 0
+        now = time.time()
+        with _revgap_lock:
+            served = _revserve_last.get(frm)
+            if served is not None and now - served < REVSERVE_MIN_INTERVAL:
+                return None
+            _revserve_last[frm] = now
+        try:
+            body, block = _load_revlist(cfg)
+        except (OSError, ValueError):
+            return None
+        if body is None or body.get("iat", 0) <= want:
+            return None
+        ok, _reason, _b = _verify_revlist(cfg, block)
+        if not ok:
+            return None
+        try:
+            send_raw(cfg, me, frm, "revlist-resp",
+                     ctl=_stamp_posture({"mw": "revlist-resp", "block": block}))
+        except (urllib.error.URLError, socket.timeout, UnicodeError,
+                ValueError, OSError):
+            pass
+        return None
+    if kind == "revlist-resp":
+        # #76 leg 2: a served list arrived. Two separable decisions
+        # (bastion seat): ADOPTION is gated only on the owner signature
+        # re-verifying (the block came from a possibly-hostile carrier, but
+        # the owner sig is the trust anchor, so a valid newer list is safe
+        # to adopt from anyone -- that IS gossip). A STRIKE, which penalizes
+        # a peer and backs off pulling from it, is far stronger and requires
+        # BOTH: a signature-VERIFIED frame (never strike on an
+        # unauthenticated carrier a shared-key holder could forge AS an
+        # honest node) AND an OUTSTANDING pull we actually made to this peer
+        # (an unsolicited response, expected is None, strikes nobody).
+        block = ctl.get("block")
+        expected = _revpull_expect.get(frm)
+        may_strike = verdict == FRAME_VERIFIED and expected is not None
+
+        def _maybe_strike(why):
+            if may_strike:
+                _revlist_strike(frm, expected, why)
+
+        if not isinstance(block, str):
+            _maybe_strike("no block in response")
+            return None
+        ok, reason, body = _verify_revlist(cfg, block)
+        if not ok:
+            _maybe_strike(reason)
+            return None
+        if expected is not None and body.get("iat", 0) < expected:
+            _maybe_strike(f"served iat={body.get('iat')} < asserted "
+                          f"{expected}")
+            return None
+        with _revgap_lock:
+            _revpull_strikes.pop(frm, None)  # substantiated: clear strikes
+            _revpull_expect.pop(frm, None)
+        note = _note_revlist(cfg, body, block)
+        if note == "adopted":
+            print(f"MESH_REVLIST_PULLED from={_single_line(frm)} "
+                  f"iat={body['iat']} n={len(body['revocations'])} "
+                  f"(adopted a newer owner-signed list -- #76)",
+                  file=sys.stderr)
         return None
     if kind == "ack":
         note_peer(cfg, frm, "ack", ctl.get("status"),
@@ -7611,6 +8108,8 @@ def _cmd_watch_owned(args, cfg, me):
             cfg, frm, recipient, body, ctl, _sig, _pk, _wts, ev,
             signed_base=_sbase)
         _report_verdict(frm, ev, verdict)
+        _observe_revlist_freshness(cfg, me, frm, _sbase, verdict)
+        _observe_downgrade(cfg, frm, verdict)
         if verdict == FRAME_VERIFIED:
             # #76 Phase A: log-only cert observability for verified frames,
             # against the LOCAL pin (the key that actually verified).
@@ -8310,6 +8809,8 @@ class MeshMCPServer:
                 cfg, frm, recipient, body, ctl, _sig, _pk, _wts, ev,
                 signed_base=_sbase)
             _report_verdict(frm, ev, verdict)
+            _observe_revlist_freshness(cfg, me, frm, _sbase, verdict)
+            _observe_downgrade(cfg, frm, verdict)
             if verdict == FRAME_VERIFIED:
                 # #76 Phase A: log-only cert observability (see cmd_watch).
                 _report_cert_status(cfg, frm, _load_pins(cfg).get(frm))

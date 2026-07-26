@@ -3020,8 +3020,14 @@ class WakeHookCheckpointTests(MembershipCmdTests):
         with mock.patch.object(mesh, "_post",
                                return_value={"id": "x"}), \
                 contextlib.redirect_stderr(err):
-            mesh.send_raw(cfg, "alpha", "beta", "x" * 5000)
+            mesh.send_raw(cfg, "alpha", "beta", "x" * 80000)
         self.assertIn("~3h TTL", err.getvalue())
+        mid = io.StringIO()
+        with mock.patch.object(mesh, "_post",
+                               return_value={"id": "m"}), \
+                contextlib.redirect_stderr(mid):
+            mesh.send_raw(cfg, "alpha", "beta", "x" * 5000)
+        self.assertNotIn("TTL", mid.getvalue())  # chunked now (#66 tier 2)
         err2 = io.StringIO()
         with mock.patch.object(mesh, "_post",
                                return_value={"id": "y"}), \
@@ -3592,6 +3598,408 @@ class MemberCertTests(unittest.TestCase):
                 mesh.cmd_cert_mint(argparse.Namespace(node="ghost",
                                                       ttl_days=365))
         self.assertIn("no pinned key", str(caught.exception))
+
+
+class RevlistPullTests(unittest.TestCase):
+    """#76 leg 2: the pull transport that makes distribution non-
+    suppressible. A node behind a peer requests its list, verifies the
+    owner signature, and adopts if newer; a peer that asserts an iat it
+    cannot substantiate is struck and backed off."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.cfg = make_cfg(tmp.name)
+        with contextlib.redirect_stdout(io.StringIO()):
+            mesh._owner_init(self.cfg, allow_unprotected=True)
+        for d in (mesh._revgap_last, mesh._revpull_last, mesh._revpull_expect,
+                  mesh._revpull_strikes, mesh._revserve_last):
+            d.clear()
+            self.addCleanup(d.clear)
+
+    def _node_pub(self):
+        d = tempfile.mkdtemp(dir=self.cfg["_dir"])
+        key = os.path.join(d, "nk")
+        subprocess.run([shutil.which("ssh-keygen"), "-q", "-t", "ed25519",
+                        "-N", "", "-C", "n", "-f", key],
+                       check=True, capture_output=True, timeout=60)
+        with open(key + ".pub", encoding="utf-8") as f:
+            return f.read().strip()
+
+    def _mint_list(self):
+        fpr = mesh._key_fingerprint(mesh._normalize_pubkey(self._node_pub()))
+        blk = mesh._mint_revocation(self.cfg, fpr, name="mallory")
+        ok, _r, body = mesh._verify_revocation(self.cfg, blk)
+        self.assertTrue(ok)
+        mesh._note_revocation(self.cfg, body)
+        return mesh._mint_revlist(self.cfg)  # (block, body)
+
+    def _capture_send(self, store):
+        def fake(cfg, me, to, body, title=None, ctl=None):
+            store.append({"to": to, "ctl": ctl})
+            return {"id": "x"}
+        return fake
+
+    # -- trigger: behind a peer -> a rate-limited pull request --
+
+    def test_gap_triggers_a_pull_request(self):
+        sent = []
+        with mock.patch.object(mesh, "send_raw", self._capture_send(sent)), \
+             contextlib.redirect_stderr(io.StringIO()):
+            mesh._observe_revlist_freshness(
+                self.cfg, "me", "beta", {"f": "beta", "rl": 9000},
+                mesh.FRAME_VERIFIED, now=1.0)
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(sent[0]["to"], "beta")
+        self.assertEqual(sent[0]["ctl"]["mw"], "revlist-req")
+
+    def test_pull_request_is_rate_limited_per_peer(self):
+        sent = []
+        with mock.patch.object(mesh, "send_raw", self._capture_send(sent)), \
+             contextlib.redirect_stderr(io.StringIO()):
+            base = {"f": "beta", "rl": 9000}
+            mesh._observe_revlist_freshness(self.cfg, "me", "beta", base,
+                                            mesh.FRAME_VERIFIED, now=1.0)
+            mesh._observe_revlist_freshness(self.cfg, "me", "beta", base,
+                                            mesh.FRAME_VERIFIED, now=5.0)
+            mesh._observe_revlist_freshness(
+                self.cfg, "me", "beta", base, mesh.FRAME_VERIFIED,
+                now=1.0 + mesh.REVPULL_MIN_INTERVAL + 1)
+        self.assertEqual(len(sent), 2)
+
+    # -- suppression vector (bastion): an UNVERIFIED assertion is inert --
+
+    def test_unverified_assertion_neither_pulls_nor_poisons(self):
+        # A shared-key-trusted but UNSIGNED frame spoofed from=victim with an
+        # inflated rl must NOT pull or write _revpull_expect. Without the
+        # verdict gate it would, and the victim's honest verified reply (a
+        # lower real iat) would then be struck -- the strike-hardening
+        # weaponized. REVGAP still logs; only the pull is gated.
+        sent = []
+        err = io.StringIO()
+        with mock.patch.object(mesh, "send_raw", self._capture_send(sent)), \
+             contextlib.redirect_stderr(err):
+            for v in (mesh.FRAME_UNSIGNED, mesh.FRAME_UNVERIFIED,
+                      mesh.FRAME_MISMATCH, None):
+                mesh._observe_revlist_freshness(
+                    self.cfg, "me", "victim",
+                    {"f": "victim", "rl": 9000}, v, now=1.0)
+        self.assertEqual(sent, [])                        # no pull emitted
+        self.assertNotIn("victim", mesh._revpull_expect)  # not poisoned
+        self.assertIn("MESH_REVGAP", err.getvalue())      # gap still observed
+
+    def test_verified_assertion_still_pulls(self):
+        # the other direction of the guard: a VERIFIED assertion drives the
+        # pull exactly as before, so the fix is not a blanket disable.
+        sent = []
+        with mock.patch.object(mesh, "send_raw", self._capture_send(sent)), \
+             contextlib.redirect_stderr(io.StringIO()):
+            mesh._observe_revlist_freshness(
+                self.cfg, "me", "beta", {"f": "beta", "rl": 9000},
+                mesh.FRAME_VERIFIED, now=1.0)
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(mesh._revpull_expect.get("beta"), 9000)
+
+    def test_spoofed_expectation_cannot_suppress_the_victim(self):
+        # End to end: attacker inflates the expectation over an UNSIGNED
+        # frame; because it never lands, the victim's genuine list (arriving
+        # on a real verified resp) adopts and the victim is NOT struck.
+        block, body = self._mint_list()   # body["iat"] = victim's REAL iat
+        with mock.patch.object(mesh, "send_raw", lambda *a, **k: {"id": "x"}), \
+             contextlib.redirect_stderr(io.StringIO()):
+            mesh._observe_revlist_freshness(
+                self.cfg, "me", "victim",
+                {"f": "victim", "rl": body["iat"] + 10_000},
+                mesh.FRAME_UNSIGNED, now=1.0)
+        self.assertNotIn("victim", mesh._revpull_expect)
+        with contextlib.redirect_stderr(io.StringIO()):
+            mesh._handle_control(self.cfg, "me", "victim",
+                                 {"mw": "revlist-resp", "block": block},
+                                 verdict=mesh.FRAME_VERIFIED)
+        self.assertEqual(mesh._load_revlist(self.cfg)[0]["iat"], body["iat"])
+        self.assertNotIn("victim", mesh._revpull_strikes)
+
+    # -- serve: answer a request with our adopted, re-verified block --
+
+    def test_request_is_served_our_verified_block(self):
+        block, body = self._mint_list()
+        mesh._note_revlist(self.cfg, body, block)
+        sent = []
+        with mock.patch.object(mesh, "send_raw", self._capture_send(sent)):
+            mesh._handle_control(self.cfg, "me", "beta",
+                                 {"mw": "revlist-req", "have": 0})
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(sent[0]["ctl"]["mw"], "revlist-resp")
+        self.assertEqual(sent[0]["ctl"]["block"], block)
+
+    def test_request_not_served_when_peer_is_current(self):
+        block, body = self._mint_list()
+        mesh._note_revlist(self.cfg, body, block)
+        sent = []
+        with mock.patch.object(mesh, "send_raw", self._capture_send(sent)):
+            mesh._handle_control(self.cfg, "me", "beta",
+                                 {"mw": "revlist-req", "have": body["iat"]})
+        self.assertEqual(sent, [])
+
+    def test_serving_is_rate_limited(self):
+        block, body = self._mint_list()
+        mesh._note_revlist(self.cfg, body, block)
+        sent = []
+        with mock.patch.object(mesh, "send_raw", self._capture_send(sent)):
+            for _ in range(3):
+                mesh._handle_control(self.cfg, "me", "beta",
+                                     {"mw": "revlist-req", "have": 0})
+        self.assertEqual(len(sent), 1)
+
+    # -- adopt: a verified newer list is adopted end-to-end --
+
+    def test_response_verifies_and_adopts(self):
+        block, body = self._mint_list()
+        mesh._revpull_expect["beta"] = body["iat"]
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            mesh._handle_control(self.cfg, "me", "beta",
+                                 {"mw": "revlist-resp", "block": block},
+                                 verdict=mesh.FRAME_VERIFIED)
+        got, _ = mesh._load_revlist(self.cfg)
+        self.assertEqual(got["iat"], body["iat"])
+        self.assertIn("MESH_REVLIST_PULLED", err.getvalue())
+
+    def test_forged_block_is_rejected_and_struck(self):
+        block, body = self._mint_list()
+        forged = block[:-6] + "AAAAAA"  # corrupt the signature tail
+        mesh._revpull_expect["beta"] = body["iat"]
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            mesh._handle_control(self.cfg, "me", "beta",
+                                 {"mw": "revlist-resp", "block": forged},
+                                 verdict=mesh.FRAME_VERIFIED)
+        self.assertIsNone(mesh._load_revlist(self.cfg)[0])
+        self.assertIn("MESH_REVLIST_UNSUBSTANTIATED", err.getvalue())
+        self.assertEqual(mesh._revpull_strikes["beta"], 1)
+
+    def test_short_served_iat_is_unsubstantiated(self):
+        # peer asserted a high iat but served a lower (older) list -> strike
+        block, body = self._mint_list()
+        mesh._revpull_expect["beta"] = body["iat"] + 10_000
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            mesh._handle_control(self.cfg, "me", "beta",
+                                 {"mw": "revlist-resp", "block": block},
+                                 verdict=mesh.FRAME_VERIFIED)
+        self.assertIn("MESH_REVLIST_UNSUBSTANTIATED", err.getvalue())
+        self.assertIsNone(mesh._load_revlist(self.cfg)[0])
+
+    def test_unverified_frame_never_strikes(self):
+        # bastion seat: a forged revlist-resp on an UNVERIFIED carrier must
+        # not strike the honest node it claims to be from.
+        block, body = self._mint_list()
+        forged = block[:-6] + "AAAAAA"
+        mesh._revpull_expect["beta"] = body["iat"]
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            for v in (mesh.FRAME_UNVERIFIED, mesh.FRAME_UNSIGNED,
+                      mesh.FRAME_MISMATCH, None):
+                mesh._handle_control(self.cfg, "me", "beta",
+                                     {"mw": "revlist-resp", "block": forged},
+                                     verdict=v)
+        self.assertNotIn("MESH_REVLIST_UNSUBSTANTIATED", err.getvalue())
+        self.assertNotIn("beta", mesh._revpull_strikes)
+
+    def test_unsolicited_response_strikes_nobody_but_still_adopts(self):
+        # no outstanding pull (expected is None): a valid owner-signed list
+        # is adopted (gossip), but a bad one strikes nobody.
+        block, body = self._mint_list()
+        with contextlib.redirect_stderr(io.StringIO()):
+            mesh._handle_control(self.cfg, "me", "beta",
+                                 {"mw": "revlist-resp", "block": block},
+                                 verdict=mesh.FRAME_VERIFIED)
+        self.assertEqual(mesh._load_revlist(self.cfg)[0]["iat"], body["iat"])
+        self.assertNotIn("beta", mesh._revpull_strikes)
+        # and a forged unsolicited one strikes nobody either
+        forged = block[:-6] + "AAAAAA"
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            mesh._handle_control(self.cfg, "me", "gamma",
+                                 {"mw": "revlist-resp", "block": forged},
+                                 verdict=mesh.FRAME_VERIFIED)
+        self.assertNotIn("MESH_REVLIST_UNSUBSTANTIATED", err.getvalue())
+        self.assertNotIn("gamma", mesh._revpull_strikes)
+
+    def test_struck_peer_is_backed_off_from_pulling(self):
+        mesh._revpull_strikes["beta"] = mesh.REVPULL_STRIKE_MAX
+        sent = []
+        with mock.patch.object(mesh, "send_raw", self._capture_send(sent)), \
+             contextlib.redirect_stderr(io.StringIO()):
+            mesh._observe_revlist_freshness(
+                self.cfg, "me", "beta", {"f": "beta", "rl": 9000},
+                mesh.FRAME_VERIFIED, now=1.0)
+        self.assertEqual(sent, [])  # no pull; gap still logged
+
+    def test_substantiated_pull_clears_strikes(self):
+        block, body = self._mint_list()
+        mesh._revpull_strikes["beta"] = 2
+        mesh._revpull_expect["beta"] = body["iat"]
+        with contextlib.redirect_stderr(io.StringIO()):
+            mesh._handle_control(self.cfg, "me", "beta",
+                                 {"mw": "revlist-resp", "block": block},
+                                 verdict=mesh.FRAME_VERIFIED)
+        self.assertNotIn("beta", mesh._revpull_strikes)
+
+    def test_full_cycle_two_nodes_converge(self):
+        # A (blind) pulls from B (holds the list); the served block adopts.
+        block, body = self._mint_list()
+        # self.cfg plays BOTH nodes here (same owner trust); the point is the
+        # served block round-trips through verify+adopt, not the identities.
+        mesh._note_revlist(self.cfg, body, block)
+        relay = []
+        with mock.patch.object(mesh, "send_raw", self._capture_send(relay)):
+            mesh._handle_control(self.cfg, "B", "A",
+                                 {"mw": "revlist-req", "have": 0})
+        self.assertEqual(relay[0]["ctl"]["mw"], "revlist-resp")
+        served_block = relay[0]["ctl"]["block"]
+        # A verifies and adopts it (A shares the owner trust via same cfg id)
+        mesh._revpull_expect["B"] = body["iat"]
+        with contextlib.redirect_stderr(io.StringIO()):
+            mesh._handle_control(self.cfg, "A", "B",
+                                 {"mw": "revlist-resp", "block": served_block},
+                                 verdict=mesh.FRAME_VERIFIED)
+        self.assertEqual(mesh._load_revlist(self.cfg)[0]["iat"], body["iat"])
+
+
+class RevlistFreshnessTests(unittest.TestCase):
+    """#76 distribution, sender-asserted freshness (observe-only): a node
+    with an adopted list stamps a SIGNED `rl`=iat; a receiver behind that
+    iat logs REVGAP and pulls nothing yet (leg 2). No durable write, no
+    delivery gate."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.cfg = make_cfg(tmp.name)
+        with contextlib.redirect_stdout(io.StringIO()):
+            mesh._owner_init(self.cfg, allow_unprotected=True)
+        for d in (mesh._revgap_last, mesh._revpull_last, mesh._revpull_expect,
+                  mesh._revpull_strikes, mesh._revserve_last):
+            d.clear()
+            self.addCleanup(d.clear)
+        # leg 2: the observer now sends a pull request on a gap; keep these
+        # freshness-only tests off the network.
+        p = mock.patch.object(mesh, "send_raw", lambda *a, **k: {"id": "x"})
+        p.start()
+        self.addCleanup(p.stop)
+
+    def _adopt(self, iat=5000):
+        body = {"v": 1, "kind": "revlist", "mesh": self.cfg["id"],
+                "iat": iat, "valid_until": iat + 86400, "revocations": {}}
+        mesh._write_json_secure(mesh.revlist_file(self.cfg),
+                                {"body": body, "block": "mwrevlist1-x"})
+
+    # -- send side: assertion is gated on holding a readable list --
+
+    def test_no_list_asserts_nothing(self):
+        out = mesh._assert_revlist_freshness(self.cfg, {"f": "a", "b": "hi"})
+        self.assertNotIn("rl", out)
+
+    def test_adopted_list_without_enable_asserts_nothing(self):
+        # bastion seat: having a list is NOT sufficient -- stamping a new
+        # signed field before the fleet is #120-capable MISMATCHES old
+        # peers. Requires the explicit revlist_freshness opt-in.
+        self._adopt(iat=7000)
+        out = mesh._assert_revlist_freshness(
+            self.cfg, {"f": "a", "t": "b", "b": "hi"})
+        self.assertNotIn("rl", out)
+
+    def test_adopted_list_stamps_signed_iat(self):
+        self._adopt(iat=7000)
+        self.cfg["revlist_freshness"] = True
+        payload = {"f": "a", "t": "b", "b": "hi"}
+        out = mesh._assert_revlist_freshness(self.cfg, payload)
+        self.assertEqual(out["rl"], 7000)
+        self.assertNotIn("rl", payload)  # caller dict untouched
+
+    def test_enable_without_a_list_still_asserts_nothing(self):
+        self.cfg["revlist_freshness"] = True  # enabled but no list adopted
+        out = mesh._assert_revlist_freshness(
+            self.cfg, {"f": "a", "t": "b", "b": "hi"})
+        self.assertNotIn("rl", out)
+
+    def test_stamp_rides_the_signed_base(self):
+        # rl must be UNDER the node signature: _base_payload keeps it, so a
+        # receiver reconstructs it and the signature covers it.
+        self._adopt(iat=7000)
+        self.cfg["revlist_freshness"] = True
+        stamped = mesh._assert_revlist_freshness(
+            self.cfg, {"f": "a", "t": "b", "b": "hi"})
+        wrapper = dict(stamped)
+        wrapper["s"] = "sig"
+        wrapper["k"] = "key"
+        self.assertEqual(mesh._base_payload(wrapper).get("rl"), 7000)
+
+    # -- receive side: observe-only REVGAP --
+
+    def test_peer_ahead_logs_revgap(self):
+        self._adopt(iat=1000)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            mesh._observe_revlist_freshness(
+                self.cfg, "me", "beta", {"f": "beta", "b": "x", "rl": 9000})
+        self.assertIn("MESH_REVGAP", err.getvalue())
+        self.assertIn("from=beta", err.getvalue())
+        self.assertIn("peer_iat=9000", err.getvalue())
+
+    def test_peer_not_ahead_is_silent(self):
+        self._adopt(iat=9000)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            mesh._observe_revlist_freshness(
+                self.cfg, "me", "beta", {"f": "beta", "rl": 9000})
+            mesh._observe_revlist_freshness(
+                self.cfg, "me", "beta", {"f": "beta", "rl": 100})
+        self.assertNotIn("REVGAP", err.getvalue())
+
+    def test_blind_receiver_still_sees_a_peer_gap(self):
+        # no local list (mine=0): any asserted iat is a gap worth logging
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            mesh._observe_revlist_freshness(
+                self.cfg, "me", "beta", {"f": "beta", "rl": 3})
+        self.assertIn("MESH_REVGAP", err.getvalue())
+        self.assertIn("mine=0", err.getvalue())
+
+    def test_absent_or_malformed_assertion_is_ignored(self):
+        self._adopt(iat=1000)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            mesh._observe_revlist_freshness(self.cfg, "me", "beta",
+                                            {"f": "beta", "b": "x"})
+            mesh._observe_revlist_freshness(self.cfg, "me", "beta",
+                                            {"f": "beta", "rl": "soon"})
+            mesh._observe_revlist_freshness(self.cfg, "me", "beta",
+                                            {"f": "beta", "rl": True})
+            mesh._observe_revlist_freshness(self.cfg, "me", "beta", None)
+        self.assertNotIn("REVGAP", err.getvalue())
+
+    def test_revgap_is_throttled_per_peer(self):
+        self._adopt(iat=1000)
+        base = {"f": "beta", "rl": 9000}
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            mesh._observe_revlist_freshness(self.cfg, "me", "beta", base, now=1.0)
+            mesh._observe_revlist_freshness(self.cfg, "me", "beta", base, now=5.0)
+            mesh._observe_revlist_freshness(
+                self.cfg, "me", "beta", base,
+                now=1.0 + mesh.REVGAP_LOG_INTERVAL + 1)
+        self.assertEqual(err.getvalue().count("MESH_REVGAP"), 2)
+
+    def test_observation_never_writes(self):
+        self._adopt(iat=1000)
+        before = os.listdir(self.cfg["_dir"])
+        with contextlib.redirect_stderr(io.StringIO()):
+            mesh._observe_revlist_freshness(
+                self.cfg, "me", "beta", {"f": "beta", "rl": 9000})
+        self.assertEqual(sorted(os.listdir(self.cfg["_dir"])), sorted(before))
+
 
 
 class RevlistTests(unittest.TestCase):
@@ -6475,6 +6883,444 @@ class BlockingWaitTests(unittest.TestCase):
         self.assertTrue(calls[1][1].wait)
         self.assertEqual(calls[1][1].from_node, "beta")
         self.assertEqual(calls[1][1].timeout, 9)
+
+
+class ChunkedPayloadTests(unittest.TestCase):
+    """#66 tier 2: oversize wire chunks under the relay inline limit so
+    normal retention carries the CONTENT, not just the wake. Framing
+    sits below the crypto -- a forged or garbled piece can only make the
+    reassembled frame fail decrypt."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.cfg = make_cfg(self._tmp.name)
+        mesh._chunk_sets.clear()
+        self.addCleanup(mesh._chunk_sets.clear)
+
+    def _send(self, body):
+        posts = []
+
+        def fake_post(cfg, tpc, data, headers):
+            posts.append(data.decode("utf-8"))
+            return {"id": f"r{len(posts)}"}
+
+        err = io.StringIO()
+        with mock.patch.object(mesh, "_post", fake_post), \
+             contextlib.redirect_stderr(err):
+            resp = mesh.send_raw(self.cfg, "alpha", "beta", body)
+        return posts, resp, err.getvalue()
+
+    @staticmethod
+    def _event(piece, eid, t=500):
+        return {"event": "message", "id": eid, "time": t, "message": piece}
+
+    def test_oversize_send_chunks_under_the_inline_limit(self):
+        posts, resp, err = self._send("x" * 9000)
+        self.assertGreater(len(posts), 1)
+        for piece in posts:
+            self.assertTrue(piece.startswith(mesh.CHUNK_PREFIX))
+            self.assertLessEqual(len(piece.encode("utf-8")),
+                                 mesh.NTFY_INLINE_LIMIT)
+        self.assertEqual(resp["id"], f"r{len(posts)}")  # last piece's id
+        self.assertNotIn("TTL", err)  # durable now: no attachment cliff
+
+    def test_small_send_stays_a_single_unprefixed_post(self):
+        posts, _resp, _err = self._send("hello")
+        self.assertEqual(len(posts), 1)
+        self.assertFalse(posts[0].startswith(mesh.CHUNK_PREFIX))
+
+    def test_past_the_chunk_ceiling_falls_back_to_attachment_warn(self):
+        posts, _resp, err = self._send("x" * 80000)
+        self.assertEqual(len(posts), 1)  # single oversize post, ntfy attaches
+        self.assertIn("~3h TTL", err)
+
+    def test_chunks_reassemble_to_the_original_frame(self):
+        body = "y" * 9000
+        posts, _resp, _err = self._send(body)
+        results = [mesh._open(self._event(p, f"e{i}"), self.cfg, "beta")
+                   for i, p in enumerate(posts)]
+        for frm, got, trusted, _ctl in results[:-1]:
+            # pending pieces are silently not-a-message-yet: empty body
+            # never triggers the unauthenticated-drop warn
+            self.assertEqual((frm, got, trusted), (None, "", False))
+        frm, got, trusted, _ctl = results[-1]
+        self.assertEqual(frm, "alpha")
+        self.assertEqual(got, body)
+        self.assertTrue(trusted)
+
+    def test_out_of_order_pieces_still_complete(self):
+        body = "z" * 9000
+        posts, _resp, _err = self._send(body)
+        shuffled = [posts[-1]] + posts[:-1]
+        results = [mesh._open(self._event(p, f"o{i}"), self.cfg, "beta")
+                   for i, p in enumerate(shuffled)]
+        self.assertEqual(results[-1][1], body)
+
+    def test_replayed_set_reassembles_to_the_same_fingerprint(self):
+        posts, _resp, _err = self._send("r" * 9000)
+
+        def complete_fingerprint(tag):
+            fp = None
+            for i, piece in enumerate(posts):
+                opened = mesh._open_with_fingerprint(
+                    self._event(piece, f"{tag}{i}"), self.cfg, "beta")
+                if opened[2]:
+                    fp = opened[4]
+            return fp
+
+        first, second = complete_fingerprint("a"), complete_fingerprint("b")
+        self.assertIsNotNone(first)
+        self.assertEqual(first, second)  # replay ledger dedupes downstream
+
+    def test_duplicate_piece_cannot_poison_a_set(self):
+        body = "q" * 9000
+        posts, _resp, _err = self._send(body)
+        cid, i_s, n_s, data = posts[0][len(mesh.CHUNK_PREFIX):].split(":", 3)
+        evil = f"{mesh.CHUNK_PREFIX}{cid}:{i_s}:{n_s}:" + "A" * len(data)
+        feed = [posts[0], evil] + posts[1:]  # first write wins
+        results = [mesh._open(self._event(p, f"p{i}"), self.cfg, "beta")
+                   for i, p in enumerate(feed)]
+        self.assertEqual(results[-1][1], body)
+        self.assertTrue(results[-1][2])
+
+    def test_set_ttl_expires_stale_partials(self):
+        posts, _resp, _err = self._send("t" * 9000)
+        t0 = 1000.0
+        self.assertIsNone(mesh._absorb_chunk(posts[0], now=t0))
+        # past the TTL the stale set is pruned; this piece opens a new one
+        self.assertIsNone(mesh._absorb_chunk(
+            posts[1], now=t0 + mesh.CHUNK_SET_TTL + 1))
+        self.assertEqual(len(mesh._chunk_sets), 1)
+        remaining = next(iter(mesh._chunk_sets.values()))
+        self.assertEqual(len(remaining["parts"]), 1)
+
+    def test_concurrent_set_count_is_bounded(self):
+        for k in range(mesh.CHUNK_MAX_SETS + 1):
+            cid = format(k, "032x")
+            mesh._absorb_chunk(f"{mesh.CHUNK_PREFIX}{cid}:0:2:data",
+                               now=1000.0 + k)
+        self.assertLessEqual(len(mesh._chunk_sets), mesh.CHUNK_MAX_SETS)
+        self.assertNotIn(format(0, "032x"), mesh._chunk_sets)  # oldest out
+
+    def test_malformed_chunk_headers_are_silently_dropped(self):
+        cid = "a" * 32
+        for bad in (f"{mesh.CHUNK_PREFIX}short",
+                    f"{mesh.CHUNK_PREFIX}not-hex-cid!:0:2:d",
+                    f"{mesh.CHUNK_PREFIX}{cid}:5:2:d",
+                    f"{mesh.CHUNK_PREFIX}{cid}:0:99:d",
+                    f"{mesh.CHUNK_PREFIX}{cid}:0:2:"):
+            self.assertIsNone(mesh._absorb_chunk(bad, now=1.0))
+        self.assertEqual(len(mesh._chunk_sets), 0)
+
+    def test_conflicting_total_poisons_the_whole_set(self):
+        cid = "b" * 32
+        mesh._absorb_chunk(f"{mesh.CHUNK_PREFIX}{cid}:0:3:d1", now=1.0)
+        self.assertIsNone(
+            mesh._absorb_chunk(f"{mesh.CHUNK_PREFIX}{cid}:1:2:d2", now=1.0))
+        self.assertNotIn(cid, mesh._chunk_sets)
+
+
+class DowngradeRatchetObserveTests(unittest.TestCase):
+    """#74 downgrade ratchet, OBSERVE-ONLY: a pinned name (seen to sign)
+    sending an unsigned frame logs MESH_DOWNGRADE and drops nothing.
+    Enforcement is blocked on the recorded #74 preconditions and is not
+    exercised here."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.cfg = make_cfg(self._tmp.name)
+        mesh._downgrade_last.clear()
+        self.addCleanup(mesh._downgrade_last.clear)
+
+    @staticmethod
+    def _fake_pub(fill):
+        t = b"ssh-ed25519"
+        blob = (len(t).to_bytes(4, "big") + t
+                + (32).to_bytes(4, "big") + bytes([fill]) * 32)
+        return "ssh-ed25519 " + base64.b64encode(blob).decode()
+
+    def _pin(self, name):
+        pins = mesh._load_pins(self.cfg)
+        pins[name] = self._fake_pub(1)
+        mesh._write_json_secure(mesh.pins_file(self.cfg), pins)
+
+    def _observe(self, frm, verdict):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            mesh._observe_downgrade(self.cfg, frm, verdict)
+        return err.getvalue()
+
+    def test_pinned_name_unsigned_is_a_downgrade(self):
+        self._pin("beta")
+        out = self._observe("beta", mesh.FRAME_UNSIGNED)
+        self.assertIn("MESH_DOWNGRADE", out)
+        self.assertIn("from=beta", out)
+
+    def test_unpinned_name_unsigned_is_not_a_downgrade(self):
+        # first contact is legitimately unsigned; nothing to ratchet yet
+        out = self._observe("stranger", mesh.FRAME_UNSIGNED)
+        self.assertNotIn("MESH_DOWNGRADE", out)
+
+    def test_signed_verdicts_never_downgrade(self):
+        self._pin("beta")
+        for verdict in (mesh.FRAME_VERIFIED, mesh.FRAME_MISMATCH,
+                        mesh.FRAME_UNVERIFIED):
+            self.assertNotIn("MESH_DOWNGRADE",
+                             self._observe("beta", verdict))
+
+    def test_observation_writes_nothing(self):
+        self._pin("beta")
+        before = sorted(os.listdir(self.cfg["_dir"]))
+        self._observe("beta", mesh.FRAME_UNSIGNED)
+        self.assertEqual(sorted(os.listdir(self.cfg["_dir"])), before)
+
+    def test_downgrade_is_throttled_per_peer(self):
+        # bastion seat: a node that genuinely can't sign must not emit one
+        # line per frame -- throttle per peer, first sight always logs.
+        self._pin("beta")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            mesh._observe_downgrade(self.cfg, "beta", mesh.FRAME_UNSIGNED,
+                                    now=1.0)
+            mesh._observe_downgrade(self.cfg, "beta", mesh.FRAME_UNSIGNED,
+                                    now=5.0)
+            mesh._observe_downgrade(
+                self.cfg, "beta", mesh.FRAME_UNSIGNED,
+                now=1.0 + mesh.DOWNGRADE_LOG_INTERVAL + 1)
+        self.assertEqual(err.getvalue().count("MESH_DOWNGRADE"), 2)
+
+    def test_downgrade_throttle_is_per_peer_not_global(self):
+        self._pin("beta")
+        self._pin("gamma")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            mesh._observe_downgrade(self.cfg, "beta", mesh.FRAME_UNSIGNED,
+                                    now=1.0)
+            mesh._observe_downgrade(self.cfg, "gamma", mesh.FRAME_UNSIGNED,
+                                    now=1.0)
+        self.assertEqual(err.getvalue().count("MESH_DOWNGRADE"), 2)
+
+    def test_enforcement_is_not_wired_into_delivery(self):
+        # the recorded #74 hard gate: no verdict may gate delivery until
+        # non-suppressible distribution is seated. The observer must be a
+        # pure side-effect logger -- it returns None and yields no signal
+        # a caller could branch delivery on.
+        self.assertIsNone(self._observe_return("beta", mesh.FRAME_UNSIGNED))
+        self.assertIsNone(self._observe_return("s", mesh.FRAME_VERIFIED))
+
+    def _observe_return(self, frm, verdict):
+        if frm == "beta":
+            self._pin("beta")
+        with contextlib.redirect_stderr(io.StringIO()):
+            return mesh._observe_downgrade(self.cfg, frm, verdict)
+
+
+class RenameMigrationTests(unittest.TestCase):
+    """#93 Phase B-prime: a KEY-VERIFIED rename migrates the pin to the
+    new name and tombstones the old one. Monotonic (one migration per
+    old name, ever -- never FROM a tombstone), replay-idempotent, never
+    a silent pin replace, and `old` derives from the signed frm only.
+    Gated on the owner's `rename_migration` opt-in (#130); enabled here
+    to exercise the migration path (default-off is its own test)."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.cfg = make_cfg(self._tmp.name)
+        self.cfg["rename_migration"] = True  # #130: owner-authorized
+
+    @staticmethod
+    def _fake_pub(fill):
+        t = b"ssh-ed25519"
+        blob = (len(t).to_bytes(4, "big") + t
+                + (32).to_bytes(4, "big") + bytes([fill]) * 32)
+        return "ssh-ed25519 " + base64.b64encode(blob).decode()
+
+    def _pin(self, name, pub):
+        pins = mesh._load_pins(self.cfg)
+        pins[name] = pub
+        mesh._write_json_secure(mesh.pins_file(self.cfg), pins)
+
+    def _rename(self, old, new, verdict=None, eid="fr-1"):
+        if verdict is None:
+            verdict = mesh.FRAME_VERIFIED
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            mesh._handle_control(self.cfg, "me", old,
+                                 {"mw": "rename", "new": new, "ts": 1},
+                                 verdict=verdict, ev={"id": eid})
+        return err.getvalue()
+
+    def test_default_is_log_only_migration_disabled(self):
+        # #130 (James's design call): without the owner's opt-in a
+        # key-verified rename does NOT migrate -- it stays today's
+        # log-only WOULD_MIGRATE, and the trust store is untouched.
+        cfg = dict(self.cfg)
+        cfg.pop("rename_migration", None)
+        key = self._fake_pub(1)
+        pins = mesh._load_pins(cfg)
+        pins["beta"] = key
+        mesh._write_json_secure(mesh.pins_file(cfg), pins)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            mesh._handle_control(cfg, "me", "beta",
+                                 {"mw": "rename", "new": "gamma", "ts": 1},
+                                 verdict=mesh.FRAME_VERIFIED, ev={"id": "f"})
+        self.assertIn("WOULD_MIGRATE", err.getvalue())
+        self.assertNotIn("MIGRATED (", err.getvalue())
+        self.assertNotIn("gamma", mesh._load_pins(cfg))
+        self.assertEqual(mesh._load_renames(cfg), {})
+
+    def test_verified_rename_migrates_pin_and_tombstones(self):
+        key = self._fake_pub(1)
+        self._pin("beta", key)
+        out = self._rename("beta", "gamma")
+        self.assertIn("MIGRATED", out)
+        self.assertIn("id=fr-1", out)
+        pins = mesh._load_pins(self.cfg)
+        self.assertEqual(pins.get("gamma"), key)
+        self.assertEqual(pins.get("beta"), key)  # old pin retained
+        renames = mesh._load_renames(self.cfg)
+        self.assertEqual(renames["beta"]["new"], "gamma")
+
+    def test_migration_is_idempotent_on_replay(self):
+        key = self._fake_pub(1)
+        self._pin("beta", key)
+        self._rename("beta", "gamma")
+        out = self._rename("beta", "gamma", eid="fr-2")
+        self.assertIn("ALREADY_MIGRATED", out)
+        self.assertNotIn("REFUSED", out)
+        self.assertEqual(len(mesh._load_renames(self.cfg)), 1)
+
+    def test_second_rename_from_tombstone_is_refused(self):
+        # never FROM a tombstone: the first verified migration wins, ever
+        key = self._fake_pub(1)
+        self._pin("beta", key)
+        self._rename("beta", "gamma")
+        out = self._rename("beta", "delta", eid="fr-3")
+        self.assertIn("TOMBSTONE", out)
+        self.assertNotIn("delta", mesh._load_pins(self.cfg))
+
+    def test_chain_rename_from_the_new_name_is_allowed(self):
+        key = self._fake_pub(1)
+        self._pin("beta", key)
+        self._rename("beta", "gamma")
+        out = self._rename("gamma", "delta")
+        self.assertIn("MIGRATED", out)
+        self.assertEqual(mesh._load_pins(self.cfg).get("delta"), key)
+
+    def test_target_pin_conflict_refuses_without_replacing(self):
+        # _bind_peer's never-silently-replace invariant holds through
+        # migration: a rename cannot steal a name someone else owns.
+        self._pin("beta", self._fake_pub(1))
+        self._pin("gamma", self._fake_pub(2))
+        out = self._rename("beta", "gamma")
+        self.assertIn("TARGET_PIN_CONFLICT", out)
+        self.assertEqual(mesh._load_pins(self.cfg)["gamma"],
+                         self._fake_pub(2))
+        self.assertNotIn("beta", mesh._load_renames(self.cfg))
+
+    def test_revoked_occupant_does_not_block_migration(self):
+        # seam 1 (lodestar): a target pinned to a REVOKED key is not a
+        # legitimate holder -- it must not permanently block a real
+        # migration. The revoked pin is replaced (targeted, non-silent).
+        src = self._fake_pub(1)
+        revoked = self._fake_pub(2)
+        self._pin("beta", src)
+        self._pin("gamma", revoked)
+        # mark gamma's key revoked in the loose store
+        fpr = mesh._key_fingerprint(revoked)
+        mesh._write_json_secure(mesh.revocations_file(self.cfg),
+                                {fpr: {"name": "gamma", "iat": 1}})
+        out = self._rename("beta", "gamma")
+        self.assertIn("TARGET_REVOKED_REPLACED", out)
+        self.assertIn("MIGRATED", out)
+        self.assertEqual(mesh._load_pins(self.cfg)["gamma"], src)
+        self.assertEqual(mesh._load_renames(self.cfg)["beta"]["new"], "gamma")
+
+    def test_clean_and_unknown_occupant_still_block(self):
+        # a different NON-revoked (clean) occupant blocks; an UNKNOWN
+        # revocation status must FAIL SHUT and also block (lodestar B2).
+        self._pin("beta", self._fake_pub(1))
+        self._pin("gamma", self._fake_pub(2))  # clean: no revocations
+        out = self._rename("beta", "gamma")
+        self.assertIn("TARGET_PIN_CONFLICT", out)
+        self.assertEqual(mesh._load_pins(self.cfg)["gamma"], self._fake_pub(2))
+        self.assertNotIn("beta", mesh._load_renames(self.cfg))
+
+    def test_unpinned_but_live_name_is_occupied(self):
+        # seam 2 (lodestar): an UNPINNED name that is a live known identity
+        # (in the roster) must not be TOFU-captured by a rename.
+        self._pin("beta", self._fake_pub(1))
+        self.cfg["nodes"] = list(self.cfg.get("nodes", [])) + ["gamma"]
+        self.assertIsNone(mesh._pinned_peer_key(self.cfg, "gamma"))  # unpinned
+        out = self._rename("beta", "gamma")
+        self.assertIn("TARGET_OCCUPIED", out)
+        self.assertNotIn("gamma", mesh._load_pins(self.cfg))
+        self.assertNotIn("beta", mesh._load_renames(self.cfg))
+
+    def test_unreadable_peer_store_fails_shut_as_occupied(self):
+        # bastion hardening: if the peer store cannot be read, a name that
+        # is not in the roster cannot be PROVEN free -- fail shut (occupied)
+        # rather than let the rename TOFU-capture it.
+        self._pin("beta", self._fake_pub(1))
+        with mock.patch.object(mesh, "load_peers",
+                               side_effect=OSError("corrupt")):
+            out = self._rename("beta", "unknowable")
+        self.assertIn("TARGET_OCCUPIED", out)
+        self.assertNotIn("unknowable", mesh._load_pins(self.cfg))
+
+    def test_unpinned_and_not_live_name_migrates(self):
+        # the happy path stays intact: a genuinely fresh name (not pinned,
+        # not in roster/peers) is free to receive the migration.
+        self._pin("beta", self._fake_pub(1))
+        self.assertNotIn("zeta-fresh", self.cfg.get("nodes", []))
+        out = self._rename("beta", "zeta-fresh")
+        self.assertIn("MIGRATED", out)
+        self.assertEqual(mesh._load_pins(self.cfg)["zeta-fresh"],
+                         self._fake_pub(1))
+
+    def test_migration_onto_a_tombstoned_name_is_refused(self):
+        key = self._fake_pub(1)
+        self._pin("beta", key)
+        self._rename("beta", "gamma")
+        self._pin("zeta", self._fake_pub(3))
+        out = self._rename("zeta", "beta", eid="fr-4")
+        self.assertIn("TOMBSTONE", out)
+        self.assertNotIn("beta", {
+            k: v for k, v in mesh._load_renames(self.cfg).items()
+            if k == "zeta"})
+
+    def test_non_verified_verdicts_migrate_nothing(self):
+        key = self._fake_pub(1)
+        self._pin("beta", key)
+        for verdict in (mesh.FRAME_MISMATCH, mesh.FRAME_UNVERIFIED,
+                        mesh.FRAME_UNSIGNED):
+            out = self._rename("beta", "gamma", verdict=verdict)
+            self.assertNotIn("MIGRATED", out)
+        self.assertNotIn("gamma", mesh._load_pins(self.cfg))
+        self.assertEqual(mesh._load_renames(self.cfg), {})
+
+    def test_unpinned_source_stays_an_observation(self):
+        # verdict says verified but no pin exists (test harnesses, store
+        # corruption): nothing to carry, nothing written.
+        out = self._rename("beta", "gamma")
+        self.assertIn("WOULD_MIGRATE", out)
+        self.assertNotIn("MIGRATED (", out)
+        self.assertEqual(mesh._load_pins(self.cfg), {})
+        self.assertEqual(mesh._load_renames(self.cfg), {})
+
+    def test_certified_tier_is_recorded_at_migration(self):
+        key = self._fake_pub(1)
+        self._pin("beta", key)
+        fpr = mesh._key_fingerprint(key)
+        mesh._write_json_secure(mesh.certs_file(self.cfg), {
+            fpr: {"v": 1, "kind": "membercert", "name": "beta",
+                  "key": key, "fpr": fpr, "iat": 1, "exp": 2**31}})
+        self._rename("beta", "gamma")
+        self.assertTrue(mesh._load_renames(self.cfg)["beta"]["certified"])
 
 
 class EvidenceLogTests(unittest.TestCase):

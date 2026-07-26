@@ -39,7 +39,7 @@ class RehearsalToolTests(unittest.TestCase):
         self.assertTrue(result["ok"], result["failures"])
         self.assertEqual(result["attack"]["verdict"], self.mesh.FRAME_MISMATCH)
         self.assertIn("KEY_MISMATCH", result["attack"]["log"])
-        self.assertNotIn("WOULD_MIGRATE", result["attack"]["log"])
+        self.assertNotIn("MIGRATED", result["attack"]["log"])
 
     def test_control_arm_proves_the_harness_discriminates(self):
         # without this, a verifier that returned mismatch unconditionally
@@ -47,7 +47,9 @@ class RehearsalToolTests(unittest.TestCase):
         result = self.tool.rehearse(out=io.StringIO())
         self.assertEqual(result["control"]["verdict"],
                          self.mesh.FRAME_VERIFIED)
-        self.assertIn("WOULD_MIGRATE", result["control"]["log"])
+        # #93 Phase B-prime: a verified rename now MIGRATES the pin
+        self.assertIn("MIGRATED", result["control"]["log"])
+        self.assertTrue(result["migrated"]["new_pinned"])
         for token in ("KEY_MISMATCH", "UNVERIFIED_SOURCE"):
             self.assertNotIn(token, result["control"]["log"])
 
@@ -62,7 +64,7 @@ class RehearsalToolTests(unittest.TestCase):
         self.assertEqual(result["forged_hint"]["verdict"],
                          self.mesh.FRAME_MISMATCH)
         self.assertIn("KEY_MISMATCH", result["forged_hint"]["log"])
-        self.assertNotIn("WOULD_MIGRATE", result["forged_hint"]["log"])
+        self.assertNotIn("MIGRATED", result["forged_hint"]["log"])
 
     def test_rehearsal_cleans_up_its_scratch_mesh(self):
         result = self.tool.rehearse(out=io.StringIO())
