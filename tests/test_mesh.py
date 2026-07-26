@@ -3647,7 +3647,8 @@ class RevlistPullTests(unittest.TestCase):
         with mock.patch.object(mesh, "send_raw", self._capture_send(sent)), \
              contextlib.redirect_stderr(io.StringIO()):
             mesh._observe_revlist_freshness(
-                self.cfg, "me", "beta", {"f": "beta", "rl": 9000}, now=1.0)
+                self.cfg, "me", "beta", {"f": "beta", "rl": 9000},
+                mesh.FRAME_VERIFIED, now=1.0)
         self.assertEqual(len(sent), 1)
         self.assertEqual(sent[0]["to"], "beta")
         self.assertEqual(sent[0]["ctl"]["mw"], "revlist-req")
@@ -3657,12 +3658,66 @@ class RevlistPullTests(unittest.TestCase):
         with mock.patch.object(mesh, "send_raw", self._capture_send(sent)), \
              contextlib.redirect_stderr(io.StringIO()):
             base = {"f": "beta", "rl": 9000}
-            mesh._observe_revlist_freshness(self.cfg, "me", "beta", base, now=1.0)
-            mesh._observe_revlist_freshness(self.cfg, "me", "beta", base, now=5.0)
+            mesh._observe_revlist_freshness(self.cfg, "me", "beta", base,
+                                            mesh.FRAME_VERIFIED, now=1.0)
+            mesh._observe_revlist_freshness(self.cfg, "me", "beta", base,
+                                            mesh.FRAME_VERIFIED, now=5.0)
             mesh._observe_revlist_freshness(
-                self.cfg, "me", "beta", base,
+                self.cfg, "me", "beta", base, mesh.FRAME_VERIFIED,
                 now=1.0 + mesh.REVPULL_MIN_INTERVAL + 1)
         self.assertEqual(len(sent), 2)
+
+    # -- suppression vector (bastion): an UNVERIFIED assertion is inert --
+
+    def test_unverified_assertion_neither_pulls_nor_poisons(self):
+        # A shared-key-trusted but UNSIGNED frame spoofed from=victim with an
+        # inflated rl must NOT pull or write _revpull_expect. Without the
+        # verdict gate it would, and the victim's honest verified reply (a
+        # lower real iat) would then be struck -- the strike-hardening
+        # weaponized. REVGAP still logs; only the pull is gated.
+        sent = []
+        err = io.StringIO()
+        with mock.patch.object(mesh, "send_raw", self._capture_send(sent)), \
+             contextlib.redirect_stderr(err):
+            for v in (mesh.FRAME_UNSIGNED, mesh.FRAME_UNVERIFIED,
+                      mesh.FRAME_MISMATCH, None):
+                mesh._observe_revlist_freshness(
+                    self.cfg, "me", "victim",
+                    {"f": "victim", "rl": 9000}, v, now=1.0)
+        self.assertEqual(sent, [])                        # no pull emitted
+        self.assertNotIn("victim", mesh._revpull_expect)  # not poisoned
+        self.assertIn("MESH_REVGAP", err.getvalue())      # gap still observed
+
+    def test_verified_assertion_still_pulls(self):
+        # the other direction of the guard: a VERIFIED assertion drives the
+        # pull exactly as before, so the fix is not a blanket disable.
+        sent = []
+        with mock.patch.object(mesh, "send_raw", self._capture_send(sent)), \
+             contextlib.redirect_stderr(io.StringIO()):
+            mesh._observe_revlist_freshness(
+                self.cfg, "me", "beta", {"f": "beta", "rl": 9000},
+                mesh.FRAME_VERIFIED, now=1.0)
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(mesh._revpull_expect.get("beta"), 9000)
+
+    def test_spoofed_expectation_cannot_suppress_the_victim(self):
+        # End to end: attacker inflates the expectation over an UNSIGNED
+        # frame; because it never lands, the victim's genuine list (arriving
+        # on a real verified resp) adopts and the victim is NOT struck.
+        block, body = self._mint_list()   # body["iat"] = victim's REAL iat
+        with mock.patch.object(mesh, "send_raw", lambda *a, **k: {"id": "x"}), \
+             contextlib.redirect_stderr(io.StringIO()):
+            mesh._observe_revlist_freshness(
+                self.cfg, "me", "victim",
+                {"f": "victim", "rl": body["iat"] + 10_000},
+                mesh.FRAME_UNSIGNED, now=1.0)
+        self.assertNotIn("victim", mesh._revpull_expect)
+        with contextlib.redirect_stderr(io.StringIO()):
+            mesh._handle_control(self.cfg, "me", "victim",
+                                 {"mw": "revlist-resp", "block": block},
+                                 verdict=mesh.FRAME_VERIFIED)
+        self.assertEqual(mesh._load_revlist(self.cfg)[0]["iat"], body["iat"])
+        self.assertNotIn("victim", mesh._revpull_strikes)
 
     # -- serve: answer a request with our adopted, re-verified block --
 
@@ -3777,7 +3832,8 @@ class RevlistPullTests(unittest.TestCase):
         with mock.patch.object(mesh, "send_raw", self._capture_send(sent)), \
              contextlib.redirect_stderr(io.StringIO()):
             mesh._observe_revlist_freshness(
-                self.cfg, "me", "beta", {"f": "beta", "rl": 9000}, now=1.0)
+                self.cfg, "me", "beta", {"f": "beta", "rl": 9000},
+                mesh.FRAME_VERIFIED, now=1.0)
         self.assertEqual(sent, [])  # no pull; gap still logged
 
     def test_substantiated_pull_clears_strikes(self):

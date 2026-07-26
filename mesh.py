@@ -1957,17 +1957,19 @@ def _revlist_strike(frm, expected, reason):
           f"({_single_line(str(reason))}) -- #76", file=sys.stderr)
 
 
-def _observe_revlist_freshness(cfg, me, frm, signed_base, now=None):
-    """#76 distribution: a peer's signed frame asserts its revocation-list
-    `iat`. When it exceeds ours we are behind that peer -- log a throttled
-    REVGAP and (leg 2) PULL the peer's list to converge. iat is monotonic,
-    so `peer_iat > mine` is unambiguous ("who is fresher" needs no
-    bidirectional digest exchange -- that concern was digest-gossip's, not
-    iat's). Only the pull's adopt-on-verify writes, and it writes a single
-    owner-signed list bounded by the verify cap; no verdict gates delivery.
-    An unsubstantiable assertion is caught at pull time (the peer cannot
-    produce the list it claimed) -- that is the non-suppressibility the
-    #74 gate waits on."""
+def _observe_revlist_freshness(cfg, me, frm, signed_base, verdict=None,
+                               now=None):
+    """#76 distribution: a peer's frame asserts its revocation-list `iat`.
+    REVGAP is logged on any trusted frame, but the PULL -- which writes
+    _revpull_expect[frm] and emits a request -- fires ONLY on a
+    signature-VERIFIED frame (bastion seat). `trusted` here is shared-key
+    membership, not authorship: an UNSIGNED frame passes it. `rl` rides
+    _base_payload, which keeps the field even on an unsigned wrapper, so
+    without the verdict gate any member could spoof from=victim with an
+    inflated iat, poison _revpull_expect[victim], and turn the victim's
+    OWN truthful verified reply (a lower real iat) into a strike -- a
+    suppression vector that weaponizes the strike-hardening. The verdict
+    is the only thing separating a real assertion from a forged one."""
     if not isinstance(signed_base, dict):
         return
     peer_iat = signed_base.get("rl")
@@ -1981,12 +1983,19 @@ def _observe_revlist_freshness(cfg, me, frm, signed_base, now=None):
         last = _revgap_last.get(frm)
         if last is None or now - last >= REVGAP_LOG_INTERVAL:
             _revgap_last[frm] = now
+            # Split the line by verdict so it never claims a pull it did not
+            # do (bastion, CLAUDE.md rule 1): only a verified assertion pulls.
+            act = ("pulling to converge" if verdict == FRAME_VERIFIED
+                   else "not pulling -- unverified assertion")
             print(f"MESH_REVGAP from={_single_line(frm)} peer_iat={peer_iat} "
                   f"mine={mine} (peer holds a newer owner-signed revocation "
-                  f"list; pulling to converge -- #76)", file=sys.stderr)
-        # Back-off: a peer that keeps asserting an iat it cannot substantiate
-        # is not something an honest node does (lodestar) -- stop pulling
-        # from it, but keep logging the gap above so the abuse stays visible.
+                  f"list; {act} -- #76)", file=sys.stderr)
+        # The pull mutates _revpull_expect and emits a request. Only a
+        # signature-VERIFIED assertion may drive it: an unsigned frame is
+        # trusted only by shared-key membership and is spoofable
+        # from=victim, so acting on its iat is the suppression vector.
+        if verdict != FRAME_VERIFIED:
+            return  # fail closed: only a verified assertion drives a pull
         if _revpull_strikes.get(frm, 0) >= REVPULL_STRIKE_MAX:
             return
         pulled = _revpull_last.get(frm)
@@ -7858,7 +7867,7 @@ def _cmd_watch_owned(args, cfg, me):
             cfg, frm, recipient, body, ctl, _sig, _pk, _wts, ev,
             signed_base=_sbase)
         _report_verdict(frm, ev, verdict)
-        _observe_revlist_freshness(cfg, me, frm, _sbase)
+        _observe_revlist_freshness(cfg, me, frm, _sbase, verdict)
         if verdict == FRAME_VERIFIED:
             # #76 Phase A: log-only cert observability for verified frames,
             # against the LOCAL pin (the key that actually verified).
@@ -8558,7 +8567,7 @@ class MeshMCPServer:
                 cfg, frm, recipient, body, ctl, _sig, _pk, _wts, ev,
                 signed_base=_sbase)
             _report_verdict(frm, ev, verdict)
-            _observe_revlist_freshness(cfg, me, frm, _sbase)
+            _observe_revlist_freshness(cfg, me, frm, _sbase, verdict)
             if verdict == FRAME_VERIFIED:
                 # #76 Phase A: log-only cert observability (see cmd_watch).
                 _report_cert_status(cfg, frm, _load_pins(cfg).get(frm))
