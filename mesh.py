@@ -3630,7 +3630,11 @@ def _absorb_chunk(message, now=None):
             entry = _chunk_sets[cid] = {"born": now, "n": total,
                                         "parts": {}}
         if entry["n"] != total:
-            del _chunk_sets[cid]  # self-contradictory set: poison, drop
+            # A piece disagreeing on the total count is IGNORED and the
+            # established set is KEPT (first-write-wins on the count, matching
+            # the per-slot rule below). Discarding the whole set here let a
+            # single mismatched-count piece drop a legitimate in-flight
+            # message, since the cid rides in cleartext (#128 follow-up).
             return None
         entry["parts"].setdefault(index, data)
         if len(entry["parts"]) < entry["n"]:
