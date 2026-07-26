@@ -6,7 +6,7 @@ Cross-machine agent-to-agent mesh: Python, single-file `mesh.py` CLI plus harnes
 
 ## Hard constraints
 
-- **`mesh.py` is stdlib-only.** No third-party imports. CI does not catch this — you must.
+- **`mesh.py` is stdlib-only.** No third-party imports. CI catches this (`stdlib_only` job, #140) and the local suite does too (`StdlibOnlyTests`); a third-party import fails before push. Stay vigilant — the test catches imports, not subtle misuse of a stdlib facility.
 - **Python 3.8+.** No `match`, no runtime `X | Y` unions, no 3.9+ stdlib.
 - **Tests:** `python3 -m unittest discover -s tests` (`python` on Windows)
 
