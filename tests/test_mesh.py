@@ -3600,6 +3600,133 @@ class MemberCertTests(unittest.TestCase):
         self.assertIn("no pinned key", str(caught.exception))
 
 
+class RevlistFreshnessTests(unittest.TestCase):
+    """#76 distribution, sender-asserted freshness (observe-only): a node
+    with an adopted list stamps a SIGNED `rl`=iat; a receiver behind that
+    iat logs REVGAP and pulls nothing yet (leg 2). No durable write, no
+    delivery gate."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.cfg = make_cfg(tmp.name)
+        with contextlib.redirect_stdout(io.StringIO()):
+            mesh._owner_init(self.cfg, allow_unprotected=True)
+        mesh._revgap_last.clear()
+        self.addCleanup(mesh._revgap_last.clear)
+
+    def _adopt(self, iat=5000):
+        body = {"v": 1, "kind": "revlist", "mesh": self.cfg["id"],
+                "iat": iat, "valid_until": iat + 86400, "revocations": {}}
+        mesh._write_json_secure(mesh.revlist_file(self.cfg),
+                                {"body": body, "block": "mwrevlist1-x"})
+
+    # -- send side: assertion is gated on holding a readable list --
+
+    def test_no_list_asserts_nothing(self):
+        out = mesh._assert_revlist_freshness(self.cfg, {"f": "a", "b": "hi"})
+        self.assertNotIn("rl", out)
+
+    def test_adopted_list_without_enable_asserts_nothing(self):
+        # bastion seat: having a list is NOT sufficient -- stamping a new
+        # signed field before the fleet is #120-capable MISMATCHES old
+        # peers. Requires the explicit revlist_freshness opt-in.
+        self._adopt(iat=7000)
+        out = mesh._assert_revlist_freshness(
+            self.cfg, {"f": "a", "t": "b", "b": "hi"})
+        self.assertNotIn("rl", out)
+
+    def test_adopted_list_stamps_signed_iat(self):
+        self._adopt(iat=7000)
+        self.cfg["revlist_freshness"] = True
+        payload = {"f": "a", "t": "b", "b": "hi"}
+        out = mesh._assert_revlist_freshness(self.cfg, payload)
+        self.assertEqual(out["rl"], 7000)
+        self.assertNotIn("rl", payload)  # caller dict untouched
+
+    def test_enable_without_a_list_still_asserts_nothing(self):
+        self.cfg["revlist_freshness"] = True  # enabled but no list adopted
+        out = mesh._assert_revlist_freshness(
+            self.cfg, {"f": "a", "t": "b", "b": "hi"})
+        self.assertNotIn("rl", out)
+
+    def test_stamp_rides_the_signed_base(self):
+        # rl must be UNDER the node signature: _base_payload keeps it, so a
+        # receiver reconstructs it and the signature covers it.
+        self._adopt(iat=7000)
+        self.cfg["revlist_freshness"] = True
+        stamped = mesh._assert_revlist_freshness(
+            self.cfg, {"f": "a", "t": "b", "b": "hi"})
+        wrapper = dict(stamped)
+        wrapper["s"] = "sig"
+        wrapper["k"] = "key"
+        self.assertEqual(mesh._base_payload(wrapper).get("rl"), 7000)
+
+    # -- receive side: observe-only REVGAP --
+
+    def test_peer_ahead_logs_revgap(self):
+        self._adopt(iat=1000)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            mesh._observe_revlist_freshness(
+                self.cfg, "beta", {"f": "beta", "b": "x", "rl": 9000})
+        self.assertIn("MESH_REVGAP", err.getvalue())
+        self.assertIn("from=beta", err.getvalue())
+        self.assertIn("peer_iat=9000", err.getvalue())
+
+    def test_peer_not_ahead_is_silent(self):
+        self._adopt(iat=9000)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            mesh._observe_revlist_freshness(
+                self.cfg, "beta", {"f": "beta", "rl": 9000})
+            mesh._observe_revlist_freshness(
+                self.cfg, "beta", {"f": "beta", "rl": 100})
+        self.assertNotIn("REVGAP", err.getvalue())
+
+    def test_blind_receiver_still_sees_a_peer_gap(self):
+        # no local list (mine=0): any asserted iat is a gap worth logging
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            mesh._observe_revlist_freshness(
+                self.cfg, "beta", {"f": "beta", "rl": 3})
+        self.assertIn("MESH_REVGAP", err.getvalue())
+        self.assertIn("mine=0", err.getvalue())
+
+    def test_absent_or_malformed_assertion_is_ignored(self):
+        self._adopt(iat=1000)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            mesh._observe_revlist_freshness(self.cfg, "beta",
+                                            {"f": "beta", "b": "x"})
+            mesh._observe_revlist_freshness(self.cfg, "beta",
+                                            {"f": "beta", "rl": "soon"})
+            mesh._observe_revlist_freshness(self.cfg, "beta",
+                                            {"f": "beta", "rl": True})
+            mesh._observe_revlist_freshness(self.cfg, "beta", None)
+        self.assertNotIn("REVGAP", err.getvalue())
+
+    def test_revgap_is_throttled_per_peer(self):
+        self._adopt(iat=1000)
+        base = {"f": "beta", "rl": 9000}
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            mesh._observe_revlist_freshness(self.cfg, "beta", base, now=1.0)
+            mesh._observe_revlist_freshness(self.cfg, "beta", base, now=5.0)
+            mesh._observe_revlist_freshness(
+                self.cfg, "beta", base,
+                now=1.0 + mesh.REVGAP_LOG_INTERVAL + 1)
+        self.assertEqual(err.getvalue().count("MESH_REVGAP"), 2)
+
+    def test_observation_never_writes(self):
+        self._adopt(iat=1000)
+        before = os.listdir(self.cfg["_dir"])
+        with contextlib.redirect_stderr(io.StringIO()):
+            mesh._observe_revlist_freshness(
+                self.cfg, "beta", {"f": "beta", "rl": 9000})
+        self.assertEqual(sorted(os.listdir(self.cfg["_dir"])), sorted(before))
+
+
 class RevlistTests(unittest.TestCase):
     """#76 revocation distribution, increment 1: the owner-signed full-set
     revocation list -- mint, verify, monotonic adoption, and the status
