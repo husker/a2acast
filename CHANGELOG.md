@@ -62,9 +62,10 @@ Tests, CI & docs:
   third-party import fails before push. CONTRIBUTING.md carries
   agent-readable contribution rules; the README leads with the PyPI install.
 
-Known limb (#90): on Windows the harness-spawned async claude-hook still
-exits before receiving; this release keeps the delayed-redelivery posture,
-never loss.
+Known limb (#90): on Windows a Stop-hook-*spawned async* claude-hook still
+exits before it can independently receive. The in-session Stop-hook wake
+path itself works — it carries live fleet coordination — so delivery
+degrades to delayed redelivery, never loss.
 
 ## 0.16.1
 - Fixed the two delivery-loss mechanisms behind #86, validated live on all
