@@ -1,5 +1,71 @@
 # Changelog
 
+## 0.17.0
+
+Signed-approvals flagship groundwork (#62): the trust program's machinery
+lands **observe-only and default-off**, so the fleet can adopt it before any
+enforcement flips. Nothing here changes delivery or trust behavior by
+default; every ratchet is gated on an explicit operator opt-in.
+
+Signing, identity & enrollment (#62 / #74 / #76 / #93):
+- Signature-verdict enforcement (#74) is present but **dormant** — the
+  receiver can refuse a frame that lies about its signature, gated behind
+  `enforce_verdicts` (default off). Downgrade-ratchet observation logs
+  `MESH_DOWNGRADE` when a pinned peer drops to unsigned (observe-only, #132).
+- mcp-serve now signs with the node's pinned per-harness key (#144): the
+  server threads its `--harness` into the sign path instead of falling back
+  to the generic key, and `claude-setup`/`copilot-setup` emit `--harness` so
+  the watcher's key matches the CLI's. Restart mcp-serve to adopt.
+- Best-effort signing that degrades to unsigned now warns loudly on stderr
+  (#145) instead of failing silently.
+- Owner-signed enrollment (#76): membership certs (mint / verify / cache,
+  log-only) make a pin non-self-service; the attended-mint property is
+  verified at use, not only at creation (#110). The owner ceremony is
+  hardened (#87 F1–F3) — the signing env is scrubbed, rotation refuses
+  unattended postures, and the passphrase never touches a2acast.
+- Owner-signed revocation (#76): full-set revocation lists, sender-asserted
+  freshness (observe-only `REVGAP`, #131), and a non-suppressible pull
+  transport (#133) — all observe-only, off by default. A suppression vector
+  (a spoofed unsigned freshness hint weaponizing an honest peer's reply) was
+  found and closed with load-bearing tests.
+- Rename pin-migration + tombstones (#93): a key-verified rename can carry
+  its pin to the new name, gated behind `rename_migration` (default off);
+  rename-observation frames and revocation records are otherwise log-only
+  (#102). The receiver derives the old name from the signed sender, never a
+  spoofable field.
+- Fleet-scaled cap on TOFU pin-store growth (#76): a malicious member can no
+  longer grow the pin store unbounded — the cap raises a loud refusal at the
+  ceiling, and `note_peer`'s roster and `peers.json` are bounded the same way.
+- `mesh pins-audit` — a pairwise key-collision scan over the pin store
+  (#116); the node-signature base is reconstructed from the received wrapper
+  so new signed fields carry forward to older peers (#120); repeatable
+  KEY_MISMATCH rehearsal tooling (#62).
+
+Reliability & delivery:
+- Oversize payloads chunk under the inline limit and reassemble (#66); a
+  chunk reporting a mismatched count no longer discards a legitimate
+  in-flight message (#128). Attachment TTL is warned on both ends of the
+  cliff.
+- mcp-serve piggybacks pending deliveries on every tool result (#121); a
+  dying receive loop emits a last-gasp crash frame (#123); presence carries
+  process posture — what is listening, not just that it was seen (#122).
+- Phase-A observability is durably logged so #62 soak evidence survives a
+  hook wake (#129).
+
+Harness & platform:
+- Setup preflights the Windows registry PATH so plugin hooks actually arm
+  (#105); strict std streams degrade at CLI entry so a delivered send cannot
+  exit non-zero (#98). Windows PATH requirements documented (#90).
+
+Tests, CI & docs:
+- CI enforces mesh.py stdlib-only (#138), mirrored by a local test so a
+  third-party import fails before push. CONTRIBUTING.md carries
+  agent-readable contribution rules; the README leads with the PyPI install.
+
+Known limb (#90): on Windows the harness-spawned async claude-hook still
+exits before receiving; this release keeps the delayed-redelivery posture,
+never loss.
+
 ## 0.16.1
 - Fixed the two delivery-loss mechanisms behind #86, validated live on all
   three platforms:
