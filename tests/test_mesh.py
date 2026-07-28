@@ -5773,12 +5773,14 @@ class ApprovalAutoActB1Tests(unittest.TestCase):
 
     def test_optin_on_logs_would_act_no_action_no_consume(self):
         self.cfg["act_on_approvals"] = True
-        ctl = self._frame()
+        # an UNMAPPED action -> the would-act fallback (B2a made adopt-release a
+        # real handler; would-act is now for grants with no handler).
+        ctl = self._frame(action="unmapped-grant")
         log = self._handle(ctl)
         self.assertIn("MESH_APPROVAL_WOULD_ACT", log)
         self.assertIn("NO action taken", log)
         # finding C: the real applied-set (nonce ledger) is NOT written, so the
-        # approval stays really-actionable when B2's handler ships.
+        # approval stays really-actionable when a real handler ships.
         self.assertFalse(os.path.isfile(mesh._approval_ledger_file(self.cfg)),
                          "B1 would-act consumed the approval (wrote the ledger)")
         ok, _ = mesh._verify_approval(self.cfg, ctl["descriptor"],
@@ -5815,6 +5817,95 @@ class ApprovalAutoActB1Tests(unittest.TestCase):
         for ctl in ({"mw": "approval"},
                     {"mw": "approval", "token": 5, "descriptor": []}):
             self.assertEqual(self._handle(ctl), "")
+
+
+class AdoptPendingB2aTests(unittest.TestCase):
+    """#62 B2a: with act_on_approvals ON, a verified `adopt-release` records an
+    authenticated PENDING adoption (owner-signed {token,descriptor}) and logs
+    MESH_ADOPT_PENDING -- NO install, NO exec. Unknown grants fall back to the
+    B1 would-act log (never executed). The record carries owner-signed
+    provenance so `adopt-supervise` (B2b) re-verifies before it execs."""
+
+    @classmethod
+    def setUpClass(cls):
+        if not shutil.which("ssh-keygen"):
+            raise unittest.SkipTest("ssh-keygen unavailable")
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.cfg = make_cfg(tmp.name)
+        self.cfg["act_on_approvals"] = True
+        with contextlib.redirect_stdout(io.StringIO()):
+            mesh._owner_init(self.cfg, allow_unprotected=True)
+
+    def _frame(self, action="adopt-release", artifact="a" * 40, version="0.18.0"):
+        d = {"action": action, "version": version, "nonce": secrets.token_hex(16)}
+        if artifact is not None:
+            d["artifact"] = artifact
+        token = mesh._approve_descriptor(self.cfg, d)
+        return {"mw": "approval", "token": token, "descriptor": d}
+
+    def _handle(self, ctl, frm="imac"):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            mesh._handle_control(self.cfg, "me", frm, ctl)
+        return err.getvalue()
+
+    def _pending(self):
+        p = mesh._adopt_pending_file(self.cfg)
+        return json.load(open(p)) if os.path.isfile(p) else {}
+
+    def test_adopt_release_queues_owner_signed_pending_record(self):
+        ctl = self._frame()
+        log = self._handle(ctl)
+        self.assertIn("MESH_ADOPT_PENDING", log)
+        self.assertIn("NO install done here", log)
+        pending = self._pending()
+        self.assertEqual(len(pending), 1)
+        rec = next(iter(pending.values()))
+        # seam integrity: the record stores the OWNER-SIGNED token + descriptor,
+        # NOT a bare hash -- so the supervisor (B2b) can re-verify provenance.
+        self.assertEqual(rec["token"], ctl["token"])
+        self.assertEqual(rec["descriptor"], ctl["descriptor"])
+        self.assertEqual(rec["previous"], mesh.VERSION)
+        ok, _ = mesh._verify_approval(self.cfg, rec["descriptor"], rec["token"],
+                                      use_ledger=False)
+        self.assertTrue(ok, "stored pending token no longer verifies")
+
+    def test_adopt_release_without_artifact_pin_refused(self):
+        log = self._handle(self._frame(artifact=None))
+        self.assertIn("MESH_ADOPT_REFUSED", log)
+        self.assertEqual(self._pending(), {})
+
+    def test_forged_adopt_release_not_queued(self):
+        d = {"action": "adopt-release", "version": "0.18.0",
+             "artifact": "a" * 40, "nonce": secrets.token_hex(16)}
+        token = mesh._approve_descriptor(self.cfg, d)
+        tampered = dict(d, artifact="b" * 40)  # not what the owner signed
+        log = self._handle({"mw": "approval", "token": token,
+                           "descriptor": tampered})
+        self.assertIn("MESH_APPROVAL_BAD", log)
+        self.assertEqual(self._pending(), {})
+
+    def test_unknown_grant_falls_back_to_would_act_not_queued(self):
+        log = self._handle(self._frame(action="some-future-grant"))
+        self.assertIn("MESH_APPROVAL_WOULD_ACT", log)
+        self.assertNotIn("MESH_ADOPT_PENDING", log)
+        self.assertEqual(self._pending(), {})
+
+    def test_adopt_release_is_idempotent(self):
+        ctl = self._frame()
+        self.assertIn("MESH_ADOPT_PENDING", self._handle(ctl))
+        second = self._handle(ctl)  # re-broadcast: nonce replayed -> skipped
+        self.assertNotIn("MESH_ADOPT_PENDING", second)
+        self.assertEqual(len(self._pending()), 1)
+
+    def test_opt_in_off_does_not_queue(self):
+        self.cfg["act_on_approvals"] = False
+        log = self._handle(self._frame())
+        self.assertIn("MESH_APPROVAL_OK", log)  # Phase A observe
+        self.assertEqual(self._pending(), {})
 
 
 class AgentWatchWarningTests(unittest.TestCase):
