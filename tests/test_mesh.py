@@ -5721,6 +5721,9 @@ class ApprovalFramePhaseATests(unittest.TestCase):
         args.descriptor = json.dumps(self._descriptor())
         args.ttl = 3600
         args.broadcast = True
+        # Explicit sender so the test never leans on the ambient machine's node
+        # identity (which make_cfg doesn't set; my_node sys.exits without one).
+        args.as_node = "owner"
         with mock.patch.object(mesh, "load_config", lambda: self.cfg), \
                 mock.patch.object(mesh, "send_raw", fake_send_raw), \
                 contextlib.redirect_stdout(io.StringIO()), \
