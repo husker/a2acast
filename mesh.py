@@ -1116,6 +1116,9 @@ def _note_replay(replays, fingerprint, message_ts):
 OWNER_KEY_NAME = ".meshwire.owner"
 OWNER_TRUST_NAME = ".meshwire.trust.json"
 APPROVAL_LEDGER_NAME = ".meshwire.approvals.json"
+# #62 B2a: pending owner-signed adoptions, read by the operator-run
+# `adopt-supervise` (B2b). Additive/revertible cache, NOT trust state.
+ADOPT_PENDING_NAME = ".meshwire.adopt-pending.json"
 APPROVAL_TTL_DEFAULT = 3600
 APPROVAL_TOKEN_MAX = 16384
 # #62 Phase B finding D (structural belt+braces): config keys that NO
@@ -1174,6 +1177,10 @@ def owner_trust_file(cfg):
 
 def _approval_ledger_file(cfg):
     return os.path.join(cfg["_dir"], APPROVAL_LEDGER_NAME)
+
+
+def _adopt_pending_file(cfg):
+    return os.path.join(cfg["_dir"], ADOPT_PENDING_NAME)
 
 
 def _canonical_descriptor(value):
@@ -2691,6 +2698,77 @@ def _would_act_approval(cfg, frm, ctl):
     else:
         print(f"MESH_APPROVAL_BAD from={who} action={action} "
               f"reason={_single_line(reason)} (#62 Phase B B1)", file=sys.stderr)
+
+
+def _queue_adoption(cfg, frm, ctl):
+    """#62 B2a: on a verified `adopt-release` approval (act_on_approvals ON),
+    record an authenticated PENDING adoption and log MESH_ADOPT_PENDING. Runs
+    NO package manager and cycles NOTHING -- the install + cycle + post-cycle
+    health-check + rollback live in the operator-run `adopt-supervise` (B2b, not
+    built). The record stores the OWNER-SIGNED {token, descriptor} (not a bare
+    hash) so the supervisor re-verifies owner provenance before it execs (seam
+    integrity). Verifying with use_ledger=True consumes the nonce = intent
+    recorded once; a re-broadcast is 'replayed' and skipped (idempotent)."""
+    descriptor = ctl.get("descriptor")
+    token = ctl.get("token")
+    if not isinstance(descriptor, dict) or not isinstance(token, str):
+        return
+    who = _single_line(str(frm))[:40]
+    try:
+        ok, reason = _verify_approval(cfg, descriptor, token, use_ledger=True)
+    except (OSError, ValueError):
+        return
+    if not ok:
+        # already-queued (nonce replayed) is benign idempotency, not a bad frame
+        if "replayed" not in reason:
+            print(f"MESH_APPROVAL_BAD from={who} action=adopt-release "
+                  f"reason={_single_line(reason)} (#62 B2a)", file=sys.stderr)
+        return
+    artifact = descriptor.get("artifact")
+    if not isinstance(artifact, str) or not artifact.strip():
+        print(f"MESH_ADOPT_REFUSED from={who} action=adopt-release "
+              f"reason=descriptor carries no artifact pin (#62 B2a)",
+              file=sys.stderr)
+        return
+    version = _single_line(str(descriptor.get("version")))[:40]
+    nonce = descriptor.get("nonce")
+    try:
+        pending = _load_json_regular(
+            _adopt_pending_file(cfg), require_private=False,
+            max_bytes=WORKER_DELEGATE_LEDGER_MAX)
+    except (FileNotFoundError, OSError, ValueError):
+        pending = {}
+    if not isinstance(pending, dict):
+        pending = {}
+    pending[nonce] = {"token": token, "descriptor": descriptor,
+                      "previous": VERSION, "iat": int(time.time()),
+                      "status": "pending"}
+    try:
+        _write_json_secure(_adopt_pending_file(cfg), pending)
+    except OSError:
+        return
+    print(f"MESH_ADOPT_PENDING from={who} version={version} "
+          f"artifact={_single_line(artifact)[:24]} -- owner-signed, queued for "
+          f"adopt-supervise; NO install done here (#62 B2a)", file=sys.stderr)
+
+
+# #62 B2a: the enumerated auto-act grant registry -- the ONLY actions a node
+# will auto-act on. `adopt-release` is the first; it records intent, never execs.
+_APPROVAL_HANDLERS = {"adopt-release": _queue_adoption}
+
+
+def _dispatch_approval(cfg, frm, ctl):
+    """#62 B2a: with act_on_approvals ON, route a verified approval to its
+    enumerated grant handler. An UNKNOWN action is never auto-acted -- it falls
+    back to the B1 would-act log (verified, no action, no consume), so an
+    unrecognized grant is observed, never executed (forward-compatible)."""
+    descriptor = ctl.get("descriptor")
+    action = descriptor.get("action") if isinstance(descriptor, dict) else None
+    handler = _APPROVAL_HANDLERS.get(action)
+    if handler:
+        handler(cfg, frm, ctl)
+    else:
+        _would_act_approval(cfg, frm, ctl)
 
 
 CERT_TTL_DEFAULT = 365 * 86400
@@ -8146,7 +8224,7 @@ def _handle_control(cfg, me, frm, ctl, verdict=None, ev=None):
         # old peer lacking this arm falls through to MESH_CTL "(ignored)" --
         # forward-compatible, no partition.
         if _act_on_approvals_enabled(cfg):
-            _would_act_approval(cfg, frm, ctl)
+            _dispatch_approval(cfg, frm, ctl)
         else:
             _observe_approval(cfg, frm, ctl)
         return None
