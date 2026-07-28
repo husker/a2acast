@@ -5734,6 +5734,89 @@ class ApprovalFramePhaseATests(unittest.TestCase):
         self.assertIn("MESH_APPROVAL_OK", self._observe(captured["ctl"]))
 
 
+class ApprovalAutoActB1Tests(unittest.TestCase):
+    """#62 Phase B B1 -- the gated-dispatch SCAFFOLD. With `act_on_approvals`
+    OFF a verified approval is Phase-A observed (log OK/BAD). With it ON a
+    verified approval logs MESH_APPROVAL_WOULD_ACT -- but B1 ships no
+    side-effecting handler, so it takes NO action and does NOT consume the
+    approval (finding C). No received frame can flip `act_on_approvals`
+    (finding D, the bootstrap invariant)."""
+
+    @classmethod
+    def setUpClass(cls):
+        if not shutil.which("ssh-keygen"):
+            raise unittest.SkipTest("ssh-keygen unavailable")
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.cfg = make_cfg(tmp.name)
+        with contextlib.redirect_stdout(io.StringIO()):
+            mesh._owner_init(self.cfg, allow_unprotected=True)
+
+    def _frame(self, action="adopt-release"):
+        d = {"action": action, "version": "0.18.0",
+             "nonce": secrets.token_hex(16)}
+        token = mesh._approve_descriptor(self.cfg, d)
+        return {"mw": "approval", "token": token, "descriptor": d}
+
+    def _handle(self, ctl, frm="imac"):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            mesh._handle_control(self.cfg, "me", frm, ctl)
+        return err.getvalue()
+
+    def test_optin_off_is_phase_a_observe(self):
+        log = self._handle(self._frame())
+        self.assertIn("MESH_APPROVAL_OK", log)
+        self.assertNotIn("WOULD_ACT", log)
+
+    def test_optin_on_logs_would_act_no_action_no_consume(self):
+        self.cfg["act_on_approvals"] = True
+        ctl = self._frame()
+        log = self._handle(ctl)
+        self.assertIn("MESH_APPROVAL_WOULD_ACT", log)
+        self.assertIn("NO action taken", log)
+        # finding C: the real applied-set (nonce ledger) is NOT written, so the
+        # approval stays really-actionable when B2's handler ships.
+        self.assertFalse(os.path.isfile(mesh._approval_ledger_file(self.cfg)),
+                         "B1 would-act consumed the approval (wrote the ledger)")
+        ok, _ = mesh._verify_approval(self.cfg, ctl["descriptor"],
+                                      ctl["token"], use_ledger=False)
+        self.assertTrue(ok)
+
+    def test_optin_on_forged_logs_bad(self):
+        self.cfg["act_on_approvals"] = True
+        d = {"action": "adopt-release", "version": "0.18.0",
+             "nonce": secrets.token_hex(16)}
+        token = mesh._approve_descriptor(self.cfg, d)
+        tampered = dict(d, version="6.6.6")
+        log = self._handle({"mw": "approval", "token": token,
+                           "descriptor": tampered})
+        self.assertIn("MESH_APPROVAL_BAD", log)
+        self.assertNotIn("WOULD_ACT", log)
+
+    def test_a_received_frame_cannot_flip_act_on_approvals(self):
+        # Bootstrap invariant (finding D, load-bearing): a VALID owner-signed
+        # approval whose action NAMES the opt-in must NOT enable auto-act -- no
+        # handler writes config, so the flag stays off. If a frame could flip
+        # it, one signed frame bootstraps the whole fleet into auto-act.
+        self.assertFalse(mesh._act_on_approvals_enabled(self.cfg))
+        self._handle(self._frame(action="act_on_approvals"))
+        self.assertFalse(mesh._act_on_approvals_enabled(self.cfg),
+                         "a received approval flipped act_on_approvals")
+
+    def test_bootstrap_denylist_guard(self):
+        self.assertTrue(mesh._bootstrap_key_denied("act_on_approvals"))
+        self.assertFalse(mesh._bootstrap_key_denied("some_other_key"))
+
+    def test_optin_on_malformed_is_ignored(self):
+        self.cfg["act_on_approvals"] = True
+        for ctl in ({"mw": "approval"},
+                    {"mw": "approval", "token": 5, "descriptor": []}):
+            self.assertEqual(self._handle(ctl), "")
+
+
 class AgentWatchWarningTests(unittest.TestCase):
     """#57: warn when `mesh watch --follow` in an agent session would be a
     write-only pipe that never wakes the model."""
