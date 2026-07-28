@@ -1118,6 +1118,12 @@ OWNER_TRUST_NAME = ".meshwire.trust.json"
 APPROVAL_LEDGER_NAME = ".meshwire.approvals.json"
 APPROVAL_TTL_DEFAULT = 3600
 APPROVAL_TOKEN_MAX = 16384
+# #62 Phase B finding D (structural belt+braces): config keys that NO
+# owner-signed approval grant may ever write, so a future config-write grant
+# cannot re-open the auto-act bootstrap. `act_on_approvals` must be set only by
+# DIRECT operator action -- never by a received frame -- or one signed frame
+# could flip the whole fleet into auto-act (the recursion the invariant forbids).
+BOOTSTRAP_DENYLIST = frozenset({"act_on_approvals"})
 
 
 def _ssh_keygen_binary():
@@ -2614,6 +2620,23 @@ def _verify_approval(cfg, descriptor, token, use_ledger=True):
     return True, "ok"
 
 
+def _act_on_approvals_enabled(cfg):
+    """#62 Phase B: whether THIS node auto-acts on a verified approval. Default
+    OFF; set ONLY by direct operator action (config / a local command), NEVER by
+    a received frame (see BOOTSTRAP_DENYLIST) -- else one signed frame could
+    bootstrap the fleet into auto-act. Mirrors _rename_migration_enabled. B1
+    gates only a log-only would-act; real side-effecting handlers arrive in B2."""
+    return bool(cfg.get("act_on_approvals"))
+
+
+def _bootstrap_key_denied(key):
+    """#62 Phase B finding D: True if a config key is bootstrap-critical and so
+    refused to EVERY approval grant. Any future config-write handler MUST consult
+    this before writing; a denied key is never writable from the receive path, so
+    the auto-act bootstrap cannot be re-opened by a signed frame."""
+    return key in BOOTSTRAP_DENYLIST
+
+
 def _observe_approval(cfg, frm, ctl):
     """#62 Phase A (log-only): verify a RECEIVED owner-signed approval frame
     against its descriptor and LOG the verdict on stderr. Acts on NOTHING and
@@ -2640,6 +2663,34 @@ def _observe_approval(cfg, frm, ctl):
     else:
         print(f"MESH_APPROVAL_BAD from={who} action={action} "
               f"reason={_single_line(reason)} (#62 Phase A)", file=sys.stderr)
+
+
+def _would_act_approval(cfg, frm, ctl):
+    """#62 Phase B B1 (scaffold, still LOG-ONLY): when act_on_approvals is ON, a
+    verified approval WOULD be acted on -- but B1 ships no side-effecting
+    handlers, so it verifies and logs MESH_APPROVAL_WOULD_ACT and takes NO
+    action. Verifies with use_ledger=False so it does NOT consume the approval's
+    single-use nonce (finding C) -- the approval stays really-actionable when
+    B2's handler deploys; consuming it here would make B2 silently skip it.
+    Malformed frames are ignored, exactly as the Phase-A observer."""
+    descriptor = ctl.get("descriptor")
+    token = ctl.get("token")
+    if not isinstance(descriptor, dict) or not isinstance(token, str):
+        return
+    action = _single_line(str(descriptor.get("action")))[:80]
+    who = _single_line(str(frm))[:40]
+    try:
+        ok, reason = _verify_approval(cfg, descriptor, token, use_ledger=False)
+    except (OSError, ValueError):
+        return
+    if ok:
+        print(f"MESH_APPROVAL_WOULD_ACT from={who} action={action} -- "
+              f"owner-signed, verified; act_on_approvals is ON but B1 has no "
+              f"handler, so NO action taken and the approval is NOT consumed "
+              f"(#62 Phase B B1)", file=sys.stderr)
+    else:
+        print(f"MESH_APPROVAL_BAD from={who} action={action} "
+              f"reason={_single_line(reason)} (#62 Phase B B1)", file=sys.stderr)
 
 
 CERT_TTL_DEFAULT = 365 * 86400
@@ -8086,13 +8137,18 @@ def _handle_control(cfg, me, frm, ctl, verdict=None, ev=None):
               f"until something re-arms)")
         return None
     if kind == "approval":
-        # #62 Phase A (log-only): verify a received owner-signed approval and
-        # log the verdict. Acts on nothing and mutates no state
-        # (_observe_approval verifies with use_ledger=False). Auto-acting on a
-        # verified approval is Phase B, gated behind an owner opt-in that
-        # defaults off. An old peer lacking this arm falls through to the
-        # MESH_CTL "(ignored)" line below -- forward-compatible, no partition.
-        _observe_approval(cfg, frm, ctl)
+        # #62 approvals. Phase A (opt-in OFF): verify + log the verdict, act on
+        # nothing, consume nothing. Phase B B1 (opt-in act_on_approvals ON): a
+        # verified approval WOULD be acted on -- but B1 ships no side-effecting
+        # handlers, so it still only logs (MESH_APPROVAL_WOULD_ACT) and does NOT
+        # consume the approval (finding C). The opt-in is set only by direct
+        # operator action, NEVER by a frame (BOOTSTRAP_DENYLIST, finding D). An
+        # old peer lacking this arm falls through to MESH_CTL "(ignored)" --
+        # forward-compatible, no partition.
+        if _act_on_approvals_enabled(cfg):
+            _would_act_approval(cfg, frm, ctl)
+        else:
+            _observe_approval(cfg, frm, ctl)
         return None
     print(f"MESH_CTL from={_single_line(frm)} kind={kind!r} (ignored)",
           file=sys.stderr)
