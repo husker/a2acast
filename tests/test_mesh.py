@@ -5623,6 +5623,117 @@ class SignedApprovalTests(unittest.TestCase):
             mesh._apply_owner_trust(self.cfg, block)
 
 
+class ApprovalFramePhaseATests(unittest.TestCase):
+    """#62 Phase A: a RECEIVED owner-signed approval frame is verified against
+    the pinned owner key and LOGGED -- it takes NO action and mutates NO
+    state. Auto-acting on a verified approval is Phase B, gated behind an
+    owner opt-in that defaults off."""
+
+    @classmethod
+    def setUpClass(cls):
+        if not shutil.which("ssh-keygen"):
+            raise unittest.SkipTest("ssh-keygen unavailable")
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.cfg = make_cfg(tmp.name)
+        with contextlib.redirect_stdout(io.StringIO()):
+            mesh._owner_init(self.cfg, allow_unprotected=True)
+
+    def _descriptor(self, **overrides):
+        d = {"action": "adopt-release", "version": "0.17.0",
+             "nonce": secrets.token_hex(16)}
+        d.update(overrides)
+        return d
+
+    def _frame(self, descriptor=None):
+        descriptor = self._descriptor() if descriptor is None else descriptor
+        token = mesh._approve_descriptor(self.cfg, descriptor)
+        return {"mw": "approval", "token": token, "descriptor": descriptor}
+
+    def _observe(self, ctl, frm="imac"):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            mesh._observe_approval(self.cfg, frm, ctl)
+        return err.getvalue()
+
+    def test_valid_approval_logs_ok_and_takes_no_action(self):
+        log = self._observe(self._frame())
+        self.assertIn("MESH_APPROVAL_OK", log)
+        self.assertIn("adopt-release", log)
+        self.assertIn("no action taken", log)
+
+    def test_forged_descriptor_logs_bad(self):
+        # Load-bearing: the owner signed descriptor D, but the frame carries a
+        # DIFFERENT descriptor D'. A real verify catches the hash mismatch ->
+        # APPROVAL_BAD. Neuter the verify and this falsely logs OK.
+        d = self._descriptor()
+        token = mesh._approve_descriptor(self.cfg, d)
+        tampered = dict(d, version="6.6.6")  # not what the owner signed
+        log = self._observe({"mw": "approval", "token": token,
+                             "descriptor": tampered})
+        self.assertIn("MESH_APPROVAL_BAD", log)
+        self.assertNotIn("MESH_APPROVAL_OK", log)
+
+    def test_unsigned_garbage_token_logs_bad(self):
+        log = self._observe({"mw": "approval",
+                             "token": "mwapproval1-notarealtoken",
+                             "descriptor": self._descriptor()})
+        self.assertIn("MESH_APPROVAL_BAD", log)
+
+    def test_malformed_frame_is_ignored_no_crash_no_log(self):
+        for ctl in ({"mw": "approval"},
+                    {"mw": "approval", "token": "x"},
+                    {"mw": "approval", "descriptor": {"action": "x"}},
+                    {"mw": "approval", "token": 5, "descriptor": []}):
+            self.assertEqual(self._observe(ctl), "",
+                             "malformed approval frame should be silently ignored")
+
+    def test_phase_a_mutates_no_state_and_does_not_consume_nonce(self):
+        # Rule 6 / Phase A: observation must consume NOTHING. The single-use
+        # nonce ledger is not written, so the same approval verifies OK again
+        # -- it is not spent by being observed (consuming it is a Phase-B act).
+        ctl = self._frame()
+        self.assertIn("MESH_APPROVAL_OK", self._observe(ctl))
+        self.assertFalse(
+            os.path.isfile(mesh._approval_ledger_file(self.cfg)),
+            "observation wrote the approval ledger (consumed the nonce)")
+        self.assertIn("MESH_APPROVAL_OK", self._observe(ctl))
+
+    def test_handle_control_routes_approval_to_observe(self):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            mesh._handle_control(self.cfg, "me", "imac", self._frame())
+        self.assertIn("MESH_APPROVAL_OK", err.getvalue())
+
+    def test_broadcast_emits_a_verifiable_approval_frame(self):
+        # Emit -> receive: `mesh approve --broadcast` sends an approval control
+        # frame that _observe_approval verifies OK on the far end.
+        captured = {}
+
+        def fake_send_raw(cfg, me, to, body, title=None, ctl=None):
+            captured["to"], captured["ctl"] = to, ctl
+
+        class _Args:
+            pass
+        args = _Args()
+        args.descriptor = json.dumps(self._descriptor())
+        args.ttl = 3600
+        args.broadcast = True
+        # Explicit sender so the test never leans on the ambient machine's node
+        # identity (which make_cfg doesn't set; my_node sys.exits without one).
+        args.as_node = "owner"
+        with mock.patch.object(mesh, "load_config", lambda: self.cfg), \
+                mock.patch.object(mesh, "send_raw", fake_send_raw), \
+                contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()):
+            mesh.cmd_approve(args)
+        self.assertEqual(captured["to"], mesh.BROADCAST)
+        self.assertEqual(captured["ctl"]["mw"], "approval")
+        self.assertIn("MESH_APPROVAL_OK", self._observe(captured["ctl"]))
+
+
 class AgentWatchWarningTests(unittest.TestCase):
     """#57: warn when `mesh watch --follow` in an agent session would be a
     write-only pipe that never wakes the model."""

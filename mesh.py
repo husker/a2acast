@@ -2523,8 +2523,13 @@ def _approve_descriptor(cfg, descriptor, ttl=APPROVAL_TTL_DEFAULT):
         token.encode("utf-8")).decode("ascii").rstrip("=")
 
 
-def _verify_approval(cfg, descriptor, token):
-    """Return (ok, reason); records the nonce on success (single use)."""
+def _verify_approval(cfg, descriptor, token, use_ledger=True):
+    """Return (ok, reason). With use_ledger (default) the nonce is checked
+    against and recorded in the single-use ledger. use_ledger=False does a
+    PURE crypto verify (owner sig + descriptor hash + nonce + expiry) that
+    neither reads nor writes the ledger -- for #62 Phase-A observation, which
+    must verify a received approval WITHOUT consuming its single-use nonce
+    (consuming it is an ACT, and Phase A acts on nothing)."""
     try:
         canonical = _canonical_descriptor(descriptor)
     except ValueError as exc:
@@ -2558,18 +2563,20 @@ def _verify_approval(cfg, descriptor, token):
         return False, "token timestamps invalid"
     if now >= exp:
         return False, "token expired"
-    try:
-        ledger = _load_json_regular(
-            _approval_ledger_file(cfg), require_private=False,
-            max_bytes=WORKER_DELEGATE_LEDGER_MAX)
-    except FileNotFoundError:
-        ledger = {}
-    except (OSError, ValueError):
-        return False, "approval ledger is unreadable"
-    if not isinstance(ledger, dict):
-        ledger = {}
-    if nonce in ledger:
-        return False, "replayed approval (nonce already used)"
+    ledger = {}
+    if use_ledger:
+        try:
+            ledger = _load_json_regular(
+                _approval_ledger_file(cfg), require_private=False,
+                max_bytes=WORKER_DELEGATE_LEDGER_MAX)
+        except FileNotFoundError:
+            ledger = {}
+        except (OSError, ValueError):
+            return False, "approval ledger is unreadable"
+        if not isinstance(ledger, dict):
+            ledger = {}
+        if nonce in ledger:
+            return False, "replayed approval (nonce already used)"
     try:
         owner_pub = _load_owner_trust(cfg)
     except ValueError as exc:
@@ -2599,11 +2606,40 @@ def _verify_approval(cfg, descriptor, token):
             return False, "signature verification failed"
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
-    pruned = {value: seen for value, seen in ledger.items()
-              if isinstance(seen, int) and seen > now - 86400}
-    pruned[nonce] = int(exp)
-    _write_json_secure(_approval_ledger_file(cfg), pruned)
+    if use_ledger:
+        pruned = {value: seen for value, seen in ledger.items()
+                  if isinstance(seen, int) and seen > now - 86400}
+        pruned[nonce] = int(exp)
+        _write_json_secure(_approval_ledger_file(cfg), pruned)
     return True, "ok"
+
+
+def _observe_approval(cfg, frm, ctl):
+    """#62 Phase A (log-only): verify a RECEIVED owner-signed approval frame
+    against its descriptor and LOG the verdict on stderr. Acts on NOTHING and
+    mutates NO state -- pure observation (use_ledger=False, so the approval's
+    single-use nonce is not consumed; consuming it is an ACT, which belongs to
+    Phase B). A grant is NEVER executed here; auto-acting on a verified
+    approval is Phase B, gated behind an owner opt-in that defaults off.
+    Malformed or unknown-shape frames are ignored so an old or hostile peer
+    cannot crash the receive loop or forge a verdict."""
+    descriptor = ctl.get("descriptor")
+    token = ctl.get("token")
+    if not isinstance(descriptor, dict) or not isinstance(token, str):
+        return
+    action = _single_line(str(descriptor.get("action")))[:80]
+    who = _single_line(str(frm))[:40]
+    try:
+        ok, reason = _verify_approval(cfg, descriptor, token, use_ledger=False)
+    except (OSError, ValueError):
+        return  # a malformed approval must never break receive
+    if ok:
+        print(f"MESH_APPROVAL_OK from={who} action={action} -- owner-signed, "
+              f"verified; LOG-ONLY, no action taken (#62 Phase A)",
+              file=sys.stderr)
+    else:
+        print(f"MESH_APPROVAL_BAD from={who} action={action} "
+              f"reason={_single_line(reason)} (#62 Phase A)", file=sys.stderr)
 
 
 CERT_TTL_DEFAULT = 365 * 86400
@@ -7126,6 +7162,18 @@ def cmd_approve(args):
         token = _approve_descriptor(cfg, descriptor, ttl=args.ttl)
     except ValueError as exc:
         sys.exit(f"error: {exc}")
+    if getattr(args, "broadcast", False):
+        # #62 Phase A: distribute the owner-signed approval over the mesh as a
+        # control frame. Every peer verifies it against the pinned owner key
+        # and LOGS the verdict; none act on it (auto-act is Phase B, gated
+        # behind an owner opt-in that defaults off).
+        me = my_node(cfg, getattr(args, "as_node", None))
+        action = _single_line(str(descriptor.get("action")))[:60]
+        send_raw(cfg, me, BROADCAST, f"owner approval: {action}",
+                 ctl={"mw": "approval", "token": token,
+                      "descriptor": descriptor})
+        print("broadcast this approval to the mesh (peers verify + log; "
+              "none act -- #62 Phase A).", file=sys.stderr)
     print(token)
 
 
@@ -8036,6 +8084,15 @@ def _handle_control(cfg, me, frm, ctl, verdict=None, ev=None):
         _evidence(f"MESH_CRASH from={_single_line(frm)} exc={exc_name} "
               f"(its receive loop died -- deliveries there will sit "
               f"until something re-arms)")
+        return None
+    if kind == "approval":
+        # #62 Phase A (log-only): verify a received owner-signed approval and
+        # log the verdict. Acts on nothing and mutates no state
+        # (_observe_approval verifies with use_ledger=False). Auto-acting on a
+        # verified approval is Phase B, gated behind an owner opt-in that
+        # defaults off. An old peer lacking this arm falls through to the
+        # MESH_CTL "(ignored)" line below -- forward-compatible, no partition.
+        _observe_approval(cfg, frm, ctl)
         return None
     print(f"MESH_CTL from={_single_line(frm)} kind={kind!r} (ignored)",
           file=sys.stderr)
@@ -12752,6 +12809,9 @@ def main():
                                       "include 'action' and a 'nonce'")
     p.add_argument("--ttl", type=int, default=APPROVAL_TTL_DEFAULT,
                    help="seconds until the token expires (default 3600)")
+    p.add_argument("--broadcast", action="store_true",
+                   help="also distribute the approval over the mesh so peers "
+                        "verify + log it (#62 Phase A; none act on it)")
     p.set_defaults(fn=cmd_approve)
 
     p = sub.add_parser("verify-approval",
