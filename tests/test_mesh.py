@@ -5908,6 +5908,113 @@ class AdoptPendingB2aTests(unittest.TestCase):
         self.assertEqual(self._pending(), {})
 
 
+class AdoptSuperviseB2bDryRunTests(unittest.TestCase):
+    """#62 B2b-1: `adopt-supervise` DRY-RUN -- re-verify owner provenance,
+    detect + map the install operation, LOG what it WOULD run (never exec).
+    Runs no package manager, installs nothing, mutates no store."""
+
+    @classmethod
+    def setUpClass(cls):
+        if not shutil.which("ssh-keygen"):
+            raise unittest.SkipTest("ssh-keygen unavailable")
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.cfg = make_cfg(tmp.name)
+        self.cfg["act_on_approvals"] = True
+        with contextlib.redirect_stdout(io.StringIO()):
+            mesh._owner_init(self.cfg, allow_unprotected=True)
+
+    def _queue(self, artifact="a" * 40, version="0.18.0"):
+        d = {"action": "adopt-release", "version": version,
+             "artifact": artifact, "nonce": secrets.token_hex(16)}
+        token = mesh._approve_descriptor(self.cfg, d)
+        with contextlib.redirect_stderr(io.StringIO()):
+            mesh._handle_control(self.cfg, "me", "imac",
+                                 {"mw": "approval", "token": token,
+                                  "descriptor": d})  # B2a writes the pending record
+
+    def _supervise(self, install_type):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            seen = mesh._adopt_supervise_once(self.cfg, install_type=install_type)
+        return err.getvalue(), seen
+
+    def test_map_git_type_to_git_checkout(self):
+        op = mesh._map_pin_operation(
+            "uv-tool-git", {"artifact": "deadbeef", "version": "0.18.0"})
+        self.assertIn("git checkout deadbeef", op)
+
+    def test_map_pkg_type_to_pip(self):
+        op = mesh._map_pin_operation(
+            "pip", {"artifact": "sha", "version": "0.18.0"})
+        self.assertIn("pip install --upgrade a2acast==0.18.0", op)
+
+    def test_map_refuses_unknown_type_and_missing_fields(self):
+        self.assertIsNone(mesh._map_pin_operation(
+            "conda", {"artifact": "x", "version": "1"}))
+        self.assertIsNone(mesh._map_pin_operation("pip", {"artifact": "x"}))
+        self.assertIsNone(mesh._map_pin_operation(
+            "uv-tool-git", {"version": "1"}))
+
+    def test_detect_families(self):
+        self.assertEqual(mesh._detect_install_type(
+            exe="", module="/x/site-packages/mesh.py"), "pip")
+        self.assertEqual(mesh._detect_install_type(
+            exe="", module="/h/.local/pipx/venvs/a/mesh.py"), "pipx")
+        self.assertIsNone(mesh._detect_install_type(
+            exe="/usr/bin/mesh", module="/opt/conda/mesh.py"))
+
+    def test_detect_uv_tool_reads_receipt_for_git_vs_pypi(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        toolroot = os.path.join(tmp.name, "uv", "tools", "a2acast")
+        os.makedirs(os.path.join(toolroot, "bin"))
+        exe = os.path.join(toolroot, "bin", "mesh")
+        open(exe, "w").write("#!/x/python\n")
+        receipt = os.path.join(toolroot, "uv-receipt.toml")
+        open(receipt, "w").write('source = { git = "https://x" }\n')
+        self.assertEqual(mesh._detect_install_type(exe=exe, module="/tmp/x.py"),
+                         "uv-tool-git")
+        open(receipt, "w").write('[source]\nregistry = "pypi"\nversion = "0.17"\n')
+        self.assertEqual(mesh._detect_install_type(exe=exe, module="/tmp/x.py"),
+                         "uv-tool-pypi")
+
+    def test_dryrun_logs_wouldexec_no_exec(self):
+        self._queue()
+        log, seen = self._supervise("pipx")
+        self.assertEqual(seen, 1)
+        self.assertIn("MESH_ADOPT_WOULDEXEC", log)
+        self.assertIn("pip install --upgrade a2acast==0.18.0", log)
+        self.assertIn("NO install run", log)
+
+    def test_dryrun_refuses_unmappable_type(self):
+        self._queue()
+        log, _ = self._supervise("conda")
+        self.assertIn("MESH_ADOPT_REFUSED", log)
+        self.assertNotIn("MESH_ADOPT_WOULDEXEC", log)
+
+    def test_dryrun_tampered_record_fails_reverify(self):
+        # Seam (load-bearing): tamper the STORED pending record's descriptor ->
+        # the supervisor's owner re-verify fails -> MESH_ADOPT_FAILED, never
+        # WOULDEXEC. A local edit cannot redirect the install.
+        self._queue()
+        pf = mesh._adopt_pending_file(self.cfg)
+        data = json.load(open(pf))
+        nonce = next(iter(data))
+        data[nonce]["descriptor"]["artifact"] = "tampered"
+        mesh._write_json_secure(pf, data)
+        log, _ = self._supervise("pipx")
+        self.assertIn("MESH_ADOPT_FAILED", log)
+        self.assertIn("re-verify", log)
+        self.assertNotIn("MESH_ADOPT_WOULDEXEC", log)
+
+    def test_no_pending_is_clean(self):
+        _log, seen = self._supervise("pipx")
+        self.assertEqual(seen, 0)
+
+
 class AgentWatchWarningTests(unittest.TestCase):
     """#57: warn when `mesh watch --follow` in an agent session would be a
     write-only pipe that never wakes the model."""

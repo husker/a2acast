@@ -2771,6 +2771,157 @@ def _dispatch_approval(cfg, frm, ctl):
         _would_act_approval(cfg, frm, ctl)
 
 
+# #62 B2b: install types whose pin is a git commit SHA vs a package version+hash.
+_GIT_ADOPT_TYPES = frozenset({"uv-tool-git", "source-clone", "editable"})
+_PKG_ADOPT_TYPES = frozenset({"uv-tool-pypi", "pipx", "pip"})
+
+
+def _uv_tool_source(uv_dir):
+    """#62 B2b (seat finding 1): for a uv-tool install, read the uv RECEIPT
+    (at the tool root .../uv/tools/<tool>/) to tell git from PyPI -- the shebang
+    can't, both share the .../uv/tools/... path. Returns 'git', 'pypi', or None
+    (undeterminable -> caller refuses)."""
+    try:
+        with open(os.path.join(uv_dir, "uv-receipt.toml"),
+                  "r", encoding="utf-8") as f:
+            text = f.read().lower()
+    except (OSError, ValueError):
+        return None
+    if "git+" in text or "git =" in text or "source = { git" in text:
+        return "git"       # a git-sourced uv tool names a git URL/source
+    if "registry" in text or "version =" in text:
+        return "pypi"      # a PyPI-sourced uv tool names the registry/version
+    return None            # ambiguous -> refuse (never guess)
+
+
+def _mesh_shebang(exe):
+    """First shebang line of the `mesh` console script, or '' -- it reveals the
+    venv/tool the script runs from (pipx/uv-tool live there, NOT the shim path)."""
+    try:
+        with open(exe, "r", encoding="utf-8", errors="replace") as f:
+            line = f.readline()
+        return line if line.startswith("#!") else ""
+    except (OSError, ValueError):
+        return ""
+
+
+def _detect_install_type(exe=None, module=None):
+    """#62 B2b: detect THIS node's a2acast install type, or None if it can't be
+    determined -> refuse. The console script's SHEBANG/path gives the FAMILY
+    (pipx/uv-tool live in the shebang, not the shim path); the uv receipt tells
+    a uv-tool's source. The long tail (conda/system/bare-script) returns None,
+    covered by refuse-if-unmappable. Parameters injectable for tests."""
+    if exe is None:
+        exe = shutil.which("mesh") or ""
+    if module is None:
+        module = getattr(sys.modules.get("mesh"), "__file__", None) or __file__
+    exe, module = exe or "", module or ""
+    hay = "\n".join((exe, _mesh_shebang(exe), module))
+    uv_marker = os.sep + "uv" + os.sep + "tools" + os.sep
+    if uv_marker in hay:
+        for s in hay.split("\n"):
+            i = s.find(uv_marker)
+            if i >= 0:
+                tool = s[i + len(uv_marker):].split(os.sep, 1)[0]
+                src = _uv_tool_source(s[:i + len(uv_marker)] + tool)
+                return {"git": "uv-tool-git", "pypi": "uv-tool-pypi"}.get(src)
+    if os.sep + "pipx" + os.sep in hay:
+        return "pipx"
+    if "site-packages" in module or "dist-packages" in module:
+        return "pip"
+    # source clone / editable: the module lives inside a git working tree
+    d = os.path.dirname(os.path.abspath(module))
+    for _ in range(40):
+        if os.path.isdir(os.path.join(d, ".git")):
+            return "source-clone"
+        parent = os.path.dirname(d)
+        if parent == d:
+            break
+        d = parent
+    return None
+
+
+def _map_pin_operation(install_type, descriptor):
+    """#62 B2b: map an owner-signed adopt-release pin to the concrete upgrade
+    operation for THIS install type. Returns a description string (dry-run logs
+    it; B2b-2 would run it) or None if unmappable -> REFUSE, never guess."""
+    if not isinstance(descriptor, dict):
+        return None
+    artifact = descriptor.get("artifact")
+    version = descriptor.get("version")
+    if not isinstance(artifact, str) or not artifact.strip():
+        return None
+    if install_type in _GIT_ADOPT_TYPES:
+        return "git checkout " + _single_line(artifact)
+    if install_type in _PKG_ADOPT_TYPES:
+        if not isinstance(version, str) or not version.strip():
+            return None
+        return ("pip install --upgrade a2acast==" + _single_line(version)
+                + " [verify hash " + _single_line(artifact)[:16] + "]")
+    return None
+
+
+def _adopt_supervise_once(cfg, install_type=None):
+    """#62 B2b-1 (DRY-RUN): process pending adoptions -- re-verify owner
+    provenance, detect + map the install operation, and LOG what it WOULD run
+    (MESH_ADOPT_WOULDEXEC) or why it refuses. Runs NO package manager, installs
+    NOTHING, cycles nothing, and does not mutate the pending store (B2b-2 flips
+    on the real exec + lifecycle). Returns the count of pending records seen."""
+    try:
+        pending = _load_json_regular(
+            _adopt_pending_file(cfg), require_private=False,
+            max_bytes=WORKER_DELEGATE_LEDGER_MAX)
+    except (FileNotFoundError, OSError, ValueError):
+        pending = {}
+    if not isinstance(pending, dict):
+        pending = {}
+    if install_type is None:
+        install_type = _detect_install_type()
+    seen = 0
+    for nonce, rec in pending.items():
+        if not isinstance(rec, dict) or rec.get("status") != "pending":
+            continue
+        seen += 1
+        tag = _single_line(str(nonce))[:16]
+        token, descriptor = rec.get("token"), rec.get("descriptor")
+        if not isinstance(token, str) or not isinstance(descriptor, dict):
+            print(f"MESH_ADOPT_FAILED nonce={tag} reason=malformed pending "
+                  f"record (#62 B2b-1)", file=sys.stderr)
+            continue
+        # SEAM: re-verify owner provenance on the STORED token; take the pin
+        # from the owner-signed descriptor. This is the authoritative,
+        # exec-adjacent gate -- a tampered record fails here.
+        try:
+            ok, reason = _verify_approval(cfg, descriptor, token,
+                                          use_ledger=False)
+        except (OSError, ValueError):
+            ok, reason = False, "verify error"
+        if not ok:
+            print(f"MESH_ADOPT_FAILED nonce={tag} reason=owner re-verify "
+                  f"failed: {_single_line(reason)} (#62 B2b-1)", file=sys.stderr)
+            continue
+        version = _single_line(str(descriptor.get("version")))[:40]
+        op = _map_pin_operation(install_type, descriptor)
+        if op is None:
+            print(f"MESH_ADOPT_REFUSED version={version} "
+                  f"install_type={install_type or 'unknown'} reason=cannot map "
+                  f"the artifact pin to a known operation (#62 B2b-1)",
+                  file=sys.stderr)
+            continue
+        print(f"MESH_ADOPT_WOULDEXEC version={version} "
+              f"install_type={install_type} op=[{op}] -- DRY-RUN, owner-"
+              f"verified; NO install run (#62 B2b-1)", file=sys.stderr)
+    return seen
+
+
+def cmd_adopt_supervise(args):
+    cfg = load_config()
+    seen = _adopt_supervise_once(cfg)
+    if not seen:
+        print("no pending adoptions (#62 B2b-1 dry-run: nothing to inspect)",
+              file=sys.stderr)
+
+
 CERT_TTL_DEFAULT = 365 * 86400
 CERT_TTL_MAX = 400 * 86400
 CERT_BLOCK_MAX = 8192
@@ -13186,6 +13337,13 @@ def main():
                    help="signal a running codex-supervise loop to stop")
     p.add_argument("--as", dest="as_node", default=None)
     p.set_defaults(fn=cmd_codex_supervise)
+
+    p = sub.add_parser("adopt-supervise",
+                       help="#62 B2b-1 (DRY-RUN): inspect pending owner-signed "
+                            "adoptions and log the upgrade operation each WOULD "
+                            "run -- verifies + detects install type + maps, but "
+                            "runs NOTHING (no install, no cycle)")
+    p.set_defaults(fn=cmd_adopt_supervise)
 
     p = sub.add_parser(
         "pool-setup", help="configure isolated machine-wide AI workers")
