@@ -2795,14 +2795,17 @@ def _uv_tool_source(uv_dir):
 
 
 def _mesh_shebang(exe):
-    """First shebang line of the `mesh` console script, or '' -- it reveals the
-    venv/tool the script runs from (pipx/uv-tool live there, NOT the shim path)."""
+    """The interpreter path from the `mesh` console script's shebang (the `#!`
+    prefix + surrounding whitespace stripped), or '' -- it reveals the venv/tool
+    the script runs from (pipx/uv-tool live there, NOT the shim path). The `#!`
+    MUST be stripped: the caller reconstructs the uv tool root from this string,
+    and a leading `#!` corrupts that path -> a real uv-tool node would misdetect."""
     try:
         with open(exe, "r", encoding="utf-8", errors="replace") as f:
             line = f.readline()
-        return line if line.startswith("#!") else ""
     except (OSError, ValueError):
         return ""
+    return line[2:].strip() if line.startswith("#!") else ""
 
 
 def _detect_install_type(exe=None, module=None):

@@ -5967,18 +5967,27 @@ class AdoptSuperviseB2bDryRunTests(unittest.TestCase):
             exe="/usr/bin/mesh", module="/opt/conda/mesh.py"))
 
     def test_detect_uv_tool_reads_receipt_for_git_vs_pypi(self):
+        # Exercise the SHEBANG -> reconstruct -> receipt flow (where the `#!`
+        # bug lived): the shim's PATH has NO uv/tools; the uv location is in its
+        # SHEBANG. Uses the real uv-receipt shape.
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         toolroot = os.path.join(tmp.name, "uv", "tools", "a2acast")
         os.makedirs(os.path.join(toolroot, "bin"))
-        exe = os.path.join(toolroot, "bin", "mesh")
-        open(exe, "w").write("#!/x/python\n")
+        shim = os.path.join(tmp.name, "bin", "mesh")  # NOT under uv/tools
+        os.makedirs(os.path.dirname(shim))
+        open(shim, "w").write(
+            "#!" + os.path.join(toolroot, "bin", "python") + " -E\n")
         receipt = os.path.join(toolroot, "uv-receipt.toml")
-        open(receipt, "w").write('source = { git = "https://x" }\n')
-        self.assertEqual(mesh._detect_install_type(exe=exe, module="/tmp/x.py"),
+        open(receipt, "w").write(
+            '[tool]\nrequirements = [{ name = "a2acast", '
+            'git = "https://github.com/husker/a2acast" }]\n')
+        self.assertEqual(mesh._detect_install_type(exe=shim, module="/tmp/x.py"),
                          "uv-tool-git")
-        open(receipt, "w").write('[source]\nregistry = "pypi"\nversion = "0.17"\n')
-        self.assertEqual(mesh._detect_install_type(exe=exe, module="/tmp/x.py"),
+        open(receipt, "w").write(
+            '[tool]\nrequirements = [{ name = "a2acast", '
+            'specifier = "==0.17.0" }]\nregistry = "https://pypi.org/simple"\n')
+        self.assertEqual(mesh._detect_install_type(exe=shim, module="/tmp/x.py"),
                          "uv-tool-pypi")
 
     def test_dryrun_logs_wouldexec_no_exec(self):
