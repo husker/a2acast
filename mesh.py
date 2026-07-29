@@ -2819,16 +2819,24 @@ def _detect_install_type(exe=None, module=None):
     if module is None:
         module = getattr(sys.modules.get("mesh"), "__file__", None) or __file__
     exe, module = exe or "", module or ""
-    hay = "\n".join((exe, _mesh_shebang(exe), module))
-    uv_marker = os.sep + "uv" + os.sep + "tools" + os.sep
-    if uv_marker in hay:
-        for s in hay.split("\n"):
-            i = s.find(uv_marker)
+    # Match separator-agnostically: the fleet is cross-platform (Windows spells
+    # paths with '\\', POSIX with '/'), and "under uv/tools" / "under pipx" is a
+    # separator-INDEPENDENT property (Rule 4 -- gate on the property, not a '/'
+    # proxy that silently mis-refuses every real Windows node). Normalize a COPY
+    # for matching; reconstruct the on-disk receipt path from the ORIGINAL
+    # segment so open() gets a native path. '\\'->'/' is 1:1, so an index found
+    # in the normalized form is valid in the original.
+    _UV = "/uv/tools/"
+    segments = (exe, _mesh_shebang(exe), module)
+    nhay = "\n".join(segments).replace("\\", "/")
+    if _UV in nhay:
+        for s in segments:
+            i = s.replace("\\", "/").find(_UV)
             if i >= 0:
-                tool = s[i + len(uv_marker):].split(os.sep, 1)[0]
-                src = _uv_tool_source(s[:i + len(uv_marker)] + tool)
+                tool = s[i + len(_UV):].replace("\\", "/").split("/", 1)[0]
+                src = _uv_tool_source(s[:i + len(_UV)] + tool)
                 return {"git": "uv-tool-git", "pypi": "uv-tool-pypi"}.get(src)
-    if os.sep + "pipx" + os.sep in hay:
+    if "/pipx/" in nhay:
         return "pipx"
     if "site-packages" in module or "dist-packages" in module:
         return "pip"

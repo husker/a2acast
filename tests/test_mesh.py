@@ -5966,6 +5966,15 @@ class AdoptSuperviseB2bDryRunTests(unittest.TestCase):
         self.assertIsNone(mesh._detect_install_type(
             exe="/usr/bin/mesh", module="/opt/conda/mesh.py"))
 
+    def test_detect_families_separator_agnostic(self):
+        # Windows spells install paths with '\\'; detection must not depend on
+        # the running platform's os.sep (real Windows nodes exist in the fleet).
+        # These assert on BOTH platforms -> fail on any os.sep-based marker.
+        self.assertEqual(mesh._detect_install_type(
+            exe="", module=r"C:\Users\r\AppData\pipx\venvs\a\mesh.py"), "pipx")
+        self.assertEqual(mesh._detect_install_type(
+            exe="", module=r"C:\py\Lib\site-packages\mesh.py"), "pip")
+
     def test_detect_uv_tool_reads_receipt_for_git_vs_pypi(self):
         # Exercise the SHEBANG -> reconstruct -> receipt flow (where the `#!`
         # bug lived): the shim's PATH has NO uv/tools; the uv location is in its
