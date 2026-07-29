@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.18.0
+
+Owner-signed approvals over the mesh (#62): the "authorize once → every node
+observes" pipeline lands, still **log-only / dry-run and gated default-off**.
+An owner-signed grant now distributes over the mesh and each node verifies it
+against its pinned owner key — but no node yet acts on one. This is the
+wire-format adoption release ahead of any real fleet adoption; every step is
+off by default and inert on 0.17.0 nodes.
+
+- Owner-signed approval frames (#62 Phase A): `mesh approve <descriptor>
+  --broadcast` distributes a single-use, expiring, owner-signed grant; a
+  receiving node verifies it against the pinned owner pubkey and logs
+  `MESH_APPROVAL_OK` / `MESH_APPROVAL_BAD` — no action, no trust mutation, no
+  nonce consumed (a pure-crypto verify). Old peers ignore the frame
+  (forward-compatible).
+- Gated auto-act scaffold (#62 Phase B1): an `act_on_approvals` opt-in —
+  default off, settable only by the direct operator and never by any frame
+  (a structural bootstrap denylist) — that, when on, logs
+  `MESH_APPROVAL_WOULD_ACT` and still takes no action.
+- Pending-adoption record (#62 Phase B2a): a verified `adopt-release` grant
+  (opt-in on) writes an authenticated pending-adoption record — storing the
+  owner-signed token + descriptor, not a bare hash — and logs
+  `MESH_ADOPT_PENDING`. The receive path still runs no code.
+- `mesh adopt-supervise` dry-run (#62 Phase B2b-1): an operator-run, opt-in
+  supervisor reads a pending record, re-verifies the owner signature, detects
+  the install type (uv-tool git/PyPI via the uv receipt, pipx, pip,
+  source-clone), maps the pinned artifact to the upgrade operation it *would*
+  run, and logs `MESH_ADOPT_WOULDEXEC` / `REFUSED` — refusing anything it
+  cannot map to a known operation. It installs nothing and cycles nothing;
+  the real package-manager exec is a separate, operator-gated slice.
+
 ## 0.17.0
 
 Signed-approvals flagship groundwork (#62): the trust program's machinery
