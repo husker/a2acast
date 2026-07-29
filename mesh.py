@@ -1127,9 +1127,18 @@ APPROVAL_TOKEN_MAX = 16384
 # DIRECT operator action -- never by a received frame -- or one signed frame
 # could flip the whole fleet into auto-act (the recursion the invariant forbids).
 BOOTSTRAP_DENYLIST = frozenset({"act_on_approvals"})
+SSH_KEYGEN_ENV = "A2ACAST_SSH_KEYGEN"
 
 
 def _ssh_keygen_binary():
+    override = os.environ.get(SSH_KEYGEN_ENV)
+    if override is not None:
+        binary = shutil.which(override.strip()) if override.strip() else None
+        if not binary:
+            raise ValueError(
+                f"{SSH_KEYGEN_ENV}={override!r} could not be resolved to an "
+                "ssh-keygen executable")
+        return binary
     binary = shutil.which("ssh-keygen")
     if not binary:
         raise ValueError(

@@ -379,6 +379,19 @@ export A2ACAST_CONFIG=/absolute/path/to/mesh-node/.meshwire.json
 `mesh claude-setup` and `mesh copilot-setup` still write their MCP workspace
 files in the current project while pinning that isolated config path.
 
+To select a specific OpenSSH binary, set `A2ACAST_SSH_KEYGEN` to its path.
+This is useful on Windows builds where the in-box OpenSSH 9.5p2
+`ssh-keygen -Y sign` can take about one minute and race a2acast's signing
+timeout. For example:
+
+```powershell
+$env:A2ACAST_SSH_KEYGEN = 'C:\Program Files\Git\usr\bin\ssh-keygen.exe'
+```
+
+Set the same variable in an MCP server's `env` block for long-running
+integrations. The override drives both signing and verification; an invalid
+value fails loudly and never falls back to the slower PATH binary.
+
 **Onboarding & MCP clients.** `mesh integrate` prints the right setup for
 whatever you run — a harness plugin (`--format codex`/`copilot`), a CLAUDE.md
 snippet (`--format claude`), a paste-in skill (`--format skill`), or the MCP

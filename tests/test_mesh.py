@@ -6214,6 +6214,45 @@ class NodeSigningTests(unittest.TestCase):
     def test_round_trip(self):
         self.assertTrue(self._verify(self._sign()))
 
+    def test_explicit_ssh_keygen_override_drives_sign_and_verify(self):
+        # #159: stock Windows OpenSSH 9.5p2 can take just over 60s to
+        # `-Y sign`, racing the node-signing timeout and degrading the frame
+        # to unsigned.  An operator-selected newer binary must drive the
+        # actual crypto operations, not merely be present in the environment.
+        # Make ordinary PATH lookup unusable and prove a real signature still
+        # completes and verifies through the explicit binary.
+        git_for_windows = r"C:\Program Files\Git\usr\bin\ssh-keygen.exe"
+        real_binary = (git_for_windows
+                       if os.path.isfile(git_for_windows)
+                       else shutil.which("ssh-keygen"))
+
+        def only_override_resolves(command):
+            return real_binary if command == real_binary else None
+
+        with mock.patch.dict(
+                os.environ, {"A2ACAST_SSH_KEYGEN": real_binary}), \
+             mock.patch.object(
+                 mesh.shutil, "which", side_effect=only_override_resolves):
+            self.assertTrue(self._verify(self._sign()))
+
+    def test_invalid_ssh_keygen_override_does_not_fall_back_to_path(self):
+        # A typo in the explicit override must be loud.  Falling back to PATH
+        # would silently put an affected Windows node back on the one-minute
+        # signer and recreate the unsigned-frame degradation.
+        real_binary = shutil.which("ssh-keygen")
+
+        def path_has_only_the_default(command):
+            return real_binary if command == "ssh-keygen" else None
+
+        with mock.patch.dict(
+                os.environ,
+                {"A2ACAST_SSH_KEYGEN": "definitely-missing-ssh-keygen"}), \
+             mock.patch.object(
+                 mesh.shutil, "which", side_effect=path_has_only_the_default):
+            with self.assertRaisesRegex(
+                    ValueError, "A2ACAST_SSH_KEYGEN.*could not be resolved"):
+                mesh._ssh_keygen_binary()
+
     def test_rejects_tampered_body(self):
         sig = self._sign()
         self.assertFalse(self._verify(sig, payload=dict(self.payload,
