@@ -9022,7 +9022,7 @@ class PluginManifestTests(unittest.TestCase):
         release = re.search(r'^version = "([^"]+)"$', py, re.MULTILINE)
         self.assertIsNotNone(release)
         release = release.group(1)
-        self.assertEqual(release, "0.17.0")
+        self.assertEqual(release, "0.18.0")
         for rel in (self.MANIFEST, ".claude-plugin/plugin.json",
                     self.COPILOT_MANIFEST):
             v = self._load(rel)["version"]
