@@ -17321,5 +17321,85 @@ class AdoptExecB2b2aTests(unittest.TestCase):
         self.assertIn("exec not enabled", err)
 
 
+class WatchdogSupervisorTests(unittest.TestCase):
+    """#158 increment-2: the supervised-watch stall-watchdog exits on a stale
+    heartbeat so a KeepAlive unit restarts a wedged receiver — the catch-all
+    that recovers ANY stall (read/consumer/wake) the in-process fix can't."""
+
+    def _cfg(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        return make_cfg(tmp.name)
+
+    def test_should_exit_only_when_stale(self):
+        # Load-bearing guard: exit ONLY on a stale heartbeat, never a fresh one.
+        # Drop the `== 'stalled'` check and a healthy receiver gets killed.
+        cfg = self._cfg()
+        base = 1_000_000
+        mesh._write_recv_heartbeat(cfg, "n1", now=base)
+        self.assertFalse(mesh._watchdog_should_exit(cfg, "n1", now=base + 10))
+        self.assertTrue(mesh._watchdog_should_exit(
+            cfg, "n1", now=base + mesh.RECV_STALL_SECONDS + 60))
+
+    def test_thread_fires_on_stale_heartbeat(self):
+        cfg = self._cfg()
+        mesh._write_recv_heartbeat(
+            cfg, "n1", now=int(time.time()) - (mesh.RECV_STALL_SECONDS + 60))
+        fired = threading.Event()
+        stop = threading.Event()
+
+        def on_stall():
+            fired.set()
+            stop.set()
+
+        t = threading.Thread(
+            target=mesh._watch_stall_watchdog, args=(cfg, "n1", stop),
+            kwargs={"interval": 0.01, "on_stall": on_stall}, daemon=True)
+        t.start()
+        self.assertTrue(fired.wait(timeout=3), "watchdog did not fire on stall")
+        t.join(timeout=2)
+
+    def test_thread_leaves_healthy_receiver_alone(self):
+        cfg = self._cfg()
+        mesh._write_recv_heartbeat(cfg, "n1")  # fresh (real clock)
+        fired = threading.Event()
+        stop = threading.Event()
+        t = threading.Thread(
+            target=mesh._watch_stall_watchdog, args=(cfg, "n1", stop),
+            kwargs={"interval": 0.01, "on_stall": fired.set}, daemon=True)
+        t.start()
+        self.assertFalse(fired.wait(timeout=0.3), "watchdog killed a healthy node")
+        stop.set()
+        t.join(timeout=2)
+
+
+class WatchInstallTests(unittest.TestCase):
+    """#158 inc2: the always-on self-healing receiver install (the KeepAlive
+    restarter the watchdog relies on)."""
+
+    def test_agent_label_sanitizes_node_name(self):
+        self.assertEqual(mesh._watch_agent_label("a/b c@x"),
+                         "cloud.a2acast.watch.a_b_c_x")
+
+    def test_launch_agent_value_keepalive_supervised_no_secret(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        cfg = make_cfg(tmp.name)
+        exe = os.path.join(tmp.name, "mesh")
+        with open(exe, "w") as f:
+            f.write("#!/x")
+        os.chmod(exe, 0o755)
+        v = mesh._watch_launch_agent_value(cfg, "weenis", exe)
+        # KeepAlive is what makes the watchdog's os._exit a restart, not a death.
+        self.assertTrue(v["KeepAlive"])
+        self.assertTrue(v["RunAtLoad"])
+        self.assertIn("--supervised", v["ProgramArguments"])
+        self.assertIn("--follow", v["ProgramArguments"])
+        # The shared mesh key must never land in a world-loadable launch agent.
+        import plistlib
+        self.assertNotIn(cfg["key"],
+                         plistlib.dumps(v).decode("utf-8", "replace"))
+
+
 if __name__ == "__main__":
     unittest.main()

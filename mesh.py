@@ -3777,6 +3777,32 @@ def _receiver_liveness(cfg, node, now=None):
     return ("stalled" if age > RECV_STALL_SECONDS else "healthy", age)
 
 
+def _watchdog_should_exit(cfg, me, now=None):
+    """#158 increment-2: True iff a SUPERVISED receiver's heartbeat is stale
+    enough to warrant a restart. A stale heartbeat means the receiver stopped
+    delivering (read-, consumer-, or wake-blocked); the in-process close-response
+    only recovers the read-blocked case, so the catch-all is to exit and let an
+    external KeepAlive restarter (launchd/systemd) revive a fresh process."""
+    return _receiver_liveness(cfg, me, now=now)[0] == "stalled"
+
+
+def _watch_stall_watchdog(cfg, me, stop, interval=None, on_stall=None):
+    """Background thread for `mesh watch --supervised`: on a stale heartbeat,
+    os._exit so the KeepAlive unit restarts the receiver. Runs in its OWN
+    thread so it fires even while the main receive loop is wedged. `on_stall`
+    is injectable for tests (default os._exit); `stop` ends it cleanly."""
+    interval = interval if interval is not None else max(30, RECV_STALL_SECONDS // 3)
+    on_stall = on_stall or (lambda: os._exit(1))
+    while not stop.wait(interval):
+        if _watchdog_should_exit(cfg, me):
+            print(f"MESH_WATCHDOG_EXIT node={_single_line(me)} reason="
+                  f"receiver heartbeat stale >{RECV_STALL_SECONDS}s; exiting for "
+                  f"KeepAlive restart (#158 inc2)", file=sys.stderr)
+            sys.stderr.flush()
+            on_stall()
+            return
+
+
 PROCESS_POSTURES = ("watch", "hook", "mcp-serve", "mcp", "worker")
 _process_posture = None
 
@@ -8691,6 +8717,19 @@ def cmd_watch(args):
     if plock is None:
         sys.exit(f"error: node '{me}' already has a live presence watcher; "
                  "refusing a second relay subscription")
+    watchdog_stop = None
+    if getattr(args, "supervised", False):
+        # #158 inc2: only under a KeepAlive restarter (launchd/systemd) is
+        # os._exit-on-stall safe -- it becomes a clean restart. --supervised is
+        # set by `mesh watch-install`'s unit, never by a bare hand-run watch.
+        _write_recv_heartbeat(cfg, me)  # baseline so the watchdog has a start
+        watchdog_stop = threading.Event()
+        threading.Thread(
+            target=_watch_stall_watchdog, args=(cfg, me, watchdog_stop),
+            daemon=True).start()
+        print(f"MESH_WATCH_SUPERVISED node={_single_line(me)} watchdog armed "
+              f"(os._exit on heartbeat stall >{RECV_STALL_SECONDS}s -> KeepAlive "
+              f"restart) (#158 inc2)", file=sys.stderr)
     try:
         return _cmd_watch_owned(args, cfg, me)
     except Exception as exc:
@@ -8699,6 +8738,8 @@ def cmd_watch(args):
         _emit_crash_frame(cfg, me, exc)
         raise
     finally:
+        if watchdog_stop is not None:
+            watchdog_stop.set()  # never os._exit during a clean shutdown
         try:
             os.unlink(plock)
         except FileNotFoundError:
@@ -12437,6 +12478,88 @@ def _run_launchctl(command, operation, backend, absent_ok=False,
     sys.exit(f"error: launchctl {operation} {backend}: {detail}")
 
 
+def _watch_agent_label(me):
+    return "cloud.a2acast.watch." + re.sub(r"[^A-Za-z0-9._-]", "_", str(me))
+
+
+def _watch_launch_agent_value(cfg, me, mesh_exe):
+    """#158 inc2: launchd plist for an always-on, self-healing supervised
+    receiver. KeepAlive restarts it whenever the watchdog exits on a stall."""
+    mesh_exe = _absolute_managed_path(mesh_exe, "mesh executable")
+    config_path = _absolute_managed_path(
+        os.path.realpath(cfg.get("_path", "")), "mesh config")
+    working = _absolute_managed_path(
+        os.path.realpath(cfg.get("_dir", "")), "mesh directory")
+    value = {
+        "Label": _watch_agent_label(me),
+        "ProgramArguments": [mesh_exe, "watch", "--supervised", "--follow",
+                             "--as", str(me)],
+        "EnvironmentVariables": {
+            "A2ACAST_CONFIG": config_path,
+            "PATH": os.pathsep.join([
+                os.path.join(os.path.expanduser("~"), ".local", "bin"),
+                "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"]),
+            "HOME": os.path.expanduser("~"),
+            "LANG": os.environ.get("LANG", "en_US.UTF-8"),
+        },
+        "RunAtLoad": True,
+        "KeepAlive": True,
+        "ThrottleInterval": 15,
+        "StandardOutPath": os.devnull,
+        "StandardErrorPath": os.devnull,
+        "WorkingDirectory": working,
+    }
+    if _contains_config_secret(cfg, value):
+        raise ValueError("watch launch agent must not contain the mesh shared key")
+    return value
+
+
+def cmd_watch_install(args):
+    """#158 inc2: install the always-on self-healing receiver. macOS -> a
+    launchd KeepAlive agent (turnkey, survives reboot). Elsewhere -> print the
+    supervised-watch command to run under the node's own restarter (systemd
+    Restart=always, or `while true; do <cmd>; sleep 2; done`), matching the
+    pool convention. The watchdog exits on a stall; the restarter revives it."""
+    cfg = load_config()
+    me = my_node(cfg, args.as_node)
+    mesh_exe = shutil.which("mesh") or os.path.realpath(sys.argv[0])
+    if sys.platform != "darwin":
+        program = shlex.join([mesh_exe, "watch", "--supervised", "--follow",
+                              "--as", str(me)])
+        if getattr(args, "uninstall", False):
+            print("# stop your restarter for this command:")
+            print("#   " + program)
+            return
+        print("# a2acast self-healing receiver for node "
+              f"'{_single_line(me)}' -- run under a restarter that revives it")
+        print("# on exit (systemd Restart=always, or a shell restart loop):")
+        print(program)
+        print("#   e.g.  while true; do " + program + "; sleep 2; done")
+        return
+    label = _watch_agent_label(me)
+    directory = _absolute_managed_path(
+        _launch_agents_directory(), "current-user LaunchAgents")
+    path = os.path.join(directory, label + ".plist")
+    domain = f"gui/{os.getuid()}"
+    if getattr(args, "uninstall", False):
+        _run_launchctl(["launchctl", "bootout", f"{domain}/{label}"],
+                       "bootout", "watch", absent_ok=True)
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+        print(f"uninstalled self-healing receiver agent {label}")
+        return
+    payload = plistlib.dumps(_watch_launch_agent_value(cfg, me, mesh_exe),
+                             fmt=plistlib.FMT_XML)
+    _atomic_write_private_bytes(path, payload, "watch launch agent")
+    _run_launchctl(["launchctl", "bootout", f"{domain}/{label}"],
+                   "bootout", "watch", absent_ok=True)
+    _run_launchctl(["launchctl", "bootstrap", domain, path], "bootstrap", "watch")
+    print(f"installed + started {label}: always-on self-healing receiver for "
+          f"'{_single_line(me)}' (launchd KeepAlive; survives reboot). #158 inc2")
+
+
 def cmd_pool_start(_args):
     cfg, pool = _load_pool_lifecycle_context()
     if sys.platform != "darwin":
@@ -13351,8 +13474,25 @@ def main():
     p.add_argument("--timeout", type=int, default=None,
                    help="one-shot mode: exit after the first delivery or "
                         "after N seconds, whichever comes first")
+    p.add_argument("--supervised", action="store_true",
+                   help="#158 inc2: run the stall-watchdog that exits on a "
+                        "stale heartbeat so a KeepAlive unit restarts a wedged "
+                        "receiver. Set by `mesh watch-install`; only safe under "
+                        "an external restarter (never a bare hand-run).")
     p.add_argument("--as", dest="as_node", default=None)
     p.set_defaults(fn=cmd_watch)
+
+    p = sub.add_parser("watch-install",
+                       help="#158 inc2: install an always-on self-healing "
+                            "receiver. macOS: a launchd KeepAlive agent that "
+                            "restarts the supervised watcher on any stall + "
+                            "survives reboot. Other OS: prints the command to "
+                            "run under your own restarter (systemd/restart-loop).")
+    p.add_argument("--uninstall", action="store_true",
+                   help="remove the launchd agent (macOS) / print the command "
+                        "to stop (other OS)")
+    p.add_argument("--as", dest="as_node", default=None)
+    p.set_defaults(fn=cmd_watch_install)
 
     delivery_hooks = {"claude": cmd_claude_hook, "codex": cmd_codex_hook,
                       "copilot": cmd_copilot_hook}
