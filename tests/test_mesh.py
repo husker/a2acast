@@ -17321,5 +17321,57 @@ class AdoptExecB2b2aTests(unittest.TestCase):
         self.assertIn("exec not enabled", err)
 
 
+class WatchdogSupervisorTests(unittest.TestCase):
+    """#158 increment-2: the supervised-watch stall-watchdog exits on a stale
+    heartbeat so a KeepAlive unit restarts a wedged receiver — the catch-all
+    that recovers ANY stall (read/consumer/wake) the in-process fix can't."""
+
+    def _cfg(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        return make_cfg(tmp.name)
+
+    def test_should_exit_only_when_stale(self):
+        # Load-bearing guard: exit ONLY on a stale heartbeat, never a fresh one.
+        # Drop the `== 'stalled'` check and a healthy receiver gets killed.
+        cfg = self._cfg()
+        base = 1_000_000
+        mesh._write_recv_heartbeat(cfg, "n1", now=base)
+        self.assertFalse(mesh._watchdog_should_exit(cfg, "n1", now=base + 10))
+        self.assertTrue(mesh._watchdog_should_exit(
+            cfg, "n1", now=base + mesh.RECV_STALL_SECONDS + 60))
+
+    def test_thread_fires_on_stale_heartbeat(self):
+        cfg = self._cfg()
+        mesh._write_recv_heartbeat(
+            cfg, "n1", now=int(time.time()) - (mesh.RECV_STALL_SECONDS + 60))
+        fired = threading.Event()
+        stop = threading.Event()
+
+        def on_stall():
+            fired.set()
+            stop.set()
+
+        t = threading.Thread(
+            target=mesh._watch_stall_watchdog, args=(cfg, "n1", stop),
+            kwargs={"interval": 0.01, "on_stall": on_stall}, daemon=True)
+        t.start()
+        self.assertTrue(fired.wait(timeout=3), "watchdog did not fire on stall")
+        t.join(timeout=2)
+
+    def test_thread_leaves_healthy_receiver_alone(self):
+        cfg = self._cfg()
+        mesh._write_recv_heartbeat(cfg, "n1")  # fresh (real clock)
+        fired = threading.Event()
+        stop = threading.Event()
+        t = threading.Thread(
+            target=mesh._watch_stall_watchdog, args=(cfg, "n1", stop),
+            kwargs={"interval": 0.01, "on_stall": fired.set}, daemon=True)
+        t.start()
+        self.assertFalse(fired.wait(timeout=0.3), "watchdog killed a healthy node")
+        stop.set()
+        t.join(timeout=2)
+
+
 if __name__ == "__main__":
     unittest.main()

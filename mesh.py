@@ -3777,6 +3777,32 @@ def _receiver_liveness(cfg, node, now=None):
     return ("stalled" if age > RECV_STALL_SECONDS else "healthy", age)
 
 
+def _watchdog_should_exit(cfg, me, now=None):
+    """#158 increment-2: True iff a SUPERVISED receiver's heartbeat is stale
+    enough to warrant a restart. A stale heartbeat means the receiver stopped
+    delivering (read-, consumer-, or wake-blocked); the in-process close-response
+    only recovers the read-blocked case, so the catch-all is to exit and let an
+    external KeepAlive restarter (launchd/systemd) revive a fresh process."""
+    return _receiver_liveness(cfg, me, now=now)[0] == "stalled"
+
+
+def _watch_stall_watchdog(cfg, me, stop, interval=None, on_stall=None):
+    """Background thread for `mesh watch --supervised`: on a stale heartbeat,
+    os._exit so the KeepAlive unit restarts the receiver. Runs in its OWN
+    thread so it fires even while the main receive loop is wedged. `on_stall`
+    is injectable for tests (default os._exit); `stop` ends it cleanly."""
+    interval = interval if interval is not None else max(30, RECV_STALL_SECONDS // 3)
+    on_stall = on_stall or (lambda: os._exit(1))
+    while not stop.wait(interval):
+        if _watchdog_should_exit(cfg, me):
+            print(f"MESH_WATCHDOG_EXIT node={_single_line(me)} reason="
+                  f"receiver heartbeat stale >{RECV_STALL_SECONDS}s; exiting for "
+                  f"KeepAlive restart (#158 inc2)", file=sys.stderr)
+            sys.stderr.flush()
+            on_stall()
+            return
+
+
 PROCESS_POSTURES = ("watch", "hook", "mcp-serve", "mcp", "worker")
 _process_posture = None
 
@@ -8691,6 +8717,19 @@ def cmd_watch(args):
     if plock is None:
         sys.exit(f"error: node '{me}' already has a live presence watcher; "
                  "refusing a second relay subscription")
+    watchdog_stop = None
+    if getattr(args, "supervised", False):
+        # #158 inc2: only under a KeepAlive restarter (launchd/systemd) is
+        # os._exit-on-stall safe -- it becomes a clean restart. --supervised is
+        # set by `mesh watch-install`'s unit, never by a bare hand-run watch.
+        _write_recv_heartbeat(cfg, me)  # baseline so the watchdog has a start
+        watchdog_stop = threading.Event()
+        threading.Thread(
+            target=_watch_stall_watchdog, args=(cfg, me, watchdog_stop),
+            daemon=True).start()
+        print(f"MESH_WATCH_SUPERVISED node={_single_line(me)} watchdog armed "
+              f"(os._exit on heartbeat stall >{RECV_STALL_SECONDS}s -> KeepAlive "
+              f"restart) (#158 inc2)", file=sys.stderr)
     try:
         return _cmd_watch_owned(args, cfg, me)
     except Exception as exc:
@@ -8699,6 +8738,8 @@ def cmd_watch(args):
         _emit_crash_frame(cfg, me, exc)
         raise
     finally:
+        if watchdog_stop is not None:
+            watchdog_stop.set()  # never os._exit during a clean shutdown
         try:
             os.unlink(plock)
         except FileNotFoundError:
@@ -13351,6 +13392,11 @@ def main():
     p.add_argument("--timeout", type=int, default=None,
                    help="one-shot mode: exit after the first delivery or "
                         "after N seconds, whichever comes first")
+    p.add_argument("--supervised", action="store_true",
+                   help="#158 inc2: run the stall-watchdog that exits on a "
+                        "stale heartbeat so a KeepAlive unit restarts a wedged "
+                        "receiver. Set by `mesh watch-install`; only safe under "
+                        "an external restarter (never a bare hand-run).")
     p.add_argument("--as", dest="as_node", default=None)
     p.set_defaults(fn=cmd_watch)
 
