@@ -17180,6 +17180,88 @@ class ReceiverHeartbeatTests(unittest.TestCase):
         self.assertEqual(calls, [1])
 
 
+
+class ReceiverWatchdogTests(unittest.TestCase):
+    """#158 increment 2: the opt-in stall-watchdog that force-re-arms a silently
+    stalled receiver (os._exit -> fresh watcher). Recovers delivery-blocked
+    stalls that closing the socket cannot (lodestar's 4-day case)."""
+
+    def _patch(self, patches):
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+
+    def test_should_exit_healthy_never_fires(self):
+        self.assertFalse(mesh._watchdog_should_exit("healthy", 10 ** 6))
+
+    def test_should_exit_stalled_past_grace(self):
+        self.assertTrue(
+            mesh._watchdog_should_exit("stalled", mesh.RECV_STALL_SECONDS + 1))
+
+    def test_should_exit_unknown_past_grace_is_dead(self):
+        self.assertTrue(
+            mesh._watchdog_should_exit("unknown", mesh.RECV_STALL_SECONDS + 1))
+
+    def test_no_exit_within_startup_grace(self):
+        # a fresh/quiet watcher inside the grace is never killed, even if the
+        # heartbeat reads stale from a prior watcher (leftover-stale guard)
+        self.assertFalse(
+            mesh._watchdog_should_exit("stalled", mesh.RECV_STALL_SECONDS))
+        self.assertFalse(mesh._watchdog_should_exit("unknown", 1))
+
+    def test_opt_in_default_off_starts_nothing(self):
+        before = threading.active_count()
+        self.assertIsNone(mesh._maybe_start_receiver_watchdog(make_cfg(), "n"))
+        self.assertEqual(threading.active_count(), before)
+
+    def test_opt_in_on_starts_watchdog(self):
+        cfg = make_cfg()
+        cfg["receiver_watchdog"] = True
+        self._patch([mock.patch.object(mesh, "_evidence")])
+        stop = mesh._maybe_start_receiver_watchdog(cfg, "n")
+        self.assertIsInstance(stop, threading.Event)
+        stop.set()  # let the daemon exit promptly
+
+    def test_loop_exits_on_stall_past_grace(self):
+        # load-bearing: stalled + past grace -> os._exit(WATCHDOG_EXIT_CODE)
+        exits, stop, calls = [], threading.Event(), [0]
+        def fake_exit(code):
+            exits.append(code)
+            stop.set()
+        def liveness(_cfg, _n, now=None):
+            calls[0] += 1
+            if calls[0] > 5:
+                stop.set()  # safety: never hang even if the decision is broken
+            return ("stalled", 999)
+        self._patch([
+            mock.patch.object(mesh, "_receiver_liveness", side_effect=liveness),
+            mock.patch.object(mesh, "_evidence"),
+            mock.patch.object(mesh.os, "_exit", side_effect=fake_exit),
+            mock.patch.object(mesh, "WATCHDOG_CHECK_SECONDS", 0.01),
+            mock.patch.object(mesh, "RECV_STALL_SECONDS", -1),
+        ])
+        mesh._receiver_watchdog_loop(make_cfg(), "n", stop)
+        self.assertEqual(exits, [mesh.WATCHDOG_EXIT_CODE])
+
+    def test_loop_does_not_exit_while_healthy(self):
+        exits, stop, calls = [], threading.Event(), [0]
+        def liveness(_cfg, _n, now=None):
+            calls[0] += 1
+            if calls[0] >= 3:
+                stop.set()
+            return ("healthy", 5)
+        self._patch([
+            mock.patch.object(mesh, "_receiver_liveness", side_effect=liveness),
+            mock.patch.object(mesh, "_evidence"),
+            mock.patch.object(mesh.os, "_exit",
+                              side_effect=lambda c: exits.append(c)),
+            mock.patch.object(mesh, "WATCHDOG_CHECK_SECONDS", 0.01),
+            mock.patch.object(mesh, "RECV_STALL_SECONDS", -1),
+        ])
+        mesh._receiver_watchdog_loop(make_cfg(), "n", stop)
+        self.assertEqual(exits, [])
+
+
 class AdoptExecB2b2aTests(unittest.TestCase):
     """#62 B2b-2a: `adopt-supervise --exec` REALLY checks out an owner-signed
     SHA on a git working tree, smoke-tests the new code, and LOCALLY rolls back

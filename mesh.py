@@ -134,6 +134,8 @@ RECV_NAME = ".meshwire.recv-{}.json"            # #158: receiver liveness heartb
 # threshold sits above the keepalive interval + generous margin so a healthy
 # but quiet link never reads as stalled.
 RECV_STALL_SECONDS = 300
+WATCHDOG_CHECK_SECONDS = 60     # #158 inc2: how often the stall-watchdog samples the heartbeat
+WATCHDOG_EXIT_CODE = 75         # #158 inc2: distinct exit so a re-arm loop can tell a watchdog-forced exit from a clean one
 EVIDENCE_FILE_MAX = 1024 * 1024                 # rotate to .1 past this (~2MiB)
 BROADCAST = "all"
 # Single source of truth for the running client's version. Must match
@@ -3775,6 +3777,60 @@ def _receiver_liveness(cfg, node, now=None):
         return ("unknown", None)
     age = max(0, now - ts)
     return ("stalled" if age > RECV_STALL_SECONDS else "healthy", age)
+
+
+
+def _watchdog_should_exit(state, armed_for):
+    """#158 inc2: the stall-watchdog fires iff it is past the startup grace
+    (armed longer than RECV_STALL_SECONDS) AND the receiver is no longer
+    'healthy' -- 'stalled' (delivered then went quiet) or 'unknown' (never
+    delivered at all, past the grace = also dead). Pure + unit-tested."""
+    return armed_for > RECV_STALL_SECONDS and state != "healthy"
+
+
+def _receiver_watchdog_loop(cfg, node, stop_event):
+    """#158 increment 2 (opt-in, default-OFF): bound a silent receiver stall to
+    ~RECV_STALL_SECONDS + one check interval, regardless of root cause. Samples
+    the #161 heartbeat; once past a startup grace, if the watcher is no longer
+    'healthy' (held its relay subscription but stopped delivering -- read-blocked
+    OR delivery-blocked, the latter NOT recoverable by closing the socket) it
+    logs loudly and os._exit()s so the process manager re-arms a FRESH watcher.
+
+    os._exit (not sys.exit / a stop flag) because the main thread may be blocked
+    in a read or parked at a `yield` and would never observe an exception. A
+    healthy watcher refreshes on every keepalive (well under the threshold), so
+    it never trips; the grace lets a fresh watcher establish a heartbeat -- and
+    a leftover-stale heartbeat from a prior watcher be refreshed -- first."""
+    armed_at = time.time()
+    while not stop_event.wait(WATCHDOG_CHECK_SECONDS):
+        state, age = _receiver_liveness(cfg, node)
+        if _watchdog_should_exit(state, time.time() - armed_at):
+            _evidence(
+                f"MESH_WATCHDOG_STALL_EXIT node={node} state={state} "
+                f"last_delivery={age if age is not None else 'never'}s "
+                f"(> {RECV_STALL_SECONDS}s) -- receiver held its subscription "
+                f"but stopped delivering; forcing a fresh re-arm "
+                f"(#158 increment 2)")
+            os._exit(WATCHDOG_EXIT_CODE)
+
+
+def _maybe_start_receiver_watchdog(cfg, node, stop_event=None):
+    """Start the #158 increment-2 stall-watchdog IFF the owner opted in
+    (`receiver_watchdog`, default OFF -- this consequential os._exit behaviour
+    lands DORMANT so each topology verifies its re-arm before enabling). Pass an
+    existing stop_event to tie the watchdog to a caller's lifecycle (mcp-serve
+    passes self._stop); otherwise a fresh one is returned for the caller to set
+    on exit. Returns the stop_event, or None if not started."""
+    if not cfg.get("receiver_watchdog"):
+        return None
+    stop_event = stop_event if stop_event is not None else threading.Event()
+    threading.Thread(target=_receiver_watchdog_loop,
+                     args=(cfg, node, stop_event), daemon=True,
+                     name="a2acast-receiver-watchdog").start()
+    _evidence(f"MESH_WATCHDOG_ARMED node={node} check={WATCHDOG_CHECK_SECONDS}s "
+              f"stall={RECV_STALL_SECONDS}s exit_code={WATCHDOG_EXIT_CODE} "
+              f"(#158 increment 2)")
+    return stop_event
 
 
 PROCESS_POSTURES = ("watch", "hook", "mcp-serve", "mcp", "worker")
@@ -8691,6 +8747,9 @@ def cmd_watch(args):
     if plock is None:
         sys.exit(f"error: node '{me}' already has a live presence watcher; "
                  "refusing a second relay subscription")
+    _wd_stop = (_maybe_start_receiver_watchdog(cfg, me)
+                if (args.follow or args.timeout is None
+                    or (args.timeout or 0) > RECV_STALL_SECONDS) else None)
     try:
         return _cmd_watch_owned(args, cfg, me)
     except Exception as exc:
@@ -8699,6 +8758,8 @@ def cmd_watch(args):
         _emit_crash_frame(cfg, me, exc)
         raise
     finally:
+        if _wd_stop is not None:
+            _wd_stop.set()
         try:
             os.unlink(plock)
         except FileNotFoundError:
@@ -9446,6 +9507,7 @@ class MeshMCPServer:
                 break
             if self._stop.wait(min(MESH_MCP_STOP_POLL_INTERVAL, remaining)):
                 return
+        _maybe_start_receiver_watchdog(cfg, me, stop_event=self._stop)
         backoff = 1
         while not self._stop.is_set():
             try:
