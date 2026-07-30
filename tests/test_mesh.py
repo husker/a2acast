@@ -17060,5 +17060,86 @@ class StdlibOnlyTests(unittest.TestCase):
             f"mesh.py imports non-stdlib module(s): {sorted(bad)}")
 
 
+class ReceiverHeartbeatTests(unittest.TestCase):
+    """#158: a long-lived watcher leaves a durable last-received heartbeat, so a
+    silent stall (holds the subscription, stops delivering) becomes witnessable
+    instead of invisible for hours."""
+
+    def _cfg(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        return make_cfg(tmp.name)
+
+    # Time-dependent tests pass an explicit `now` to both write and read so they
+    # never depend on the ambient clock (hermetic — immune to a leaked time
+    # monkeypatch from another test in the suite).
+    def test_heartbeat_roundtrip_reads_healthy(self):
+        cfg = self._cfg()
+        base = 1_000_000
+        mesh._write_recv_heartbeat(cfg, "n1", now=base)
+        live, age = mesh._receiver_liveness(cfg, "n1", now=base + 2)
+        self.assertEqual(live, "healthy")
+        self.assertEqual(age, 2)
+
+    def test_liveness_unknown_without_heartbeat(self):
+        cfg = self._cfg()
+        self.assertEqual(mesh._receiver_liveness(cfg, "ghost"), ("unknown", None))
+
+    def test_liveness_reports_stall_past_threshold(self):
+        # The load-bearing case: a heartbeat older than RECV_STALL_SECONDS is the
+        # silent stall lighthouse hit (subscription held, delivery ceased). Revert
+        # the threshold check and this reads 'healthy' -> stall stays invisible.
+        cfg = self._cfg()
+        base = 1_000_000
+        mesh._write_recv_heartbeat(cfg, "n1", now=base)
+        live, age = mesh._receiver_liveness(
+            cfg, "n1", now=base + mesh.RECV_STALL_SECONDS + 120)
+        self.assertEqual(live, "stalled")
+        self.assertGreater(age, mesh.RECV_STALL_SECONDS)
+
+    def test_liveness_fresh_just_under_threshold(self):
+        cfg = self._cfg()
+        base = 1_000_000
+        mesh._write_recv_heartbeat(cfg, "n1", now=base)
+        live, _ = mesh._receiver_liveness(
+            cfg, "n1", now=base + mesh.RECV_STALL_SECONDS - 30)
+        self.assertEqual(live, "healthy")
+
+    def test_stream_events_heartbeats_on_keepalive(self):
+        # A keepalive (NOT a message) must still refresh the heartbeat -- that is
+        # how a quiet-but-live link stays healthy, and it is exactly the event
+        # that stopped flowing during the stall. Fails if _stream_events drops
+        # the heartbeat_cb call.
+        cfg = self._cfg()
+        stop = threading.Event()
+        calls = []
+
+        def hb():
+            calls.append(1)
+            stop.set()  # terminate the loop after the first heartbeat
+
+        class _Resp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def __iter__(self):
+                return iter([b'{"event":"keepalive"}\n'])
+
+        orig = mesh.http
+
+        def _no_net(*a, **k):
+            raise OSError("no network in test")
+
+        mesh.http = _no_net  # if the mutation drops hb, the retry dial hits this
+        self.addCleanup(lambda: setattr(mesh, "http", orig))
+        list(mesh._stream_events(cfg, "tpc", str(int(time.time()) - 5),
+                                 deadline=time.time() + 2, first=_Resp(),
+                                 stop_event=stop, heartbeat_cb=hb))
+        self.assertEqual(calls, [1])
+
+
 if __name__ == "__main__":
     unittest.main()
