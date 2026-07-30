@@ -2889,12 +2889,119 @@ def _map_pin_operation(install_type, descriptor):
     return None
 
 
-def _adopt_supervise_once(cfg, install_type=None):
-    """#62 B2b-1 (DRY-RUN): process pending adoptions -- re-verify owner
-    provenance, detect + map the install operation, and LOG what it WOULD run
-    (MESH_ADOPT_WOULDEXEC) or why it refuses. Runs NO package manager, installs
-    NOTHING, cycles nothing, and does not mutate the pending store (B2b-2 flips
-    on the real exec + lifecycle). Returns the count of pending records seen."""
+# #62 B2b-2a: the ONLY install types that get a REAL exec in this slice -- a
+# git WORKING TREE we can checkout in place. uv-tool-git (needs a uv reinstall)
+# and pip/pipx/uv-tool-pypi stay dry-run until their own validated slices.
+_GIT_TREE_TYPES = frozenset({"source-clone", "editable"})
+
+
+def _mesh_git_tree(module=None):
+    """The git working-tree root that mesh.py runs from, or None. Walks up from
+    mesh's __file__ looking for a .git dir -- a source-clone/editable install."""
+    start = module or getattr(sys.modules.get("mesh"), "__file__", None) or __file__
+    d = os.path.dirname(os.path.abspath(start))
+    for _ in range(40):
+        if os.path.isdir(os.path.join(d, ".git")):
+            return d
+        parent = os.path.dirname(d)
+        if parent == d:
+            return None
+        d = parent
+    return None
+
+
+def _run_git(tree, args, timeout=120):
+    """Run `git -C <tree> <args>` with no shell. Returns (rc, stdout, stderr);
+    rc=-1 on a launch/timeout failure. Never raises into the exec loop."""
+    try:
+        p = subprocess.run(["git", "-C", tree] + list(args),
+                           capture_output=True, text=True, timeout=timeout)
+        return p.returncode, (p.stdout or "").strip(), (p.stderr or "").strip()
+    except (OSError, subprocess.SubprocessError):
+        return -1, "", "git launch/timeout failure"
+
+
+def _adopt_smoke_ok(tree):
+    """Does the NEW code on disk actually come up? Import mesh from the checked-
+    out tree in a fresh interpreter -- catches syntax/import errors (a won't-
+    start release) synchronously, so we can roll back before trusting it. This
+    is the B2b-2a floor; the cross-cycle 'received a frame' self-test is
+    increment-2 (and #158's heartbeat already makes a receive-breaker visible)."""
+    try:
+        p = subprocess.run(
+            [sys.executable, "-c",
+             "import sys; sys.path.insert(0, sys.argv[1]); import mesh", tree],
+            capture_output=True, text=True, timeout=60)
+        return p.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def _adopt_exec_git_tree(cfg, nonce, rec, descriptor, tree=None):
+    """#62 B2b-2a REAL EXEC for a git working tree. Ordered for safety:
+    fetch+verify the owner-signed SHA BEFORE any swap; record `previous` HEAD
+    locally (rollback needs no network); atomic checkout; synchronous smoke
+    test; LOCAL rollback on won't-start; mark applied/failed (no loop-retry --
+    a fresh owner approval is the redo path). Mutates the pending record in-
+    place; the caller persists. Returns True iff the new version is applied."""
+    tag = _single_line(str(nonce))[:16]
+    version = _single_line(str(descriptor.get("version")))[:40]
+    sha = _single_line(str(descriptor.get("artifact"))).strip()
+    if tree is None:
+        tree = _mesh_git_tree()
+
+    def fail(reason):
+        rec["status"] = "failed"
+        print(f"MESH_ADOPT_FAILED nonce={tag} version={version} "
+              f"reason={_single_line(reason)} (#62 B2b-2a)", file=sys.stderr)
+        return False
+
+    if not tree:
+        return fail("no git working tree for this mesh (not source-clone)")
+    if not re.fullmatch(r"[0-9a-fA-F]{7,64}", sha):
+        return fail("artifact pin is not a git SHA")
+    # Fetch is best-effort (the SHA may already be local); the verify is the gate.
+    _run_git(tree, ["fetch", "--quiet", "--all"], timeout=120)
+    rc, _, _ = _run_git(tree, ["cat-file", "-e", sha + "^{commit}"])
+    if rc != 0:
+        return fail("owner-signed SHA does not resolve to a commit; NOT checked out")
+    rc, prev, err = _run_git(tree, ["rev-parse", "HEAD"])
+    if rc != 0 or not prev:
+        return fail("cannot read current HEAD to record a rollback point")
+    rec["previous_ref"] = prev  # LOCAL rollback target, recorded BEFORE mutation
+    print(f"MESH_ADOPT_EXEC nonce={tag} version={version} "
+          f"install_type=git-tree op=[git checkout {sha}] previous={prev[:12]} "
+          f"(#62 B2b-2a)", file=sys.stderr)
+    rc, _, err = _run_git(tree, ["checkout", "--quiet", sha])
+    if rc != 0:
+        return fail(f"git checkout failed (tree untouched): {err[:120]}")
+    if not _adopt_smoke_ok(tree):
+        rrc, _, rerr = _run_git(tree, ["checkout", "--quiet", prev])
+        if rrc != 0:
+            print(f"MESH_ADOPT_ROLLBACK_FAILED nonce={tag} could NOT restore "
+                  f"{prev[:12]}: {_single_line(rerr)[:120]} -- MANUAL RECOVERY "
+                  f"NEEDED (#62 B2b-2a)", file=sys.stderr)
+            return fail("new version won't start AND rollback failed")
+        print(f"MESH_ADOPT_ROLLED_BACK nonce={tag} version={version} reason="
+              f"new code failed to import; restored {prev[:12]} locally "
+              f"(#62 B2b-2a)", file=sys.stderr)
+        return fail("new version failed the smoke test; rolled back")
+    rec["status"] = "applied"
+    rec["applied_ref"] = sha
+    print(f"MESH_ADOPT_APPLIED nonce={tag} version={version} sha={sha[:12]} "
+          f"-- new code imports; live on next receiver cycle. mesh status shows "
+          f"receiver liveness (#158) (#62 B2b-2a)", file=sys.stderr)
+    return True
+
+
+def _adopt_supervise_once(cfg, install_type=None, exec_mode=False):
+    """#62 B2b: process pending adoptions -- re-verify owner provenance, detect
+    + map the install operation. exec_mode=False (DRY-RUN, the default): LOG
+    what it WOULD run (MESH_ADOPT_WOULDEXEC), touch nothing. exec_mode=True
+    (B2b-2a): for a git WORKING TREE (source-clone/editable) actually
+    fetch-verify + checkout the owner-signed SHA, smoke-test, and locally roll
+    back a won't-start version; ALL other install types stay dry-run (their own
+    validated slices). Returns the count of pending records seen."""
     try:
         pending = _load_json_regular(
             _adopt_pending_file(cfg), require_private=False,
@@ -2906,6 +3013,7 @@ def _adopt_supervise_once(cfg, install_type=None):
     if install_type is None:
         install_type = _detect_install_type()
     seen = 0
+    mutated = False
     for nonce, rec in pending.items():
         if not isinstance(rec, dict) or rec.get("status") != "pending":
             continue
@@ -2933,21 +3041,41 @@ def _adopt_supervise_once(cfg, install_type=None):
         if op is None:
             print(f"MESH_ADOPT_REFUSED version={version} "
                   f"install_type={install_type or 'unknown'} reason=cannot map "
-                  f"the artifact pin to a known operation (#62 B2b-1)",
+                  f"the artifact pin to a known operation (#62 B2b)",
                   file=sys.stderr)
             continue
-        print(f"MESH_ADOPT_WOULDEXEC version={version} "
-              f"install_type={install_type} op=[{op}] -- DRY-RUN, owner-"
-              f"verified; NO install run (#62 B2b-1)", file=sys.stderr)
+        if exec_mode and install_type in _GIT_TREE_TYPES:
+            _adopt_exec_git_tree(cfg, nonce, rec, descriptor)  # sets rec status
+            mutated = True
+        elif exec_mode:
+            print(f"MESH_ADOPT_WOULDEXEC version={version} "
+                  f"install_type={install_type} op=[{op}] -- exec not enabled "
+                  f"for this install type in B2b-2a (git working tree only); "
+                  f"NO install run (#62 B2b-2a)", file=sys.stderr)
+        else:
+            print(f"MESH_ADOPT_WOULDEXEC version={version} "
+                  f"install_type={install_type} op=[{op}] -- DRY-RUN, owner-"
+                  f"verified; NO install run (#62 B2b-1)", file=sys.stderr)
+    if mutated:
+        try:
+            _write_json_secure(_adopt_pending_file(cfg), pending)
+        except OSError as exc:
+            print(f"MESH_ADOPT_WARN could not persist pending store: "
+                  f"{_single_line(str(exc))[:80]} (#62 B2b-2a)", file=sys.stderr)
     return seen
 
 
 def cmd_adopt_supervise(args):
     cfg = load_config()
-    seen = _adopt_supervise_once(cfg)
+    exec_mode = bool(getattr(args, "exec", False))
+    if exec_mode:
+        print("MESH_ADOPT_EXEC_MODE on -- will actually checkout owner-signed "
+              "SHAs on a git working tree (#62 B2b-2a). Other install types stay "
+              "dry-run.", file=sys.stderr)
+    seen = _adopt_supervise_once(cfg, exec_mode=exec_mode)
     if not seen:
-        print("no pending adoptions (#62 B2b-1 dry-run: nothing to inspect)",
-              file=sys.stderr)
+        mode = "B2b-2a exec" if exec_mode else "B2b-1 dry-run"
+        print(f"no pending adoptions ({mode}: nothing to do)", file=sys.stderr)
 
 
 CERT_TTL_DEFAULT = 365 * 86400
@@ -13422,10 +13550,15 @@ def main():
     p.set_defaults(fn=cmd_codex_supervise)
 
     p = sub.add_parser("adopt-supervise",
-                       help="#62 B2b-1 (DRY-RUN): inspect pending owner-signed "
-                            "adoptions and log the upgrade operation each WOULD "
-                            "run -- verifies + detects install type + maps, but "
-                            "runs NOTHING (no install, no cycle)")
+                       help="#62 B2b: inspect pending owner-signed adoptions. "
+                            "Default DRY-RUN (log the upgrade each WOULD run). "
+                            "With --exec (B2b-2a), actually checkout the owner-"
+                            "signed SHA on a git working tree + smoke-test + "
+                            "local-rollback; other install types stay dry-run.")
+    p.add_argument("--exec", action="store_true",
+                   help="#62 B2b-2a: really run the git-working-tree upgrade "
+                        "(opt-in; default is dry-run). Only source-clone/"
+                        "editable installs exec; all others stay dry-run.")
     p.set_defaults(fn=cmd_adopt_supervise)
 
     p = sub.add_parser(

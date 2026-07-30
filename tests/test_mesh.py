@@ -17180,5 +17180,146 @@ class ReceiverHeartbeatTests(unittest.TestCase):
         self.assertEqual(calls, [1])
 
 
+class AdoptExecB2b2aTests(unittest.TestCase):
+    """#62 B2b-2a: `adopt-supervise --exec` REALLY checks out an owner-signed
+    SHA on a git working tree, smoke-tests the new code, and LOCALLY rolls back
+    a won't-start version. Only source-clone/editable exec; other types dry-run."""
+
+    @classmethod
+    def setUpClass(cls):
+        if not shutil.which("git"):
+            raise unittest.SkipTest("git unavailable")
+
+    _ENV = None
+
+    def _git(self, repo, *args):
+        env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t",
+                   GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t")
+        return subprocess.run(["git", "-C", repo, *args],
+                              capture_output=True, text=True, env=env)
+
+    def _repo(self, commits):
+        # commits: list of mesh.py contents; returns (repo_path, [shas]).
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        repo = tmp.name
+        self._git(repo, "init", "-q")
+        self._git(repo, "checkout", "-q", "-b", "main")
+        shas = []
+        for content in commits:
+            with open(os.path.join(repo, "mesh.py"), "w") as f:
+                f.write(content)
+            self._git(repo, "add", "-A")
+            self._git(repo, "commit", "-q", "-m", "c")
+            shas.append(self._git(repo, "rev-parse", "HEAD").stdout.strip())
+        return repo, shas
+
+    def _rec(self, sha, version="0.19.0"):
+        return {"token": "t", "descriptor": {
+            "action": "adopt-release", "version": version,
+            "artifact": sha, "nonce": "n"}, "previous": "0.18.0",
+            "status": "pending"}
+
+    def _head(self, repo):
+        return self._git(repo, "rev-parse", "HEAD").stdout.strip()
+
+    def test_exec_checks_out_owner_signed_sha(self):
+        good = "VERSION = 'x'\n"
+        repo, shas = self._repo([good, good + "# c2\n"])
+        self._git(repo, "checkout", "-q", shas[0])  # start on c1, adopt c2
+        rec = self._rec(shas[1])
+        with contextlib.redirect_stderr(io.StringIO()):
+            ok = mesh._adopt_exec_git_tree(make_cfg(), "n", rec,
+                                           rec["descriptor"], tree=repo)
+        self.assertTrue(ok)
+        self.assertEqual(rec["status"], "applied")
+        self.assertEqual(self._head(repo), shas[1])
+
+    def test_exec_rolls_back_broken_new_code(self):
+        # The load-bearing safety case: the adopted commit won't import ->
+        # smoke test fails -> local rollback restores the prior HEAD, status
+        # failed. Drop the smoke-test+rollback and a broken version sticks.
+        good = "VERSION = 'x'\n"
+        broken = "def (  # deliberate syntax error\n"
+        repo, shas = self._repo([good, broken])
+        self._git(repo, "checkout", "-q", shas[0])
+        rec = self._rec(shas[1])
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            ok = mesh._adopt_exec_git_tree(make_cfg(), "n", rec,
+                                           rec["descriptor"], tree=repo)
+        self.assertFalse(ok)
+        self.assertEqual(rec["status"], "failed")
+        self.assertIn("MESH_ADOPT_ROLLED_BACK", err.getvalue())
+        self.assertEqual(self._head(repo), shas[0])  # restored to the good commit
+
+    def test_exec_refuses_unknown_sha_without_checkout(self):
+        repo, shas = self._repo(["VERSION = 'x'\n"])
+        rec = self._rec("deadbeef" * 5)  # 40 hex, absent from the repo
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            ok = mesh._adopt_exec_git_tree(make_cfg(), "n", rec,
+                                           rec["descriptor"], tree=repo)
+        self.assertFalse(ok)
+        self.assertIn("does not resolve", err.getvalue())
+        self.assertEqual(self._head(repo), shas[0])  # HEAD never moved
+
+    def test_exec_refuses_non_sha_artifact(self):
+        repo, shas = self._repo(["VERSION = 'x'\n"])
+        rec = self._rec("not-a-sha!!")
+        with contextlib.redirect_stderr(io.StringIO()):
+            ok = mesh._adopt_exec_git_tree(make_cfg(), "n", rec,
+                                           rec["descriptor"], tree=repo)
+        self.assertFalse(ok)
+        self.assertEqual(rec["status"], "failed")
+
+    # --- routing: exec only fires for git-tree types with --exec ---
+    def _routing_case(self, install_type, exec_mode):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        if not shutil.which("ssh-keygen"):
+            raise unittest.SkipTest("ssh-keygen unavailable")
+        cfg = make_cfg(tmp.name)
+        cfg["act_on_approvals"] = True
+        with contextlib.redirect_stdout(io.StringIO()):
+            mesh._owner_init(cfg, allow_unprotected=True)
+        d = {"action": "adopt-release", "version": "0.19.0",
+             "artifact": "a" * 40, "nonce": secrets.token_hex(16)}
+        token = mesh._approve_descriptor(cfg, d)
+        with contextlib.redirect_stderr(io.StringIO()):
+            mesh._handle_control(cfg, "me", "imac",
+                                 {"mw": "approval", "token": token,
+                                  "descriptor": d})
+        called = []
+        orig = mesh._adopt_exec_git_tree
+
+        def _stub(_cfg, _nonce, rec, _desc, tree=None):
+            called.append(1)
+            rec["status"] = "applied"
+            return True
+
+        mesh._adopt_exec_git_tree = _stub
+        self.addCleanup(lambda: setattr(mesh, "_adopt_exec_git_tree", orig))
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            mesh._adopt_supervise_once(cfg, install_type=install_type,
+                                       exec_mode=exec_mode)
+        return bool(called), err.getvalue()
+
+    def test_supervise_execs_git_tree_when_enabled(self):
+        called, _ = self._routing_case("source-clone", exec_mode=True)
+        self.assertTrue(called)
+
+    def test_supervise_default_is_dryrun_no_exec(self):
+        called, err = self._routing_case("source-clone", exec_mode=False)
+        self.assertFalse(called)
+        self.assertIn("DRY-RUN", err)
+
+    def test_supervise_exec_pkg_type_stays_dryrun(self):
+        called, err = self._routing_case("pip", exec_mode=True)
+        self.assertFalse(called)  # pip is not a git-tree type
+        self.assertIn("exec not enabled", err)
+
+
 if __name__ == "__main__":
     unittest.main()
