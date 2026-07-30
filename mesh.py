@@ -12478,6 +12478,88 @@ def _run_launchctl(command, operation, backend, absent_ok=False,
     sys.exit(f"error: launchctl {operation} {backend}: {detail}")
 
 
+def _watch_agent_label(me):
+    return "cloud.a2acast.watch." + re.sub(r"[^A-Za-z0-9._-]", "_", str(me))
+
+
+def _watch_launch_agent_value(cfg, me, mesh_exe):
+    """#158 inc2: launchd plist for an always-on, self-healing supervised
+    receiver. KeepAlive restarts it whenever the watchdog exits on a stall."""
+    mesh_exe = _absolute_managed_path(mesh_exe, "mesh executable")
+    config_path = _absolute_managed_path(
+        os.path.realpath(cfg.get("_path", "")), "mesh config")
+    working = _absolute_managed_path(
+        os.path.realpath(cfg.get("_dir", "")), "mesh directory")
+    value = {
+        "Label": _watch_agent_label(me),
+        "ProgramArguments": [mesh_exe, "watch", "--supervised", "--follow",
+                             "--as", str(me)],
+        "EnvironmentVariables": {
+            "A2ACAST_CONFIG": config_path,
+            "PATH": os.pathsep.join([
+                os.path.join(os.path.expanduser("~"), ".local", "bin"),
+                "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"]),
+            "HOME": os.path.expanduser("~"),
+            "LANG": os.environ.get("LANG", "en_US.UTF-8"),
+        },
+        "RunAtLoad": True,
+        "KeepAlive": True,
+        "ThrottleInterval": 15,
+        "StandardOutPath": os.devnull,
+        "StandardErrorPath": os.devnull,
+        "WorkingDirectory": working,
+    }
+    if _contains_config_secret(cfg, value):
+        raise ValueError("watch launch agent must not contain the mesh shared key")
+    return value
+
+
+def cmd_watch_install(args):
+    """#158 inc2: install the always-on self-healing receiver. macOS -> a
+    launchd KeepAlive agent (turnkey, survives reboot). Elsewhere -> print the
+    supervised-watch command to run under the node's own restarter (systemd
+    Restart=always, or `while true; do <cmd>; sleep 2; done`), matching the
+    pool convention. The watchdog exits on a stall; the restarter revives it."""
+    cfg = load_config()
+    me = my_node(cfg, args.as_node)
+    mesh_exe = shutil.which("mesh") or os.path.realpath(sys.argv[0])
+    if sys.platform != "darwin":
+        program = shlex.join([mesh_exe, "watch", "--supervised", "--follow",
+                              "--as", str(me)])
+        if getattr(args, "uninstall", False):
+            print("# stop your restarter for this command:")
+            print("#   " + program)
+            return
+        print("# a2acast self-healing receiver for node "
+              f"'{_single_line(me)}' -- run under a restarter that revives it")
+        print("# on exit (systemd Restart=always, or a shell restart loop):")
+        print(program)
+        print("#   e.g.  while true; do " + program + "; sleep 2; done")
+        return
+    label = _watch_agent_label(me)
+    directory = _absolute_managed_path(
+        _launch_agents_directory(), "current-user LaunchAgents")
+    path = os.path.join(directory, label + ".plist")
+    domain = f"gui/{os.getuid()}"
+    if getattr(args, "uninstall", False):
+        _run_launchctl(["launchctl", "bootout", f"{domain}/{label}"],
+                       "bootout", "watch", absent_ok=True)
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+        print(f"uninstalled self-healing receiver agent {label}")
+        return
+    payload = plistlib.dumps(_watch_launch_agent_value(cfg, me, mesh_exe),
+                             fmt=plistlib.FMT_XML)
+    _atomic_write_private_bytes(path, payload, "watch launch agent")
+    _run_launchctl(["launchctl", "bootout", f"{domain}/{label}"],
+                   "bootout", "watch", absent_ok=True)
+    _run_launchctl(["launchctl", "bootstrap", domain, path], "bootstrap", "watch")
+    print(f"installed + started {label}: always-on self-healing receiver for "
+          f"'{_single_line(me)}' (launchd KeepAlive; survives reboot). #158 inc2")
+
+
 def cmd_pool_start(_args):
     cfg, pool = _load_pool_lifecycle_context()
     if sys.platform != "darwin":
@@ -13399,6 +13481,18 @@ def main():
                         "an external restarter (never a bare hand-run).")
     p.add_argument("--as", dest="as_node", default=None)
     p.set_defaults(fn=cmd_watch)
+
+    p = sub.add_parser("watch-install",
+                       help="#158 inc2: install an always-on self-healing "
+                            "receiver. macOS: a launchd KeepAlive agent that "
+                            "restarts the supervised watcher on any stall + "
+                            "survives reboot. Other OS: prints the command to "
+                            "run under your own restarter (systemd/restart-loop).")
+    p.add_argument("--uninstall", action="store_true",
+                   help="remove the launchd agent (macOS) / print the command "
+                        "to stop (other OS)")
+    p.add_argument("--as", dest="as_node", default=None)
+    p.set_defaults(fn=cmd_watch_install)
 
     delivery_hooks = {"claude": cmd_claude_hook, "codex": cmd_codex_hook,
                       "copilot": cmd_copilot_hook}

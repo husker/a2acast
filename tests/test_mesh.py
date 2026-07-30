@@ -17373,5 +17373,33 @@ class WatchdogSupervisorTests(unittest.TestCase):
         t.join(timeout=2)
 
 
+class WatchInstallTests(unittest.TestCase):
+    """#158 inc2: the always-on self-healing receiver install (the KeepAlive
+    restarter the watchdog relies on)."""
+
+    def test_agent_label_sanitizes_node_name(self):
+        self.assertEqual(mesh._watch_agent_label("a/b c@x"),
+                         "cloud.a2acast.watch.a_b_c_x")
+
+    def test_launch_agent_value_keepalive_supervised_no_secret(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        cfg = make_cfg(tmp.name)
+        exe = os.path.join(tmp.name, "mesh")
+        with open(exe, "w") as f:
+            f.write("#!/x")
+        os.chmod(exe, 0o755)
+        v = mesh._watch_launch_agent_value(cfg, "weenis", exe)
+        # KeepAlive is what makes the watchdog's os._exit a restart, not a death.
+        self.assertTrue(v["KeepAlive"])
+        self.assertTrue(v["RunAtLoad"])
+        self.assertIn("--supervised", v["ProgramArguments"])
+        self.assertIn("--follow", v["ProgramArguments"])
+        # The shared mesh key must never land in a world-loadable launch agent.
+        import plistlib
+        self.assertNotIn(cfg["key"],
+                         plistlib.dumps(v).decode("utf-8", "replace"))
+
+
 if __name__ == "__main__":
     unittest.main()
