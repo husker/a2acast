@@ -126,6 +126,14 @@ REPLAY_REVISIT_THRESHOLD = 20000  # #77: above this, the full-rewrite save is
 # worth measuring (~26ms); surfaced in `mesh status` so the trigger is visible
 STATUS_NAME = ".meshwire.status-{}.json"
 EVIDENCE_NAME = ".meshwire.evidence-{}.log"     # #129: durable Phase-A soak log
+RECV_NAME = ".meshwire.recv-{}.json"            # #158: receiver liveness heartbeat
+# #158: a long-lived watcher refreshes its heartbeat on EVERY relay event
+# (message OR keepalive). ntfy keepalives arrive well inside this window, so a
+# heartbeat older than RECV_STALL_SECONDS means the receiver is holding its
+# subscription but no longer delivering -- the silent-stall failure. The
+# threshold sits above the keepalive interval + generous margin so a healthy
+# but quiet link never reads as stalled.
+RECV_STALL_SECONDS = 300
 EVIDENCE_FILE_MAX = 1024 * 1024                 # rotate to .1 past this (~2MiB)
 BROADCAST = "all"
 # Single source of truth for the running client's version. Must match
@@ -3606,6 +3614,39 @@ def _report_cert_status(cfg, frm, pubkey):
 
 def status_file(cfg, node):
     return os.path.join(cfg["_dir"], STATUS_NAME.format(node))
+
+
+def recv_heartbeat_file(cfg, node):
+    return os.path.join(cfg["_dir"], RECV_NAME.format(node))
+
+
+def _write_recv_heartbeat(cfg, node, now=None):
+    """#158: durable proof the receiver is still DELIVERING, not merely holding
+    its subscription. Refreshed on every relay event (message or keepalive); a
+    stale file is the only externally-visible signal of a silent stall, so this
+    is best-effort and must NEVER raise into the receive loop."""
+    try:
+        _write_json_secure(recv_heartbeat_file(cfg, node),
+                           {"ts": int(time.time()) if now is None else int(now)})
+    except OSError:
+        pass
+
+
+def _receiver_liveness(cfg, node, now=None):
+    """#158: ('healthy'|'stalled'|'unknown', age_seconds|None) read from the
+    heartbeat. 'unknown' = no heartbeat yet (no watcher has run); 'stalled' =
+    a watcher is/was holding the subscription but has not delivered an event in
+    RECV_STALL_SECONDS -- the #158 silent stall, now witnessable."""
+    now = int(time.time()) if now is None else int(now)
+    try:
+        with open(recv_heartbeat_file(cfg, node), "r", encoding="utf-8") as f:
+            ts = json.load(f).get("ts")
+    except (OSError, ValueError):
+        return ("unknown", None)
+    if not isinstance(ts, int):
+        return ("unknown", None)
+    age = max(0, now - ts)
+    return ("stalled" if age > RECV_STALL_SECONDS else "healthy", age)
 
 
 PROCESS_POSTURES = ("watch", "hook", "mcp-serve", "mcp", "worker")
@@ -7665,13 +7706,19 @@ def _relay_time(value, now=None):
 
 
 def _stream_events(cfg, tpc, since, deadline=None, skip=None, first=None,
-                   stop_event=None, response_hook=None):
+                   stop_event=None, response_hook=None, heartbeat_cb=None):
     """Yield ntfy message events from `tpc` until `deadline` (None = forever).
 
     Dedupes via the shared, mutated `skip` set; advances `since` internally
     so reconnects don't replay; backs off 1s→2s→…→30s only when connections
     die fast (<5s). `first` is an optional already-open response consumed
-    before dialing — callers can subscribe before triggering traffic."""
+    before dialing — callers can subscribe before triggering traffic.
+
+    `heartbeat_cb` (#158): called (throttled) on EVERY delivered relay event —
+    keepalive or message — so a long-lived watcher leaves durable proof it is
+    still delivering, not merely holding its subscription. It never fires while
+    the loop is blocked mid-read, so a stale heartbeat is exactly the silent
+    stall this exists to surface."""
     skip = skip if skip is not None else set()
     current_since = _relay_time(since)
     if current_since is None:
@@ -7679,6 +7726,7 @@ def _stream_events(cfg, tpc, since, deadline=None, skip=None, first=None,
         skip.clear()
     since = str(current_since)
     backoff = 1
+    hb_last = 0.0  # #158: throttle heartbeat writes to at most one / 10s
     while ((deadline is None or time.time() < deadline)
            and not (stop_event is not None and stop_event.is_set())):
         chunk = (300 if deadline is None else
@@ -7705,6 +7753,11 @@ def _stream_events(cfg, tpc, since, deadline=None, skip=None, first=None,
                             continue
                         if not isinstance(ev, dict):
                             continue
+                        if heartbeat_cb is not None:  # #158: proof of delivery
+                            _hb_now = time.time()
+                            if _hb_now - hb_last >= 10:
+                                hb_last = _hb_now
+                                heartbeat_cb()
                         if ev.get("event") != "message":
                             backoff = 1  # keepalives prove the link is healthy
                             if deadline and time.time() >= deadline:
@@ -8566,7 +8619,8 @@ def _cmd_watch_owned(args, cfg, me):
 
     sink = getattr(args, "checkpoint_sink", None)
     delivered = False
-    for ev in _stream_events(cfg, tpc, str(since), deadline, skip=skip):
+    for ev in _stream_events(cfg, tpc, str(since), deadline, skip=skip,
+                             heartbeat_cb=lambda: _write_recv_heartbeat(cfg, me)):
         if not isinstance(ev, dict) or not isinstance(ev.get("id"), str):
             continue
         event_time = _relay_time(ev.get("time"))
@@ -9284,7 +9338,8 @@ class MeshMCPServer:
         for ev in _stream_events(
                 cfg, tpc, str(since), None, skip=skip,
                 stop_event=self._stop,
-                response_hook=self._set_active_response):
+                response_hook=self._set_active_response,
+                heartbeat_cb=lambda: _write_recv_heartbeat(cfg, me)):
             if self._stop.is_set():
                 return
             if not isinstance(ev, dict) or not isinstance(
@@ -10557,7 +10612,15 @@ def cmd_status(args):
     print("nodes:")
     for n in cfg["nodes"]:
         if n == me:
-            print(f"  {n}  (this machine)")
+            live, age = _receiver_liveness(cfg, n)  # #158: witness a silent stall
+            if live == "healthy":
+                tag = f", receiver ok (last frame {_ago(int(time.time()) - age)})"
+            elif live == "stalled":
+                tag = (f", receiver STALLED — last frame {_ago(int(time.time()) - age)}"
+                       f"; re-arm the watcher (#158)")
+            else:
+                tag = ", receiver: no active watcher heartbeat"
+            print(f"  {n}  (this machine{tag})")
         elif n in peers:
             posture = peers[n].get("posture")
             shown = (f", posture={_single_line(str(posture))[:24]}"
