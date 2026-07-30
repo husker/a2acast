@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.19.0
+
+Receiver-stall visibility, a Windows signing fix, and the first real-exec slice
+of supervised adoption (dormant, default-off).
+
+- **#158/#161 -- witness silent receiver stalls.** A durable per-node receiver
+  heartbeat (refreshed on every relay event) plus a `mesh status`
+  ok / STALLED / no-heartbeat indicator, so a watcher that holds its
+  subscription but stops delivering is visible instead of silently dark.
+- **#159 -- Windows ssh-keygen override.** `A2ACAST_SSH_KEYGEN` selects the
+  ssh-keygen binary (fail-closed on a bad override), fixing the stock Windows
+  OpenSSH 9.5p2 `-Y sign` ~60s timeout race that degraded frames to unsigned.
+- **#162 -- adopt-supervise `--exec` (#62 B2b-2a), dormant.** An operator
+  running `mesh adopt-supervise --exec` can apply an owner-signed
+  git-working-tree upgrade (fetch-verify the signed SHA, checkout, import
+  smoke-test, local rollback on won't-start). Default dry-run; a received
+  frame never auto-execs.
+
 ## 0.18.0
 
 Owner-signed approvals over the mesh (#62): the "authorize once → every node
