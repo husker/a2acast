@@ -3818,7 +3818,11 @@ def _agent_liveness(cfg, node, now=None):
     now = int(time.time()) if now is None else int(now)
     try:
         with open(agent_heartbeat_file(cfg, node), "r", encoding="utf-8") as f:
-            ts = json.load(f).get("ts")
+            data = json.load(f)
+        # A valid-JSON non-object heartbeat would make .get raise AttributeError
+        # into the read path; gate on the type (parallel to _receiver_liveness,
+        # the #167 seat nit from lodestar).
+        ts = data.get("ts") if isinstance(data, dict) else None
     except (OSError, ValueError, KeyError, TypeError):
         return ("unknown", None)
     if not isinstance(ts, int):

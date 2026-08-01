@@ -9583,6 +9583,14 @@ class AgentLivenessTests(unittest.TestCase):
             f.write("{not json")
         self.assertEqual(mesh._agent_liveness(cfg, "alpha"), ("unknown", None))
 
+    def test_non_object_heartbeat_reads_unknown(self):
+        # parallel to the #167 seat nit (lodestar): a valid-JSON non-object
+        # heartbeat must read unknown, not raise AttributeError from .get.
+        cfg = self._cfg()
+        with open(mesh.agent_heartbeat_file(cfg, "alpha"), "w") as f:
+            f.write("42")
+        self.assertEqual(mesh._agent_liveness(cfg, "alpha"), ("unknown", None))
+
     def test_write_never_raises_without_dir(self):
         # best-effort contract: a cfg with no _dir must not raise into a
         # send/agent path (mirrors the receiver heartbeat's tolerance).
