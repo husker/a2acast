@@ -9544,6 +9544,117 @@ class ActivityFileTests(unittest.TestCase):
         self.assertIn("UNSOLICITED", preview)
 
 
+class AgentLivenessTests(unittest.TestCase):
+    """The agent-turn heartbeat: proof a live AGENT ran here, distinct from the
+    receiver merely holding its subscription. 'unknown' on a healthy receiver is
+    the witnessable presence-without-availability case."""
+
+    def _cfg(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        return make_cfg(tmp.name)
+
+    def test_unknown_without_any_heartbeat(self):
+        cfg = self._cfg()
+        self.assertEqual(mesh._agent_liveness(cfg, "alpha"), ("unknown", None))
+
+    def test_write_then_active_and_records_wake(self):
+        cfg = self._cfg()
+        mesh._write_agent_heartbeat(cfg, "alpha", wake="sampling")
+        state, age = mesh._agent_liveness(cfg, "alpha")
+        self.assertEqual(state, "active")
+        self.assertIsNotNone(age)
+        with open(mesh.agent_heartbeat_file(cfg, "alpha")) as f:
+            self.assertEqual(json.load(f).get("wake"), "sampling")
+
+    def test_idle_past_threshold_active_within(self):
+        cfg = self._cfg()
+        now = 1_000_000
+        mesh._write_agent_heartbeat(cfg, "alpha",
+                                    now=now - mesh.AGENT_IDLE_SECONDS - 1)
+        self.assertEqual(mesh._agent_liveness(cfg, "alpha", now=now)[0], "idle")
+        mesh._write_agent_heartbeat(cfg, "alpha",
+                                    now=now - mesh.AGENT_IDLE_SECONDS + 1)
+        self.assertEqual(mesh._agent_liveness(cfg, "alpha", now=now)[0], "active")
+
+    def test_corrupt_heartbeat_reads_unknown(self):
+        cfg = self._cfg()
+        with open(mesh.agent_heartbeat_file(cfg, "alpha"), "w") as f:
+            f.write("{not json")
+        self.assertEqual(mesh._agent_liveness(cfg, "alpha"), ("unknown", None))
+
+    def test_non_object_heartbeat_reads_unknown(self):
+        # parallel to the #167 seat nit (lodestar): a valid-JSON non-object
+        # heartbeat must read unknown, not raise AttributeError from .get.
+        cfg = self._cfg()
+        with open(mesh.agent_heartbeat_file(cfg, "alpha"), "w") as f:
+            f.write("42")
+        self.assertEqual(mesh._agent_liveness(cfg, "alpha"), ("unknown", None))
+
+    def test_write_never_raises_without_dir(self):
+        # best-effort contract: a cfg with no _dir must not raise into a
+        # send/agent path (mirrors the receiver heartbeat's tolerance).
+        mesh._write_agent_heartbeat({"nodes": []}, "alpha")   # no _dir key
+        self.assertEqual(mesh._agent_liveness({"nodes": []}, "alpha"),
+                         ("unknown", None))
+
+    def test_tool_call_stamps_agent_heartbeat(self):
+        # THE load-bearing test: an MCP tool call is a live agent turn, so it
+        # must stamp the heartbeat. Revert the stamp -> this fails.
+        cfg = self._cfg()
+        self.assertEqual(mesh._agent_liveness(cfg, "alpha")[0], "unknown")
+        srv = mesh.MeshMCPServer(cfg, "alpha", out=lambda s: None)
+        srv._handle_tool_call(1, {"name": "mesh_pending"})
+        self.assertEqual(mesh._agent_liveness(cfg, "alpha")[0], "active")
+
+    def test_sampling_completion_stamps_but_timeout_does_not(self):
+        # A SUCCESSFUL sampling wake (result, no error) means the host ran a
+        # real turn -> stamp.
+        cfg = self._cfg()
+        srv = mesh.MeshMCPServer(cfg, "alpha", out=lambda s: None)
+        srv._sampling_flag.acquire()        # _await_and_refire releases in finally
+        done = threading.Event()
+        done.set()
+        srv._await_and_refire({"event": done, "result": {"role": "assistant"},
+                               "error": None})
+        self.assertEqual(mesh._agent_liveness(cfg, "alpha")[0], "active")
+
+        # A timeout (event never set) means the host never ran -> no stamp.
+        cfg2 = self._cfg()
+        srv2 = mesh.MeshMCPServer(cfg2, "alpha", out=lambda s: None)
+        srv2._sampling_flag.acquire()
+        with mock.patch.object(mesh, "MESH_MCP_SAMPLING_TIMEOUT", 0):
+            srv2._await_and_refire({"event": threading.Event()})   # unset -> False
+        self.assertEqual(mesh._agent_liveness(cfg2, "alpha")[0], "unknown")
+
+    def test_sampling_error_or_empty_does_not_stamp(self):
+        # #170 seat (wayfinder): an error OR empty sampling response sets the
+        # same event as success but means no model turn ran -- must NOT stamp.
+        # Revert to `if event.wait(...)` alone and both of these read active.
+        for holder in (
+            {"event": threading.Event(), "result": None,
+             "error": {"code": -32000, "message": "model unavailable"}},
+            {"event": threading.Event(), "result": None, "error": None},
+        ):
+            cfg = self._cfg()
+            srv = mesh.MeshMCPServer(cfg, "alpha", out=lambda s: None)
+            srv._sampling_flag.acquire()
+            holder["event"].set()
+            srv._await_and_refire(holder)
+            self.assertEqual(mesh._agent_liveness(cfg, "alpha")[0], "unknown")
+
+    def test_write_heartbeat_swallows_unexpected_error(self):
+        # #170 seat (wayfinder): telemetry must NEVER raise into an agent/receive
+        # path -- not only the four named classes. Inject a RuntimeError from the
+        # write; both the helper and the tool-call path must stay intact.
+        cfg = self._cfg()
+        with mock.patch.object(mesh, "_write_json_secure",
+                               side_effect=RuntimeError("disk on fire")):
+            mesh._write_agent_heartbeat(cfg, "alpha", wake="sampling")  # no raise
+            srv = mesh.MeshMCPServer(cfg, "alpha", out=lambda s: None)
+            srv._handle_tool_call(1, {"name": "mesh_pending"})          # no raise
+
+
 class WatchLoopResilienceTests(unittest.TestCase):
     def test_watch_loop_resubscribes_after_unexpected_error(self):
         tmp = tempfile.TemporaryDirectory()
