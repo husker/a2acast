@@ -10917,6 +10917,72 @@ def cmd_status(args):
               f"of traffic){hint}")
 
 
+def cmd_fleet(args):
+    """Print a compact, read-only view of locally observed fleet health."""
+    cfg = load_config()
+    try:
+        # A display command must not teach an override/default into the roster.
+        me = my_node(cfg, args.as_node, learn=False)
+    except SystemExit:
+        me = None
+    peers = load_peers(cfg)
+    now = int(time.time())
+
+    # Match `status`'s bounded roster view, with an explicit --as identity
+    # included locally without persisting it.
+    nodes = [me] if me else []
+    for node in cfg.get("nodes", []):
+        if isinstance(node, str) and node and node not in nodes:
+            nodes.append(node)
+
+    rows = []
+    for node in nodes:
+        if node == me:
+            try:
+                receiver, age = _receiver_liveness(cfg, node, now=now)
+            except (AttributeError, OSError, TypeError, ValueError):
+                receiver, age = "unknown", None
+            if not (isinstance(receiver, str) and receiver in RECV_STATES):
+                receiver = "unknown"
+            seen_at = now - age if type(age) is int else None
+            status = local_status(cfg, node)
+            if not (isinstance(status, str) and status in PRESENCE_STATES):
+                status = "unknown"
+            posture_status = f"unknown/{status}"
+        else:
+            peer = peers.get(node)
+            peer = peer if isinstance(peer, dict) else {}
+            seen_at = peer.get("seen")
+            receiver = peer.get("recv")
+            recv_seen = peer.get("recv_seen")
+            if (isinstance(receiver, str) and receiver in RECV_STATES
+                    and type(recv_seen) is int):
+                report_age = now - recv_seen
+                # A stored self-report is evidence only while it is recent;
+                # after the local stall window its current state is unknown.
+                if report_age < 0 or report_age > RECV_STALL_SECONDS:
+                    receiver = "unknown"
+            else:
+                receiver = "unknown"
+            status = peer.get("status")
+            if not (isinstance(status, str) and status in PRESENCE_STATES):
+                status = "unknown"
+            posture = peer.get("posture")
+            if isinstance(posture, str) and posture:
+                posture = _single_line(posture)[:24] or "unknown"
+            else:
+                posture = "unknown"
+            posture_status = f"{posture}/{status}"
+
+        last_seen = _ago(seen_at) if type(seen_at) is int else "never"
+        rows.append((_single_line(node), last_seen, posture_status, receiver))
+
+    table = [("NODE", "LAST-SEEN", "POSTURE/STATUS", "RECEIVER")] + rows
+    widths = [max(len(row[col]) for row in table) for col in range(4)]
+    for row in table:
+        print("  ".join(row[col].ljust(widths[col]) for col in range(4)).rstrip())
+
+
 def cmd_ping(args):
     cfg = load_config()
     if not cfg.get("key"):
@@ -13676,6 +13742,10 @@ def main():
     p = sub.add_parser("status", help="show mesh config and this node")
     p.add_argument("--as", dest="as_node", default=None)
     p.set_defaults(fn=cmd_status)
+
+    p = sub.add_parser("fleet", help="show a read-only fleet health table")
+    p.add_argument("--as", dest="as_node", default=None)
+    p.set_defaults(fn=cmd_fleet)
 
     p = sub.add_parser("ping", help="liveness + round-trip time to a node "
                                     "(answered automatically by watchers)")

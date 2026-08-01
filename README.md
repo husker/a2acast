@@ -322,6 +322,7 @@ mesh a2a-serve [--port 4737] [--wait 60]      localhost A2A HTTP bridge
 mesh peek [node] [--since S]   show recent messages without consuming
 mesh peek --wait [--from NODE] [--timeout N]   wait for the next arrival
 mesh status                    mesh, identity, known peers + last seen
+mesh fleet [--as NODE]         read-only fleet receiver-health table
 mesh integrate [--format codex|copilot|claude|mcp|skill]   print setup for a harness/route
 mesh mcp [--config PATH]       stdio MCP tool server for any MCP client (Claude Desktop, Cursor, …)
 mesh claude-setup              register the Claude Code presence watcher (writes .mcp.json)
