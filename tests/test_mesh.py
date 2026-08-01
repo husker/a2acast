@@ -9608,13 +9608,15 @@ class AgentLivenessTests(unittest.TestCase):
         self.assertEqual(mesh._agent_liveness(cfg, "alpha")[0], "active")
 
     def test_sampling_completion_stamps_but_timeout_does_not(self):
-        # A completed sampling wake means the host ran a real turn -> stamp.
+        # A SUCCESSFUL sampling wake (result, no error) means the host ran a
+        # real turn -> stamp.
         cfg = self._cfg()
         srv = mesh.MeshMCPServer(cfg, "alpha", out=lambda s: None)
         srv._sampling_flag.acquire()        # _await_and_refire releases in finally
         done = threading.Event()
         done.set()
-        srv._await_and_refire({"event": done})
+        srv._await_and_refire({"event": done, "result": {"role": "assistant"},
+                               "error": None})
         self.assertEqual(mesh._agent_liveness(cfg, "alpha")[0], "active")
 
         # A timeout (event never set) means the host never ran -> no stamp.
@@ -9624,6 +9626,33 @@ class AgentLivenessTests(unittest.TestCase):
         with mock.patch.object(mesh, "MESH_MCP_SAMPLING_TIMEOUT", 0):
             srv2._await_and_refire({"event": threading.Event()})   # unset -> False
         self.assertEqual(mesh._agent_liveness(cfg2, "alpha")[0], "unknown")
+
+    def test_sampling_error_or_empty_does_not_stamp(self):
+        # #170 seat (wayfinder): an error OR empty sampling response sets the
+        # same event as success but means no model turn ran -- must NOT stamp.
+        # Revert to `if event.wait(...)` alone and both of these read active.
+        for holder in (
+            {"event": threading.Event(), "result": None,
+             "error": {"code": -32000, "message": "model unavailable"}},
+            {"event": threading.Event(), "result": None, "error": None},
+        ):
+            cfg = self._cfg()
+            srv = mesh.MeshMCPServer(cfg, "alpha", out=lambda s: None)
+            srv._sampling_flag.acquire()
+            holder["event"].set()
+            srv._await_and_refire(holder)
+            self.assertEqual(mesh._agent_liveness(cfg, "alpha")[0], "unknown")
+
+    def test_write_heartbeat_swallows_unexpected_error(self):
+        # #170 seat (wayfinder): telemetry must NEVER raise into an agent/receive
+        # path -- not only the four named classes. Inject a RuntimeError from the
+        # write; both the helper and the tool-call path must stay intact.
+        cfg = self._cfg()
+        with mock.patch.object(mesh, "_write_json_secure",
+                               side_effect=RuntimeError("disk on fire")):
+            mesh._write_agent_heartbeat(cfg, "alpha", wake="sampling")  # no raise
+            srv = mesh.MeshMCPServer(cfg, "alpha", out=lambda s: None)
+            srv._handle_tool_call(1, {"name": "mesh_pending"})          # no raise
 
 
 class WatchLoopResilienceTests(unittest.TestCase):

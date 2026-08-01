@@ -3803,7 +3803,9 @@ def _write_agent_heartbeat(cfg, node, wake=None, now=None):
         if wake:
             rec["wake"] = wake
         _write_json_secure(agent_heartbeat_file(cfg, node), rec)
-    except (OSError, KeyError, TypeError, ValueError):
+    except Exception:
+        # truly best-effort telemetry: NEVER raise into an agent/receive path,
+        # not even on an unexpected write error (#170 seat: wayfinder).
         pass
 
 
@@ -9444,8 +9446,12 @@ class MeshMCPServer:
 
     def _await_and_refire(self, holder):
         try:
-            if holder["event"].wait(MESH_MCP_SAMPLING_TIMEOUT):
-                # completed, not timed out: the host ran a real agent turn.
+            if (holder["event"].wait(MESH_MCP_SAMPLING_TIMEOUT)
+                    and holder.get("error") is None
+                    and holder.get("result") is not None):
+                # a SUCCESSFUL sampling turn actually ran -- not a timeout, and
+                # not an error/empty response (both set the same event but mean
+                # the model never ran). #170 seat: wayfinder.
                 _write_agent_heartbeat(self.cfg, self.me, wake="sampling")
         finally:
             try:
