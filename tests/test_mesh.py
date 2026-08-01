@@ -1686,6 +1686,24 @@ class SendStatusInviteTests(MembershipCmdTests):
 
         self.assertIn("status=blocked", out.getvalue())
 
+    def test_status_survives_corrupted_peer_membership(self):
+        # #173 seat (wayfinder): cmd_status reads peer recv/agent from the
+        # persisted roster; a corrupted peers.json (recv:[]/agent:{}) must not
+        # crash the display. Revert the cmd_status isinstance guards and the
+        # `[] in RECV_STATES` membership raises here.
+        cfg = self._write_cfg()
+        cfg["_path"] = os.path.abspath(mesh.CONFIG_NAME)
+        cfg["_dir"] = os.getcwd()
+        mesh.note_peer(cfg, "beta", "pong")          # learn beta into nodes+peers
+        peers = json.load(open(mesh.peers_file(cfg)))
+        peers["beta"].update({"recv": [], "agent": {}})   # externally corrupted
+        with open(mesh.peers_file(cfg), "w", encoding="utf-8") as f:
+            json.dump(peers, f)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            mesh.cmd_status(argparse.Namespace(as_node=None))   # must not raise
+        self.assertIn("beta", out.getvalue())
+
     def test_fleet_is_read_only_and_renders_receiver_and_agent_health(self):
         now = 10_000
         cfg = self._write_cfg()
