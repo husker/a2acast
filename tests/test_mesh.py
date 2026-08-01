@@ -8324,7 +8324,8 @@ class ControlHandlingTests(unittest.TestCase):
             self.assertIsNone(out)
             self.assertEqual(sent, [("alpha", "beta",
                                      {"mw": "pong", "n": "n9", "ts": 5,
-                                      "status": "listening"})])
+                                      "status": "listening",
+                                      "wake": "ok"})])
 
     def test_announce_prints_marker_and_learns_node(self):
         with tempfile.TemporaryDirectory() as d:
@@ -9360,7 +9361,8 @@ class AckReceiverTests(MembershipCmdTests):
                                               follow=False))
         self.assertEqual(order, [("ack", {"mw": "ack", "of": "m77",
                                           "status": "listening",
-                                          "posture": "watch", "recv": "healthy"}),
+                                          "posture": "watch", "recv": "healthy",
+                                          "wake": "ok"}),
                                  ("emit", "m77")])
 
     def test_watch_does_not_ack_controls_or_own_echo(self):
@@ -9381,7 +9383,8 @@ class AckReceiverTests(MembershipCmdTests):
         # exactly one ack — for the real message only
         self.assertEqual(sent, [{"mw": "ack", "of": "c3",
                                  "status": "listening",
-                                 "posture": "watch", "recv": "healthy"}])
+                                 "posture": "watch", "recv": "healthy",
+                                 "wake": "ok"}])
 
     def test_watch_survives_ack_send_failure(self):
         cfg = self._setup_mesh()
@@ -10430,7 +10433,11 @@ class MCPServeTests(unittest.TestCase):
             mesh._run_mcp_server(argparse.Namespace(as_node="alpha"),
                                   "mcp-serve", "")
         self.assertEqual(thread_cls.call_args.kwargs.get("daemon"), True)
-        thread_cls.return_value.start.assert_called_once()
+        # Two daemon threads now ride the presence holder: the watch loop and
+        # the wake-path watchdog (#158 wake-stall increment).
+        self.assertEqual(thread_cls.return_value.start.call_count, 2)
+        targets = [c.kwargs.get("target") for c in thread_cls.call_args_list]
+        self.assertIn(mesh._wake_watchdog_loop, targets)
         self.assertNotIn("serving tools only", err.getvalue())
 
     def test_presence_owner_writes_last_gasp_activity_note_on_exit(self):
@@ -17825,6 +17832,191 @@ class WatchdogSupervisorTests(unittest.TestCase):
         self.assertFalse(fired.wait(timeout=0.3), "watchdog killed a healthy node")
         stop.set()
         t.join(timeout=2)
+
+
+class WakeWatchdogTests(unittest.TestCase):
+    """#158 wake-stall increment: the wake-path watchdog. The #161 heartbeat
+    proves frames ARRIVE; #170 proves an agent WOKE; neither proves deliveries
+    are being DRAINED. Signal = activity-file age; recovery = SIGTERM a wedged
+    defer-mode holder (never relay/unknown -- lighthouse's binding
+    mixed-version rule) or surface the unarmed case."""
+
+    def _cfg(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        return make_cfg(tmp.name)
+
+    def _age_activity(self, cfg, node, seconds, lines=2):
+        act = mesh.activity_file(cfg, node)
+        with open(act, "w", encoding="utf-8") as f:
+            f.writelines(f"message from peer{i}: hello\n" for i in range(lines))
+        t = time.time() - seconds
+        os.utime(act, (t, t))
+        return act
+
+    def _lock(self, cfg, node, pid, mode="defer"):
+        path = mesh.hook_lock_file(cfg, node)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"pid": pid, "session_id": "s1", "harness": "claude",
+                       "mode": mode}, f)
+        self.addCleanup(lambda: os.path.exists(path) and os.unlink(path))
+        return path
+
+    def _decoy(self):
+        proc = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(300)"])
+        self.addCleanup(lambda: (proc.poll() is None and proc.kill(),
+                                 proc.wait()))
+        return proc
+
+    def _patch_cmdline(self, value):
+        orig = mesh._pid_cmdline
+        mesh._pid_cmdline = lambda pid: value
+        self.addCleanup(lambda: setattr(mesh, "_pid_cmdline", orig))
+
+    def test_wedged_defer_holder_recovered(self):
+        # THE fix: live defer holder ignoring aged deliveries -> SIGTERM +
+        # unlink. Revert the watchdog and this fails (nothing happens).
+        cfg = self._cfg()
+        self._age_activity(cfg, "n1", mesh.WEDGED_HOOK_SECONDS + 60)
+        proc = self._decoy()
+        lock = self._lock(cfg, "n1", proc.pid, mode="defer")
+        self._patch_cmdline("python /x/bin/mesh claude-hook")
+        killed = []
+        fired = mesh._wake_watchdog_once(
+            cfg, "n1", kill=lambda pid, sig: killed.append((pid, sig)))
+        self.assertEqual(fired, "wedged")
+        self.assertEqual(killed, [(proc.pid, signal.SIGTERM)])
+        self.assertFalse(os.path.exists(lock), "wedged lock not cleared")
+
+    def test_healthy_defer_holder_untouched(self):
+        # Load-bearing the other way: drop the age gate and this fails.
+        cfg = self._cfg()
+        self._age_activity(cfg, "n1", 5)  # fresh backlog, still consumable
+        proc = self._decoy()
+        lock = self._lock(cfg, "n1", proc.pid, mode="defer")
+        killed = []
+        fired = mesh._wake_watchdog_once(
+            cfg, "n1", kill=lambda pid, sig: killed.append((pid, sig)))
+        self.assertIsNone(fired)
+        self.assertEqual(killed, [])
+        self.assertTrue(os.path.exists(lock))
+
+    def test_relay_and_unknown_mode_holders_protected(self):
+        # Adversarial finding + lighthouse's binding mixed-version rule: a
+        # relay hook delivers on its own subscription; an old-code lock has no
+        # mode. Drop the defer-only gate and BOTH sub-tests fail.
+        cfg = self._cfg()
+        for mode in ("relay", None):
+            self._age_activity(cfg, "n1", mesh.WEDGED_HOOK_SECONDS + 60)
+            proc = self._decoy()
+            lock = self._lock(cfg, "n1", proc.pid, mode=mode)
+            killed = []
+            fired = mesh._wake_watchdog_once(
+                cfg, "n1", kill=lambda pid, sig: killed.append((pid, sig)))
+            self.assertIsNone(fired, f"mode={mode} holder was flagged")
+            self.assertEqual(killed, [], f"mode={mode} holder was killed")
+            self.assertTrue(os.path.exists(lock))
+            os.unlink(lock)
+
+    def test_pid_reuse_means_stale_lock_not_kill(self):
+        # A readable cmdline that is NOT a mesh process = the real holder is
+        # dead and the pid was reused: unlink, signal NOTHING.
+        cfg = self._cfg()
+        self._age_activity(cfg, "n1", mesh.WEDGED_HOOK_SECONDS + 60)
+        proc = self._decoy()
+        lock = self._lock(cfg, "n1", proc.pid, mode="defer")
+        self._patch_cmdline("some-unrelated-daemon --serve")
+        killed = []
+        fired = mesh._wake_watchdog_once(
+            cfg, "n1", kill=lambda pid, sig: killed.append((pid, sig)))
+        self.assertEqual(fired, "pid-reused")
+        self.assertEqual(killed, [], "killed a reused pid")
+        self.assertFalse(os.path.exists(lock))
+
+    def test_unreadable_cmdline_falls_back_to_kill(self):
+        # Windows / restricted ps: same accepted risk as cmd_agent_hook_cleanup.
+        cfg = self._cfg()
+        self._age_activity(cfg, "n1", mesh.WEDGED_HOOK_SECONDS + 60)
+        proc = self._decoy()
+        self._lock(cfg, "n1", proc.pid, mode="defer")
+        self._patch_cmdline(None)
+        killed = []
+        fired = mesh._wake_watchdog_once(
+            cfg, "n1", kill=lambda pid, sig: killed.append((pid, sig)))
+        self.assertEqual(fired, "wedged")
+        self.assertEqual(killed, [(proc.pid, signal.SIGTERM)])
+
+    def test_dead_holder_lock_eagerly_cleared(self):
+        cfg = self._cfg()
+        self._age_activity(cfg, "n1", 10)  # age irrelevant for a dead holder
+        proc = subprocess.Popen([sys.executable, "-c", "pass"])
+        proc.wait()  # dead pid, definitely ours to have owned
+        lock = self._lock(cfg, "n1", proc.pid, mode="defer")
+        fired = mesh._wake_watchdog_once(cfg, "n1", kill=lambda p, s: None)
+        self.assertEqual(fired, "stale-lock")
+        self.assertFalse(os.path.exists(lock))
+
+    def test_unarmed_stall_surfaced_and_logged_once(self):
+        # No armed hook + aged deliveries + NO agent heartbeat (missing =
+        # stale) -> wake-stalled, surface-only, log latched to once.
+        cfg = self._cfg()
+        self._age_activity(cfg, "n1", mesh.WAKE_STALL_SECONDS + 120)
+        state, info = mesh._wake_stall_info(cfg, "n1")
+        self.assertEqual((state, info["case"]), ("stalled", "unarmed"))
+        latch = {}
+        self.assertEqual(
+            mesh._wake_watchdog_once(cfg, "n1", kill=lambda p, s: None,
+                                     state=latch), "unarmed")
+        self.assertTrue(latch.get("logged"))
+        self.assertEqual(
+            mesh._wake_watchdog_once(cfg, "n1", kill=lambda p, s: None,
+                                     state=latch), "unarmed")
+
+    def test_busy_turn_not_flagged(self):
+        # The false-positive guard: aged deliveries but a FRESH #170 agent
+        # heartbeat = long busy turn, they drain at the next arm. Drop the
+        # heartbeat term and this fails.
+        cfg = self._cfg()
+        self._age_activity(cfg, "n1", mesh.WAKE_STALL_SECONDS + 120)
+        mesh._write_agent_heartbeat(cfg, "n1", wake="hook")
+        state, info = mesh._wake_stall_info(cfg, "n1")
+        self.assertEqual(state, "ok")
+        self.assertIsNone(info["case"])
+
+    def test_empty_or_missing_activity_is_ok(self):
+        cfg = self._cfg()
+        self.assertEqual(mesh._wake_stall_info(cfg, "n1")[0], "ok")
+        with open(mesh.activity_file(cfg, "n1"), "w", encoding="utf-8"):
+            pass
+        self.assertEqual(mesh._wake_stall_info(cfg, "n1")[0], "ok")
+
+    def test_wake_key_wire_safety(self):
+        # Lighthouse's HARD requirement -- the #173/#175 crash class must not
+        # come back with the new key: crafted wake:[] / wake:{} from an
+        # authenticated peer is inert everywhere it is recorded or stamped.
+        cfg = self._cfg()
+        for bad in ([], {}, 7, None, "evil"):
+            mesh.note_peer(cfg, "p1", "pong", wake=bad)  # must not raise
+            with open(mesh.peers_file(cfg), "r", encoding="utf-8") as f:
+                self.assertNotIn("wake", json.load(f)["p1"])
+            ctl = mesh._stamp_posture({"mw": "pong"}, wake=bad)
+            self.assertNotIn("wake", ctl)
+        mesh.note_peer(cfg, "p1", "pong", wake="stalled")
+        with open(mesh.peers_file(cfg), "r", encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["p1"]["wake"], "stalled")
+        self.assertEqual(
+            mesh._stamp_posture({"mw": "pong"}, wake="ok")["wake"], "ok")
+
+    def test_hook_lock_records_mode(self):
+        cfg = self._cfg()
+        for mode, want in (("defer", "defer"), ("relay", "relay"),
+                           ("bogus", None), (None, None)):
+            lock = mesh._acquire_hook_lock(cfg, "n1", {}, "claude", mode=mode)
+            self.assertIsNotNone(lock)
+            with open(lock, "r", encoding="utf-8") as f:
+                self.assertEqual(json.load(f).get("mode"), want)
+            os.unlink(lock)
 
 
 class WatchInstallTests(unittest.TestCase):

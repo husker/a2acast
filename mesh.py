@@ -170,6 +170,17 @@ MESSAGE_INTENTS = {"request", "inform", "ack"}
 PRESENCE_STATES = {"listening", "working", "blocked"}
 RECV_STATES = {"healthy", "stalled"}  # #166: stamped receiver-health (absent = unknown; mixed-version-safe)
 AGENT_STATES = {"active", "idle"}  # inc2: stamped agent-liveness (absent = unknown; mixed-version-safe)
+WAKE_STATES = {"ok", "stalled"}  # wake-path health (absent = unknown; mixed-version-safe; display-only)
+# A healthy DEFER-mode hook consumes an activity line within ~1s of the append;
+# a live holder ignoring waiting deliveries for this long is definitionally
+# wedged. Must stay far above the 1s poll yet far below any human noticing.
+WEDGED_HOOK_SECONDS = 120
+# With NO armed hook, deliveries legitimately wait out a long agent turn and
+# drain at the next turn-end arm (which restamps the agent heartbeat) -- so the
+# unarmed threshold sits above any plausible turn, and the agent-heartbeat term
+# must ALSO be stale before the node reads wake-stalled.
+WAKE_STALL_SECONDS = 1800
+HOOK_MODES = {"defer", "relay"}
 HOOK_LOCK_PREFIX = "a2acast-agent-hook-"
 PRESENCE_LOCK_PREFIX = "mw-presence-"
 SUPERVISE_LOCK_PREFIX = "mw-supervise-"
@@ -3954,10 +3965,201 @@ def _self_agent_state(cfg, node):
     return state if isinstance(state, str) and state in AGENT_STATES else None
 
 
-def _stamp_posture(ctl, recv=None, agent=None):
+def _wake_stall_info(cfg, node, now=None):
+    """Wake-path health from durable local files ONLY (activity file, hook
+    lock, #170 agent heartbeat) -- no relay I/O. Returns (state, info): state
+    is a WAKE_STATES value; info is the per-incident capture that classifies
+    a stall (lodestar's field request -- its own repro was unclassifiable for
+    lack of exactly this snapshot).
+
+    Taxonomy: a wedged RELAY-mode holder stops refreshing the #161 heartbeat
+    and presents as a frame stall (#161/#164's domain); this function owns the
+    other two shapes -- a wedged DEFER holder ignoring announced deliveries
+    (case=wedged, auto-recoverable), and announced deliveries with no armed
+    hook at all (case=unarmed, surface-only)."""
+    now = now if now is not None else time.time()
+    info = {"undrained": None, "lines": 0, "hook": "absent", "pid": None,
+            "alive": False, "mode": None, "agent_age": None, "case": None}
+    act = activity_file(cfg, node)
+    try:
+        if os.path.getsize(act) <= 0:
+            return "ok", info
+        # mtime tracks the LAST append (arrival), not the oldest: a
+        # conservative lower bound on backlog age -- fires late, never early.
+        undrained = max(0, int(now - os.path.getmtime(act)))
+    except OSError:
+        return "ok", info
+    info["undrained"] = undrained
+    try:
+        with open(act, "r", encoding="utf-8") as f:
+            info["lines"] = sum(1 for ln in f if ln.strip())
+    except OSError:
+        pass
+    try:
+        with open(hook_lock_file(cfg, node), "r", encoding="utf-8") as f:
+            meta = json.load(f)
+    except (OSError, ValueError):
+        meta = None
+    if isinstance(meta, dict):
+        info["hook"] = "held"
+        pid = meta.get("pid")
+        info["pid"] = pid if isinstance(pid, int) else None
+        info["alive"] = bool(info["pid"] and _pid_is_live(info["pid"]))
+        mode = meta.get("mode")
+        # Mixed-version rule (binding): absent/unrecognized mode stays None =
+        # PROTECTED. Old-code holders carry no mode field and could be healthy
+        # relay hooks; only a positively-identified defer holder is killable.
+        info["mode"] = mode if (isinstance(mode, str) and
+                                mode in HOOK_MODES) else None
+    try:
+        info["agent_age"] = _agent_liveness(cfg, node, now=now)[1]
+    except Exception:
+        info["agent_age"] = None
+    if info["hook"] == "held" and info["alive"]:
+        if info["mode"] == "defer" and undrained > WEDGED_HOOK_SECONDS:
+            info["case"] = "wedged"
+            return "stalled", info
+        return "ok", info
+    # No live holder (absent, or held by a dead pid). A MISSING agent
+    # heartbeat counts as stale: undrained deliveries with no agent ever
+    # seen IS a wake stall.
+    agent_age = info["agent_age"]
+    if undrained > WAKE_STALL_SECONDS and (
+            not isinstance(agent_age, (int, float)) or
+            agent_age > WAKE_STALL_SECONDS):
+        info["case"] = "unarmed"
+        return "stalled", info
+    return "ok", info
+
+
+def _self_wake_state(cfg, node):
+    """This node's own wake-path health (a WAKE_STATES value) for stamping
+    onto outbound presence -- best-effort, NEVER raises into a send path;
+    returns None when undeterminable, which peers read as 'unknown'.
+    Mirrors _self_recv_state/_self_agent_state (the #167 seat lesson)."""
+    try:
+        state = _wake_stall_info(cfg, node)[0]
+    except Exception:
+        return None
+    return state if isinstance(state, str) and state in WAKE_STATES else None
+
+
+def _wake_capture(info):
+    """One self-contained classification line fragment for wake-stall logs."""
+    hook = info.get("hook")
+    if hook == "held":
+        hook = (f"held pid={info.get('pid')} "
+                f"alive={'y' if info.get('alive') else 'n'} "
+                f"mode={info.get('mode') or 'unknown'}")
+    agent_age = info.get("agent_age")
+    agent = (f"{int(agent_age)}s" if isinstance(agent_age, (int, float))
+             else "missing")
+    return (f"undrained={info.get('undrained')}s lines={info.get('lines')} "
+            f"hook={hook} agent_age={agent}")
+
+
+def _pid_cmdline(pid):
+    """Best-effort command line of `pid`, or None when unreadable (Windows,
+    vanished process, restricted ps). POSIX-only by design; the caller treats
+    None as 'cannot verify' and falls back to the cmd_agent_hook_cleanup
+    precedent."""
+    if os.name == "nt":
+        return None
+    try:
+        out = subprocess.run(
+            ["ps", "-p", str(int(pid)), "-o", "command="],
+            capture_output=True, timeout=5)
+        line = out.stdout.decode("utf-8", "replace").strip()
+        return line or None
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+def _wake_watchdog_once(cfg, me, kill=None, state=None):
+    """One wake-path watchdog check. Hosted by the long-lived presence server
+    (60s loop) and reusable one-shot. `kill` is injectable for tests (default
+    os.kill). `state` is a mutable dict carrying the log-once latch for the
+    surface-only case across calls. Returns the fired case or None.
+
+    Recovery ladder (local-only; never touches trust state):
+    - held-by-dead-pid: eagerly unlink the stale lock (acquire would too, but
+      lazily -- and only at the next arm attempt).
+    - wedged defer holder: verify the pid still looks like ours (pid-reuse
+      window: readable cmdline that is NOT a mesh process means the real
+      holder is dead -> stale lock, signal nothing), then SIGTERM + unlink so
+      the wake path re-arms at the next turn boundary instead of never.
+    - unarmed: nothing to kill; recovery is VISIBILITY (loud #129 log, `mesh
+      status`, the `wake` presence stamp). No process outside the harness can
+      inject a turn into an idle session -- named limitation, not a TODO."""
+    kill = kill or os.kill
+    state = state if state is not None else {}
+    wake, info = _wake_stall_info(cfg, me)
+    capture = _wake_capture(info)
+    lock_path = hook_lock_file(cfg, me)
+    if info["hook"] == "held" and not info["alive"]:
+        try:
+            os.unlink(lock_path)
+        except OSError:
+            pass
+        _evidence(f"MESH_WAKE_STALL_RECOVER case=stale-lock node="
+                  f"{_single_line(me)} {capture} (#158)")
+        state.pop("logged", None)
+        return "stale-lock"
+    if wake != "stalled":
+        state.pop("logged", None)
+        return None
+    if info["case"] == "wedged":
+        cmdline = _pid_cmdline(info["pid"])
+        if cmdline is not None and "mesh" not in cmdline:
+            # pid reused by an unrelated process => the real holder is dead.
+            try:
+                os.unlink(lock_path)
+            except OSError:
+                pass
+            _evidence(f"MESH_WAKE_STALL_RECOVER case=pid-reused node="
+                      f"{_single_line(me)} {capture} (#158)")
+            return "pid-reused"
+        try:
+            kill(info["pid"], signal.SIGTERM)
+        except (OSError, TypeError):
+            pass
+        try:
+            os.unlink(lock_path)
+        except OSError:
+            pass
+        _evidence(f"MESH_WAKE_STALL_RECOVER case=wedged node="
+                  f"{_single_line(me)} {capture} -- SIGTERM wedged defer "
+                  f"hook; wake path re-arms at next turn boundary (#158)")
+        return "wedged"
+    # case == "unarmed": surface-only, log once per stall episode.
+    if not state.get("logged"):
+        _evidence(f"MESH_WAKE_STALL case=unarmed node={_single_line(me)} "
+                  f"{capture} -- deliveries waiting with no armed wake path; "
+                  f"visible in `mesh status` and the `wake` presence stamp "
+                  f"(#158)")
+        state["logged"] = True
+    return "unarmed"
+
+
+def _wake_watchdog_loop(cfg, me, stop, interval=60, kill=None):
+    """Background thread: the wake-path watchdog (design: #158 wake-stall
+    increment). Same shape as _watch_stall_watchdog (#164): its OWN thread so
+    it fires even while the host's main loop is busy; `stop` ends it."""
+    state = {}
+    while not stop.wait(interval):
+        try:
+            _wake_watchdog_once(cfg, me, kill=kill, state=state)
+        except Exception as exc:
+            # The watchdog must never kill its host over an unexpected error.
+            print(f"mesh wake-watchdog error (continuing): {exc}",
+                  file=sys.stderr)
+
+
+def _stamp_posture(ctl, recv=None, agent=None, wake=None):
     """Add this process's posture to an outbound control dict, when set. #166:
     also stamp the sender's receiver-health (`recv`); inc2: and its agent-liveness
-    (`agent`, an AGENT_STATES value) so peers can see BOTH remotely -- each absent
+    (`agent`, an AGENT_STATES value); and its wake-path health (`wake`, a
+    WAKE_STATES value) so peers can see all three remotely -- each absent
     on older peers, which read as 'unknown' (mixed-version-safe, display-only)."""
     if _process_posture:
         ctl["posture"] = _process_posture
@@ -3965,6 +4167,8 @@ def _stamp_posture(ctl, recv=None, agent=None):
         ctl["recv"] = recv
     if isinstance(agent, str) and agent in AGENT_STATES:
         ctl["agent"] = agent
+    if isinstance(wake, str) and wake in WAKE_STATES:
+        ctl["wake"] = wake
     return ctl
 
 
@@ -4041,7 +4245,8 @@ def _prune_peers(cfg, peers, keep_node, now=None):
     return kept
 
 
-def note_peer(cfg, node, via, status=None, posture=None, recv=None, agent=None):
+def note_peer(cfg, node, via, status=None, posture=None, recv=None, agent=None,
+              wake=None):
     """Record a live sighting of `node`; learn unknown nodes into the config.
 
     Membership is dynamic: any authenticated message teaches us its sender.
@@ -4087,6 +4292,8 @@ def note_peer(cfg, node, via, status=None, posture=None, recv=None, agent=None):
         peer.update({"recv": recv, "recv_seen": now})
     if isinstance(agent, str) and agent in AGENT_STATES:  # inc2: peer's reported agent-liveness (untrusted)
         peer.update({"agent": agent, "agent_seen": now})
+    if isinstance(wake, str) and wake in WAKE_STATES:  # wake-path health (untrusted; `[] in set` raises -- #173/#175 class)
+        peer.update({"wake": wake, "wake_seen": now})
     peers[node] = peer
     peers = _prune_peers(cfg, peers, node, now)  # #106: bound on write
     with open(peers_file(cfg), "w", encoding="utf-8") as f:
@@ -8545,7 +8752,7 @@ def _handle_control(cfg, me, frm, ctl, verdict=None, ev=None):
     kind = ctl.get("mw")
     if kind == "announce":
         note_peer(cfg, frm, "announce", ctl.get("status"),
-                  posture=ctl.get("posture"), recv=ctl.get("recv"), agent=ctl.get("agent"))
+                  posture=ctl.get("posture"), recv=ctl.get("recv"), agent=ctl.get("agent"), wake=ctl.get("wake"))
         return f"MESH_NODE_JOINED node={_single_line(frm)}"
     if kind == "rename":
         # #93: a node announces old->new signed by its UNCHANGED key,
@@ -8595,7 +8802,7 @@ def _handle_control(cfg, me, frm, ctl, verdict=None, ev=None):
             send_raw(cfg, me, frm, "pong",
                      ctl=_stamp_posture({"mw": "pong", "n": ctl.get("n"),
                                          "ts": ctl.get("ts"),
-                                         "status": local_status(cfg, me)}, recv=_self_recv_state(cfg, me), agent=_self_agent_state(cfg, me)))
+                                         "status": local_status(cfg, me)}, recv=_self_recv_state(cfg, me), agent=_self_agent_state(cfg, me), wake=_self_wake_state(cfg, me)))
             print(f"MESH_PING from={_single_line(frm)} (answered)",
                   file=sys.stderr)
         except (urllib.error.URLError, socket.timeout):
@@ -8604,7 +8811,7 @@ def _handle_control(cfg, me, frm, ctl, verdict=None, ev=None):
         return None
     if kind == "pong":
         note_peer(cfg, frm, "pong", ctl.get("status"),
-                  posture=ctl.get("posture"), recv=ctl.get("recv"), agent=ctl.get("agent"))
+                  posture=ctl.get("posture"), recv=ctl.get("recv"), agent=ctl.get("agent"), wake=ctl.get("wake"))
         return None
     if kind == "revlist-req":
         # #76 leg 2: a peer is behind and asked for our list. Serve our
@@ -8679,7 +8886,7 @@ def _handle_control(cfg, me, frm, ctl, verdict=None, ev=None):
         return None
     if kind == "ack":
         note_peer(cfg, frm, "ack", ctl.get("status"),
-                  posture=ctl.get("posture"), recv=ctl.get("recv"), agent=ctl.get("agent"))
+                  posture=ctl.get("posture"), recv=ctl.get("recv"), agent=ctl.get("agent"), wake=ctl.get("wake"))
         return None
     if kind == "presence" and isinstance(ctl.get("status"), str) and ctl.get("status") in PRESENCE_STATES:
         note_peer(cfg, frm, "presence", ctl["status"])
@@ -8722,7 +8929,7 @@ def _send_ack(cfg, me, frm, ev):
     try:
         send_raw(cfg, me, frm, "ack",
                  ctl=_stamp_posture({"mw": "ack", "of": ev.get("id"),
-                                     "status": local_status(cfg, me)}, recv=_self_recv_state(cfg, me), agent=_self_agent_state(cfg, me)))
+                                     "status": local_status(cfg, me)}, recv=_self_recv_state(cfg, me), agent=_self_agent_state(cfg, me), wake=_self_wake_state(cfg, me)))
     except (urllib.error.URLError, socket.timeout, UnicodeError, ValueError):
         pass
 
@@ -8769,7 +8976,7 @@ def _await_acks(cfg, me, msg_id, t0, timeout, first=None, want_all=False):
             if frm not in [n for n, _ in got]:
                 got.append((frm, int((time.monotonic() - t0) * 1000)))
                 note_peer(cfg, frm, "ack", ctl.get("status"),
-                          posture=ctl.get("posture"), recv=ctl.get("recv"), agent=ctl.get("agent"))
+                          posture=ctl.get("posture"), recv=ctl.get("recv"), agent=ctl.get("agent"), wake=ctl.get("wake"))
             if not want_all:
                 return got
     except Exception:
@@ -9792,6 +9999,11 @@ def _run_mcp_server(args, label, idle_hint):
     plock = _acquire_presence_lock(cfg, me)
     if plock:
         threading.Thread(target=server.watch_loop, daemon=True).start()
+        # Wake-path watchdog rides the presence holder: the one long-lived
+        # process that owns delivery announcements is the one that watches
+        # them get drained (#158 wake-stall increment).
+        threading.Thread(target=_wake_watchdog_loop,
+                         args=(cfg, me, server._stop), daemon=True).start()
     else:
         print(f"a2acast {label}: another presence server owns node "
               f"'{me}' — serving tools only", file=sys.stderr)
@@ -10075,7 +10287,7 @@ def _hook_lock_is_live(path):
         return False
 
 
-def _acquire_hook_lock(cfg, node, hook_input=None, harness=None):
+def _acquire_hook_lock(cfg, node, hook_input=None, harness=None, mode=None):
     path = hook_lock_file(cfg, node)
     for _ in range(3):
         try:
@@ -10096,6 +10308,10 @@ def _acquire_hook_lock(cfg, node, hook_input=None, harness=None):
                 "session_id": ((hook_input or {}).get("session_id") or
                                (hook_input or {}).get("sessionId")),
                 "harness": harness,
+                # Wake-path watchdog: only a positively-identified "defer"
+                # holder is ever recoverable-by-kill; a relay holder delivers
+                # on its own subscription and must never be touched.
+                "mode": mode if mode in HOOK_MODES else None,
             }
             os.write(fd, json.dumps(metadata).encode())
         finally:
@@ -10601,7 +10817,13 @@ def _wait_for_hook_message(args, hook_input=None, harness=None):
     # A prior flow's stale deferred checkpoint must never advance the cursor
     # past a frame THIS flow hasn't handed off (imac's PR-89 seat, N2).
     del _HOOK_PENDING_CHECKPOINTS[:]
-    lock = _acquire_hook_lock(cfg, me, hook_input, harness)
+    # Mode is decided ONCE, before the lock, and recorded in it: the wake-path
+    # watchdog may only ever kill a holder that positively declared "defer".
+    # (Same TOCTOU window as before -- presence dying between check and wait is
+    # the documented degradation below, not a new race.)
+    defer = _presence_is_live(cfg, me)
+    lock = _acquire_hook_lock(cfg, me, hook_input, harness,
+                              mode="defer" if defer else "relay")
     if lock is None:
         return None
     try:
@@ -10612,7 +10834,7 @@ def _wait_for_hook_message(args, hook_input=None, harness=None):
     # If presence dies mid-wait, _wait_for_activity below simply returns None
     # here; the next turn's arm re-checks _presence_is_live and falls back to
     # relay mode below — expected degradation, not a bug.
-    if _presence_is_live(cfg, me):
+    if defer:
         try:
             return _wait_for_activity(cfg, me, args.timeout)
         finally:
@@ -10915,6 +11137,11 @@ def cmd_status(args):
                 tag += f", agent idle (last turn {_ago(int(time.time()) - a_age)})"
             else:
                 tag += ", agent: no turns recorded (watcher-only?)"
+            w_state, w_info = _wake_stall_info(cfg, n)  # wake-path blind spot (#158)
+            if w_state == "stalled":
+                tag += (f", WAKE-STALLED — {w_info['lines']} deliveries "
+                        f"waiting (oldest ≥{_ago(int(time.time()) - w_info['undrained'])}, "
+                        f"case={w_info['case']})")
             print(f"  {n}  (this machine{tag})")
         elif n in peers:
             posture = peers[n].get("posture")
@@ -10925,6 +11152,9 @@ def cmd_status(args):
                 shown += f", receiver={recv}"
             if isinstance(agent, str) and agent in AGENT_STATES:  # inc2: remote agent-liveness (raw, advisory)
                 shown += f", agent={agent}"
+            wk = peers[n].get("wake")
+            if isinstance(wk, str) and wk in WAKE_STATES:  # remote wake-path health (raw, advisory)
+                shown += f", wake={wk}"
             if isinstance(posture, str) and posture:
                 shown += f", posture={_single_line(str(posture))[:24]}"
             print(f"  {n}  (last seen {_ago(peers[n]['seen'])}, "
@@ -11058,7 +11288,7 @@ def cmd_ping(args):
         if ctl.get("mw") == "pong" and ctl.get("n") == nonce:
             rtt = int((time.monotonic() - t0) * 1000)
             note_peer(cfg, frm or to, "pong", ctl.get("status"),
-                      posture=ctl.get("posture"), recv=ctl.get("recv"), agent=ctl.get("agent"))
+                      posture=ctl.get("posture"), recv=ctl.get("recv"), agent=ctl.get("agent"), wake=ctl.get("wake"))
             print(f"MESH_PONG node={frm or to} rtt={rtt}ms")
             return
     print(f"MESH_PING_TIMEOUT node={to} after {args.timeout}s -- no watcher "
