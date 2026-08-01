@@ -11211,6 +11211,12 @@ def cmd_fleet(args):
                 agent = "unknown"
             if not (isinstance(agent, str) and agent in AGENT_STATES):
                 agent = "unknown"
+            try:
+                wake = _wake_stall_info(cfg, node, now=now)[0]
+            except (AttributeError, OSError, TypeError, ValueError):
+                wake = "unknown"
+            if not (isinstance(wake, str) and wake in WAKE_STATES):
+                wake = "unknown"
         else:
             peer = peers.get(node)
             peer = peer if isinstance(peer, dict) else {}
@@ -11245,14 +11251,24 @@ def cmd_fleet(args):
                     agent = "unknown"
             else:
                 agent = "unknown"
+            wake = peer.get("wake")
+            wake_seen = peer.get("wake_seen")
+            if (isinstance(wake, str) and wake in WAKE_STATES
+                    and type(wake_seen) is int):
+                # advisory only while fresh; mirror recv's report-staleness window
+                wake_report_age = now - wake_seen
+                if wake_report_age < 0 or wake_report_age > RECV_STALL_SECONDS:
+                    wake = "unknown"
+            else:
+                wake = "unknown"
 
         last_seen = _ago(seen_at) if type(seen_at) is int else "never"
-        rows.append((_single_line(node), last_seen, posture_status, receiver, agent))
+        rows.append((_single_line(node), last_seen, posture_status, receiver, agent, wake))
 
-    table = [("NODE", "LAST-SEEN", "POSTURE/STATUS", "RECEIVER", "AGENT")] + rows
-    widths = [max(len(row[col]) for row in table) for col in range(5)]
+    table = [("NODE", "LAST-SEEN", "POSTURE/STATUS", "RECEIVER", "AGENT", "WAKE")] + rows
+    widths = [max(len(row[col]) for row in table) for col in range(6)]
     for row in table:
-        print("  ".join(row[col].ljust(widths[col]) for col in range(5)).rstrip())
+        print("  ".join(row[col].ljust(widths[col]) for col in range(6)).rstrip())
 
 
 def cmd_ping(args):
