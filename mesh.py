@@ -3934,9 +3934,11 @@ def _self_recv_state(cfg, node):
     receiver / no config home), which peers read as 'unknown'."""
     try:
         state = _receiver_liveness(cfg, node)[0]
+        return state if state in RECV_STATES else None
     except (KeyError, OSError, ValueError, TypeError):
+        # membership INSIDE the boundary: an unhashable state would make
+        # `state in RECV_STATES` raise TypeError -- caught here (PR #171 seat).
         return None
-    return state if state in RECV_STATES else None
 
 
 def _self_agent_state(cfg, node):
@@ -3947,11 +3949,12 @@ def _self_agent_state(cfg, node):
     _agent_liveness is already non-object-guarded (#170)."""
     try:
         state = _agent_liveness(cfg, node)[0]
+        # membership INSIDE the try (PR #171 seat, wayfinder): a malformed helper
+        # return such as ([], None) makes `state in AGENT_STATES` raise TypeError
+        # (unhashable); catching it keeps this truly never-raises-into-send.
+        return state if state in AGENT_STATES else None
     except Exception:
-        # honor never-raises-into-send literally (the #167 seat lesson): the
-        # except list is not enumerated -- any unexpected error becomes 'unknown'.
         return None
-    return state if state in AGENT_STATES else None
 
 
 def _stamp_posture(ctl, recv=None, agent=None):
@@ -4078,14 +4081,17 @@ def note_peer(cfg, node, via, status=None, posture=None, recv=None, agent=None):
     now = int(time.time())
     peer = peers.get(node) if isinstance(peers.get(node), dict) else {}
     peer.update({"seen": now, "via": via})
-    if status in PRESENCE_STATES:
+    # Untrusted wire values: type-gate EVERY set-membership. `x in <set>` raises
+    # TypeError for an unhashable list/dict, which would escape into the receive
+    # path (PR #171 seat, wayfinder). isinstance(str) short-circuits before `in`.
+    if isinstance(status, str) and status in PRESENCE_STATES:
         peer.update({"status": status, "status_seen": now})
     if isinstance(posture, str) and posture:
         # #122: untrusted wire input -- flatten and bound before storing.
         peer.update({"posture": _single_line(posture)[:24]})
-    if recv in RECV_STATES:  # #166: peer's reported receiver-health
+    if isinstance(recv, str) and recv in RECV_STATES:  # #166: peer's receiver-health
         peer.update({"recv": recv, "recv_seen": now})
-    if agent in AGENT_STATES:  # inc2: peer's reported agent-liveness
+    if isinstance(agent, str) and agent in AGENT_STATES:  # inc2: peer's agent-liveness
         peer.update({"agent": agent, "agent_seen": now})
     peers[node] = peer
     peers = _prune_peers(cfg, peers, node, now)  # #106: bound on write
@@ -8678,7 +8684,8 @@ def _handle_control(cfg, me, frm, ctl, verdict=None, ev=None):
         note_peer(cfg, frm, "ack", ctl.get("status"),
                   posture=ctl.get("posture"), recv=ctl.get("recv"), agent=ctl.get("agent"))
         return None
-    if kind == "presence" and ctl.get("status") in PRESENCE_STATES:
+    if (kind == "presence" and isinstance(ctl.get("status"), str)
+            and ctl.get("status") in PRESENCE_STATES):  # type-gate (PR #171 seat)
         note_peer(cfg, frm, "presence", ctl["status"])
         return None
     if kind == "crash":
@@ -10918,9 +10925,11 @@ def cmd_status(args):
             recv = peers[n].get("recv")
             agent = peers[n].get("agent")
             shown = ""
-            if recv in RECV_STATES:  # #166: remote receiver-health
+            if isinstance(recv, str) and recv in RECV_STATES:  # #166: remote receiver-health
                 shown += f", receiver={recv}"
-            if agent in AGENT_STATES:  # inc2: remote agent-liveness (raw, advisory)
+            # inc2: raw advisory agent-liveness (last-known). Unlike `mesh fleet`
+            # this does NOT freshness-degrade -- status shows raw history by design.
+            if isinstance(agent, str) and agent in AGENT_STATES:
                 shown += f", agent={agent}"
             if isinstance(posture, str) and posture:
                 shown += f", posture={_single_line(str(posture))[:24]}"

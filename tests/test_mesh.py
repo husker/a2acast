@@ -17511,6 +17511,58 @@ class AgentLivenessWireTests(unittest.TestCase):
         self.assertEqual(mesh._receiver_liveness(cfg, "me"), ("unknown", None))
         self.assertIsNone(mesh._self_agent_state(cfg, "me"))
 
+    # --- PR #171 seat (wayfinder): real handler wiring + wire-safety regressions
+
+    def test_handler_records_inbound_agent(self):
+        # the actual receive wiring: _handle_control(ack/pong) -> note_peer.
+        cfg = make_cfg(tempfile.mkdtemp())
+        cfg["nodes"] = list(cfg.get("nodes", [])) + ["peerH"]
+        mesh._handle_control(cfg, "me", "peerH",
+                             {"mw": "ack", "of": "x", "agent": "active"})
+        peers = json.load(open(mesh.peers_file(cfg)))
+        self.assertEqual(peers["peerH"]["agent"], "active")
+
+    def test_handler_survives_unhashable_agent(self):
+        # BLOCKING regression: an authenticated frame carrying agent:[] / {} must
+        # NOT raise (set membership on an unhashable) into the receive path.
+        cfg = make_cfg(tempfile.mkdtemp())
+        cfg["nodes"] = list(cfg.get("nodes", [])) + ["peerU"]
+        for bad in ([], {}, 3, True, "notastate"):
+            mesh._handle_control(cfg, "me", "peerU", {"mw": "pong", "agent": bad})
+        peers = json.load(open(mesh.peers_file(cfg)))
+        self.assertNotIn("agent", peers.get("peerU", {}))
+
+    def test_note_peer_survives_unhashable_metadata(self):
+        # the whole presence-metadata membership family is type-gated.
+        cfg = make_cfg(tempfile.mkdtemp())
+        cfg["nodes"] = list(cfg.get("nodes", [])) + ["peerB"]
+        mesh.note_peer(cfg, "peerB", "ack",
+                       status=[], posture={}, recv={}, agent=[])  # must not raise
+        peers = json.load(open(mesh.peers_file(cfg)))
+        for key in ("status", "recv", "agent"):
+            self.assertNotIn(key, peers.get("peerB", {}))
+
+    def test_send_ack_emits_agent_when_live(self):
+        # emission wiring: _send_ack -> _stamp_posture stamps agent from the heartbeat.
+        cfg = self._cfg()
+        mesh._write_agent_heartbeat(cfg, "me", wake="hook")   # -> active
+        captured = {}
+
+        def fake_send_raw(*a, ctl=None, **k):
+            captured.update(ctl or {})
+
+        with mock.patch.object(mesh, "send_raw", fake_send_raw):
+            mesh._send_ack(cfg, "me", "peer", {"id": "e1"})
+        self.assertEqual(captured.get("of"), "e1")
+        self.assertEqual(captured.get("agent"), "active")
+
+    def test_self_agent_state_survives_malformed_liveness_return(self):
+        # _agent_liveness returning a non-str state ([]) must not raise through the
+        # membership check now that it lives inside the exception boundary.
+        cfg = self._cfg()
+        with mock.patch.object(mesh, "_agent_liveness", return_value=([], None)):
+            self.assertIsNone(mesh._self_agent_state(cfg, "me"))
+
 
 class AdoptExecB2b2aTests(unittest.TestCase):
     """#62 B2b-2a: `adopt-supervise --exec` REALLY checks out an owner-signed
