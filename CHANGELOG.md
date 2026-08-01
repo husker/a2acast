@@ -1,5 +1,45 @@
 # Changelog
 
+## 0.20.0
+
+Fleet-wide liveness truth: every stall mode of a receiver is now detectable,
+most are auto-recovered, and each node's health is visible from every other
+node — plus two receive-path crash-class fixes. All new presence fields are
+additive, advisory, and display-only; older peers ignore them and read as
+"unknown" (mixed-version-safe).
+
+- **#158/#164 — `watch --supervised` stall-watchdog.** A supervised receiver
+  whose #161 heartbeat goes stale recovers itself: close-response first, then
+  `os._exit` under a KeepAlive restarter, so a wedged subscription is a
+  restart instead of a silent multi-day outage.
+- **#166/#167 — presence carries receiver-health.** Pong/ack control frames
+  stamp the sender's own `recv: healthy|stalled`, making remote receiver
+  liveness readable fleet-wide (data layer).
+- **#169 — `mesh fleet`.** A read-only fleet health table: last-seen,
+  posture/status, and per-node RECEIVER / AGENT columns from the propagated
+  health fields.
+- **#170/#171 — agent-liveness heartbeat.** A per-node agent heartbeat
+  distinguishes a live agent from a bare watcher (increment 1), propagated
+  over presence as a raw `agent: active|idle` column (increment 2).
+- **#173/#175 — type-gate untrusted set-membership in the receive path.** A
+  crafted authenticated frame carrying a non-string where a state/status
+  string is expected (`[] in <set>` raises) can no longer crash the receive
+  loop; both the recv/agent/status ingest and the wire-reachable
+  message/task-ingest sites are gated.
+- **#158/#176 — wake-path watchdog.** The #161 heartbeat proves frames
+  arrive; #170 proves an agent woke; #176 closes the field-confirmed blind
+  spot between them — deliveries buffered while no agent drains them. A
+  watchdog on the presence holder detects undrained deliveries, SIGTERMs a
+  positively-identified wedged defer-mode hook (relay-mode and unknown-mode
+  holders are never touched; pid-reuse guarded) so the wake path re-arms at
+  the next turn boundary, and surfaces the unarmed case via a loud
+  classification log, a `mesh status` WAKE-STALLED line, and a `wake:
+  ok|stalled` presence key. It cannot wake an agent no harness is waiting
+  on — that state is bounded and visible, not abolished.
+- **#168 — no session URLs in the public record.** Repo-level
+  `attribution.sessionUrl: false` plus a CLAUDE.md hard constraint: no Claude
+  session links or trailers in commits, PRs, or issues.
+
 ## 0.19.0
 
 Receiver-stall visibility, a Windows signing fix, and the first real-exec slice
