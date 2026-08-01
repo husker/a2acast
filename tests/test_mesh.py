@@ -1686,6 +1686,79 @@ class SendStatusInviteTests(MembershipCmdTests):
 
         self.assertIn("status=blocked", out.getvalue())
 
+    def test_fleet_is_read_only_and_renders_receiver_health(self):
+        now = 10_000
+        cfg = self._write_cfg()
+        cfg["nodes"] = ["beta", "gamma", "delta", "epsilon"]
+        with open(mesh.CONFIG_NAME, "w", encoding="utf-8") as f:
+            json.dump(cfg, f)
+        cfg["_path"] = os.path.abspath(mesh.CONFIG_NAME)
+        cfg["_dir"] = os.getcwd()
+        mesh._write_recv_heartbeat(cfg, "alpha", now=now - 5)
+        with open(mesh.peers_file(cfg), "w", encoding="utf-8") as f:
+            json.dump({
+                "beta": {
+                    "seen": now - 1,
+                    "via": "pong",
+                    "status": "listening",
+                    "posture": "watch",
+                    "recv": "healthy",
+                    "recv_seen": now - 11,
+                },
+                "gamma": {
+                    "seen": now - 65,
+                    "via": "ack",
+                    "status": "blocked",
+                    "posture": "mcp",
+                    "recv": "stalled",
+                    "recv_seen": now - 22,
+                },
+                # A peer running older code has no recv fields.
+                "delta": {
+                    "seen": now - 3,
+                    "via": "message",
+                    "status": "listening",
+                },
+                # A once-healthy report is not current evidence forever.
+                "epsilon": {
+                    "seen": now - 4,
+                    "via": "pong",
+                    "status": "listening",
+                    "recv": "healthy",
+                    "recv_seen": now - mesh.RECV_STALL_SECONDS - 1,
+                },
+            }, f)
+
+        def snapshot_files():
+            snapshot = {}
+            for name in sorted(os.listdir()):
+                if os.path.isfile(name):
+                    with open(name, "rb") as f:
+                        snapshot[name] = f.read()
+            return snapshot
+
+        files_before = snapshot_files()
+
+        out = io.StringIO()
+        with mock.patch.object(mesh.time, "time", return_value=now), \
+             mock.patch.object(mesh, "_mutate_config",
+                               side_effect=AssertionError("fleet wrote config")), \
+             mock.patch.object(sys, "argv", ["mesh", "fleet", "--as", "alpha"]), \
+             contextlib.redirect_stdout(out):
+            mesh.main()
+
+        normalized = [" ".join(line.split()) for line in out.getvalue().splitlines()]
+        self.assertEqual(normalized, [
+            "NODE LAST-SEEN POSTURE/STATUS RECEIVER",
+            "alpha 5s ago unknown/listening healthy",
+            "beta 1s ago watch/listening healthy",
+            "gamma 1m ago mcp/blocked stalled",
+            "delta 3s ago unknown/listening unknown",
+            "epsilon 4s ago unknown/listening unknown",
+        ])
+        self.assertTrue(out.getvalue().isascii(), repr(out.getvalue()))
+        self.assertEqual(snapshot_files(), files_before)
+
     def test_invite_prints_bootstrap_block(self):
         self._write_cfg()
         out = io.StringIO()
