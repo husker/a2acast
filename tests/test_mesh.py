@@ -9233,7 +9233,7 @@ class AckReceiverTests(MembershipCmdTests):
                                               follow=False))
         self.assertEqual(order, [("ack", {"mw": "ack", "of": "m77",
                                           "status": "listening",
-                                          "posture": "watch"}),
+                                          "posture": "watch", "recv": "healthy"}),
                                  ("emit", "m77")])
 
     def test_watch_does_not_ack_controls_or_own_echo(self):
@@ -9254,7 +9254,7 @@ class AckReceiverTests(MembershipCmdTests):
         # exactly one ack — for the real message only
         self.assertEqual(sent, [{"mw": "ack", "of": "c3",
                                  "status": "listening",
-                                 "posture": "watch"}])
+                                 "posture": "watch", "recv": "healthy"}])
 
     def test_watch_survives_ack_send_failure(self):
         cfg = self._setup_mesh()
@@ -17178,6 +17178,45 @@ class ReceiverHeartbeatTests(unittest.TestCase):
                                  deadline=time.time() + 2, first=_Resp(),
                                  stop_event=stop, heartbeat_cb=hb))
         self.assertEqual(calls, [1])
+
+
+
+class FleetReceiverHealthTests(unittest.TestCase):
+    """#166: presence frames carry the sender's receiver-health so a peer's
+    liveness is visible fleet-wide, not just local (mixed-version-safe)."""
+
+    def test_stamp_adds_recv_for_valid_state(self):
+        self.assertEqual(mesh._stamp_posture({}, recv="stalled").get("recv"),
+                         "stalled")
+        self.assertEqual(mesh._stamp_posture({}, recv="healthy").get("recv"),
+                         "healthy")
+
+    def test_stamp_omits_recv_when_absent_or_invalid(self):
+        self.assertNotIn("recv", mesh._stamp_posture({}))            # pre-0.20
+        self.assertNotIn("recv", mesh._stamp_posture({}, recv="evil"))  # junk
+
+    def test_note_peer_records_valid_recv(self):
+        cfg = make_cfg(tempfile.mkdtemp())
+        cfg["nodes"] = list(cfg.get("nodes", [])) + ["peerX"]
+        mesh.note_peer(cfg, "peerX", "ack", status="listening", recv="stalled")
+        peers = json.load(open(mesh.peers_file(cfg)))
+        self.assertEqual(peers["peerX"]["recv"], "stalled")
+        self.assertIn("recv_seen", peers["peerX"])
+
+    def test_note_peer_ignores_untrusted_recv(self):
+        cfg = make_cfg(tempfile.mkdtemp())
+        cfg["nodes"] = list(cfg.get("nodes", [])) + ["peerY"]
+        mesh.note_peer(cfg, "peerY", "ack", recv="../../etc/passwd")
+        peers = json.load(open(mesh.peers_file(cfg)))
+        self.assertNotIn("recv", peers.get("peerY", {}))
+
+    def test_end_to_end_stamp_to_record(self):
+        cfg = make_cfg(tempfile.mkdtemp())
+        cfg["nodes"] = list(cfg.get("nodes", [])) + ["peerZ"]
+        wire = mesh._stamp_posture({"mw": "ack"}, recv="healthy")  # sender stamps
+        mesh.note_peer(cfg, "peerZ", "ack", recv=wire.get("recv"))  # we record
+        peers = json.load(open(mesh.peers_file(cfg)))
+        self.assertEqual(peers["peerZ"]["recv"], "healthy")
 
 
 class AdoptExecB2b2aTests(unittest.TestCase):
