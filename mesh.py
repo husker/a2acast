@@ -134,6 +134,14 @@ RECV_NAME = ".meshwire.recv-{}.json"            # #158: receiver liveness heartb
 # threshold sits above the keepalive interval + generous margin so a healthy
 # but quiet link never reads as stalled.
 RECV_STALL_SECONDS = 300
+AGENT_NAME = ".meshwire.agent-{}.json"          # agent-liveness heartbeat (distinct from the receiver's)
+# An AGENT turn is far rarer than a relay event -- it fires only when a delivery
+# wakes the session or a human drives it -- so this threshold is much wider than
+# RECV_STALL_SECONDS. Past it the agent is "idle" (ran before, quiet since --
+# wakeable-or-gone, indistinguishable from the timestamp), not "stalled". The
+# value that actually witnesses presence-without-availability is 'unknown' (no
+# agent turn EVER on a node whose receiver is healthy), not age.
+AGENT_IDLE_SECONDS = 1800
 EVIDENCE_FILE_MAX = 1024 * 1024                 # rotate to .1 past this (~2MiB)
 BROADCAST = "all"
 # Single source of truth for the running client's version. Must match
@@ -3775,6 +3783,48 @@ def _receiver_liveness(cfg, node, now=None):
         return ("unknown", None)
     age = max(0, now - ts)
     return ("stalled" if age > RECV_STALL_SECONDS else "healthy", age)
+
+
+def agent_heartbeat_file(cfg, node):
+    return os.path.join(cfg["_dir"], AGENT_NAME.format(node))
+
+
+def _write_agent_heartbeat(cfg, node, wake=None, now=None):
+    """Durable proof a real AGENT turn ran on this node -- distinct from the
+    receiver merely holding its subscription (_write_recv_heartbeat). Stamped at
+    the provable agent-turn sites: an MCP tool call, a COMPLETED sampling wake
+    (a timeout does not stamp), and a turn-end delivery hook. `wake` records HOW
+    the agent is reachable here ('sampling'|'hook'). Best-effort; must NEVER
+    raise into an agent or receive path -- a node whose watcher runs but whose
+    agent never wakes (the presence-without-availability case) simply never
+    writes this file."""
+    try:
+        rec = {"ts": int(time.time()) if now is None else int(now)}
+        if wake:
+            rec["wake"] = wake
+        _write_json_secure(agent_heartbeat_file(cfg, node), rec)
+    except (OSError, KeyError, TypeError, ValueError):
+        pass
+
+
+def _agent_liveness(cfg, node, now=None):
+    """('active'|'idle'|'unknown', age_seconds|None) read from the agent
+    heartbeat. 'active' = a turn ran within AGENT_IDLE_SECONDS (fresh proof a
+    live agent is being woken here); 'idle' = a turn ran before but not lately
+    (wakeable-but-quiet OR gone -- the timestamp alone cannot tell); 'unknown' =
+    NO agent turn ever recorded. 'unknown' on a node whose receiver is healthy is
+    the witnessable presence-without-availability signal: a watcher with no agent
+    behind it."""
+    now = int(time.time()) if now is None else int(now)
+    try:
+        with open(agent_heartbeat_file(cfg, node), "r", encoding="utf-8") as f:
+            ts = json.load(f).get("ts")
+    except (OSError, ValueError, KeyError, TypeError):
+        return ("unknown", None)
+    if not isinstance(ts, int):
+        return ("unknown", None)
+    age = max(0, now - ts)
+    return ("idle" if age > AGENT_IDLE_SECONDS else "active", age)
 
 
 def _watchdog_should_exit(cfg, me, now=None):
@@ -9181,6 +9231,8 @@ class MeshMCPServer:
         ]
 
     def _handle_tool_call(self, mid, params):
+        # agent-liveness: a tool call is proof a live agent turn is running here.
+        _write_agent_heartbeat(self.cfg, self.me, wake="sampling")
         name = params.get("name")
         args = params.get("arguments") or {}
         try:
@@ -9388,7 +9440,9 @@ class MeshMCPServer:
 
     def _await_and_refire(self, holder):
         try:
-            holder["event"].wait(MESH_MCP_SAMPLING_TIMEOUT)
+            if holder["event"].wait(MESH_MCP_SAMPLING_TIMEOUT):
+                # completed, not timed out: the host ran a real agent turn.
+                _write_agent_heartbeat(self.cfg, self.me, wake="sampling")
         finally:
             try:
                 set_local_status(self.cfg, self.me, "listening")
@@ -10586,6 +10640,14 @@ def _emit_continuation_hook(args, harness):
 def _run_harness_delivery_hook(args, harness):
     """Route a delivery through the prompt contract declared by its spec."""
     _set_process_posture("hook")
+    # agent-liveness: a delivery hook is armed at turn-end, so its invocation is
+    # proof a real agent turn just ran on this node. Best-effort, never fatal.
+    try:
+        if find_config():
+            _cfg = load_config()
+            _write_agent_heartbeat(_cfg, my_node(_cfg, None, harness), wake="hook")
+    except (Exception, SystemExit):
+        pass
     spec = HARNESS_SPECS[harness]
     if spec.delivery_prompt == "continuation-json":
         _emit_continuation_hook(args, harness)
@@ -10789,6 +10851,13 @@ def cmd_status(args):
                        f"; re-arm the watcher (#158)")
             else:
                 tag = ", receiver: no active watcher heartbeat"
+            a_live, a_age = _agent_liveness(cfg, n)  # is a live agent behind the watcher?
+            if a_live == "active":
+                tag += f", agent active (last turn {_ago(int(time.time()) - a_age)})"
+            elif a_live == "idle":
+                tag += f", agent idle (last turn {_ago(int(time.time()) - a_age)})"
+            else:
+                tag += ", agent: no turns recorded (watcher-only?)"
             print(f"  {n}  (this machine{tag})")
         elif n in peers:
             posture = peers[n].get("posture")
