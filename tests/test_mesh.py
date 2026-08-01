@@ -1447,6 +1447,35 @@ class MessageIntentTests(unittest.TestCase):
         self.assertTrue(mesh._message_candidate(body))
 
 
+class Issue174MembershipTests(unittest.TestCase):
+    """#174: type-gate untrusted set-membership on the message + delegate-ingest
+    paths. `x in <SET>` raises TypeError for an unhashable list/dict, which must
+    become a clean rejection, not a receive-path crash (same class as #171/#173,
+    outside presence/liveness)."""
+
+    def test_unhashable_message_intent_rejected_not_crash(self):
+        # _message_details runs on received message frames; a list/dict/number
+        # intent must reject to None, not raise on `intent in MESSAGE_INTENTS`.
+        for bad in ([], {}, 3):
+            body = json.dumps({"mw": "message", "id": "m1",
+                               "intent": bad, "text": "hi"})
+            self.assertIsNone(mesh._message_details(body))
+
+    def test_delegate_record_unhashable_backend_and_state_reject_not_crash(self):
+        cfg = make_cfg(tempfile.mkdtemp())
+        base = {"direction": "outbound", "local_node": "me", "peer": "beta",
+                "contextId": "ctx1", "text": "x",
+                "worker_job_digest": "0" * 64, "updated": 1}
+        # unhashable worker_backend -> ValueError (the #174 gate), not TypeError
+        with self.assertRaises(ValueError):
+            mesh._validate_delegate_task_record(
+                cfg, "me", "t1", dict(base, worker_backend=[], state="submitted"))
+        # unhashable state (with a valid backend) -> ValueError, not TypeError
+        with self.assertRaises(ValueError):
+            mesh._validate_delegate_task_record(
+                cfg, "me", "t1", dict(base, worker_backend="codex", state=[]))
+
+
 class SendStatusInviteTests(MembershipCmdTests):
     """Reuses the chdir-to-tmp setUp/tearDown."""
 
