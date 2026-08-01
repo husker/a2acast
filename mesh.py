@@ -169,6 +169,7 @@ TERMINAL_STATES = {"completed", "failed", "canceled", "rejected"}
 MESSAGE_INTENTS = {"request", "inform", "ack"}
 PRESENCE_STATES = {"listening", "working", "blocked"}
 RECV_STATES = {"healthy", "stalled"}  # #166: stamped receiver-health (absent = unknown; mixed-version-safe)
+AGENT_STATES = {"active", "idle"}  # inc2: stamped agent-liveness (absent = unknown; mixed-version-safe)
 HOOK_LOCK_PREFIX = "a2acast-agent-hook-"
 PRESENCE_LOCK_PREFIX = "mw-presence-"
 SUPERVISE_LOCK_PREFIX = "mw-supervise-"
@@ -3784,7 +3785,7 @@ def _receiver_liveness(cfg, node, now=None):
         ts = data.get("ts") if isinstance(data, dict) else None
     except (OSError, ValueError):
         return ("unknown", None)
-    if not isinstance(ts, int):
+    if not isinstance(ts, int) or isinstance(ts, bool):  # bool is an int subclass (#170 seat, wayfinder)
         return ("unknown", None)
     age = max(0, now - ts)
     return ("stalled" if age > RECV_STALL_SECONDS else "healthy", age)
@@ -3832,7 +3833,7 @@ def _agent_liveness(cfg, node, now=None):
         ts = data.get("ts") if isinstance(data, dict) else None
     except (OSError, ValueError, KeyError, TypeError):
         return ("unknown", None)
-    if not isinstance(ts, int):
+    if not isinstance(ts, int) or isinstance(ts, bool):  # bool is an int subclass (#170 seat, wayfinder)
         return ("unknown", None)
     age = max(0, now - ts)
     return ("idle" if age > AGENT_IDLE_SECONDS else "active", age)
@@ -3938,15 +3939,32 @@ def _self_recv_state(cfg, node):
     return state if state in RECV_STATES else None
 
 
-def _stamp_posture(ctl, recv=None):
+def _self_agent_state(cfg, node):
+    """inc2: this node's own agent-liveness (an AGENT_STATES value) for stamping
+    onto outbound presence -- best-effort, NEVER raises into a send path; returns
+    None when it can't be determined (no agent turn recorded yet / no config
+    home), which peers read as 'unknown'. Mirrors _self_recv_state; the underlying
+    _agent_liveness is already non-object-guarded (#170)."""
+    try:
+        state = _agent_liveness(cfg, node)[0]
+    except Exception:
+        # honor never-raises-into-send literally (the #167 seat lesson): the
+        # except list is not enumerated -- any unexpected error becomes 'unknown'.
+        return None
+    return state if state in AGENT_STATES else None
+
+
+def _stamp_posture(ctl, recv=None, agent=None):
     """Add this process's posture to an outbound control dict, when set. #166:
-    also stamp the sender's receiver-health (`recv`, a RECV_STATES value) so
-    peers can see this node's liveness remotely -- absent on pre-0.20 peers,
-    which read as 'unknown' (mixed-version-safe, display-only)."""
+    also stamp the sender's receiver-health (`recv`); inc2: and its agent-liveness
+    (`agent`, an AGENT_STATES value) so peers can see BOTH remotely -- each absent
+    on older peers, which read as 'unknown' (mixed-version-safe, display-only)."""
     if _process_posture:
         ctl["posture"] = _process_posture
     if recv in RECV_STATES:
         ctl["recv"] = recv
+    if agent in AGENT_STATES:
+        ctl["agent"] = agent
     return ctl
 
 
@@ -4023,7 +4041,7 @@ def _prune_peers(cfg, peers, keep_node, now=None):
     return kept
 
 
-def note_peer(cfg, node, via, status=None, posture=None, recv=None):
+def note_peer(cfg, node, via, status=None, posture=None, recv=None, agent=None):
     """Record a live sighting of `node`; learn unknown nodes into the config.
 
     Membership is dynamic: any authenticated message teaches us its sender.
@@ -4067,6 +4085,8 @@ def note_peer(cfg, node, via, status=None, posture=None, recv=None):
         peer.update({"posture": _single_line(posture)[:24]})
     if recv in RECV_STATES:  # #166: peer's reported receiver-health
         peer.update({"recv": recv, "recv_seen": now})
+    if agent in AGENT_STATES:  # inc2: peer's reported agent-liveness
+        peer.update({"agent": agent, "agent_seen": now})
     peers[node] = peer
     peers = _prune_peers(cfg, peers, node, now)  # #106: bound on write
     with open(peers_file(cfg), "w", encoding="utf-8") as f:
@@ -8522,7 +8542,7 @@ def _handle_control(cfg, me, frm, ctl, verdict=None, ev=None):
     kind = ctl.get("mw")
     if kind == "announce":
         note_peer(cfg, frm, "announce", ctl.get("status"),
-                  posture=ctl.get("posture"), recv=ctl.get("recv"))
+                  posture=ctl.get("posture"), recv=ctl.get("recv"), agent=ctl.get("agent"))
         return f"MESH_NODE_JOINED node={_single_line(frm)}"
     if kind == "rename":
         # #93: a node announces old->new signed by its UNCHANGED key,
@@ -8572,7 +8592,7 @@ def _handle_control(cfg, me, frm, ctl, verdict=None, ev=None):
             send_raw(cfg, me, frm, "pong",
                      ctl=_stamp_posture({"mw": "pong", "n": ctl.get("n"),
                                          "ts": ctl.get("ts"),
-                                         "status": local_status(cfg, me)}, recv=_self_recv_state(cfg, me)))
+                                         "status": local_status(cfg, me)}, recv=_self_recv_state(cfg, me), agent=_self_agent_state(cfg, me)))
             print(f"MESH_PING from={_single_line(frm)} (answered)",
                   file=sys.stderr)
         except (urllib.error.URLError, socket.timeout):
@@ -8581,7 +8601,7 @@ def _handle_control(cfg, me, frm, ctl, verdict=None, ev=None):
         return None
     if kind == "pong":
         note_peer(cfg, frm, "pong", ctl.get("status"),
-                  posture=ctl.get("posture"), recv=ctl.get("recv"))
+                  posture=ctl.get("posture"), recv=ctl.get("recv"), agent=ctl.get("agent"))
         return None
     if kind == "revlist-req":
         # #76 leg 2: a peer is behind and asked for our list. Serve our
@@ -8656,7 +8676,7 @@ def _handle_control(cfg, me, frm, ctl, verdict=None, ev=None):
         return None
     if kind == "ack":
         note_peer(cfg, frm, "ack", ctl.get("status"),
-                  posture=ctl.get("posture"), recv=ctl.get("recv"))
+                  posture=ctl.get("posture"), recv=ctl.get("recv"), agent=ctl.get("agent"))
         return None
     if kind == "presence" and ctl.get("status") in PRESENCE_STATES:
         note_peer(cfg, frm, "presence", ctl["status"])
@@ -8699,7 +8719,7 @@ def _send_ack(cfg, me, frm, ev):
     try:
         send_raw(cfg, me, frm, "ack",
                  ctl=_stamp_posture({"mw": "ack", "of": ev.get("id"),
-                                     "status": local_status(cfg, me)}, recv=_self_recv_state(cfg, me)))
+                                     "status": local_status(cfg, me)}, recv=_self_recv_state(cfg, me), agent=_self_agent_state(cfg, me)))
     except (urllib.error.URLError, socket.timeout, UnicodeError, ValueError):
         pass
 
@@ -8746,7 +8766,7 @@ def _await_acks(cfg, me, msg_id, t0, timeout, first=None, want_all=False):
             if frm not in [n for n, _ in got]:
                 got.append((frm, int((time.monotonic() - t0) * 1000)))
                 note_peer(cfg, frm, "ack", ctl.get("status"),
-                          posture=ctl.get("posture"), recv=ctl.get("recv"))
+                          posture=ctl.get("posture"), recv=ctl.get("recv"), agent=ctl.get("agent"))
             if not want_all:
                 return got
     except Exception:
@@ -10896,9 +10916,12 @@ def cmd_status(args):
         elif n in peers:
             posture = peers[n].get("posture")
             recv = peers[n].get("recv")
+            agent = peers[n].get("agent")
             shown = ""
             if recv in RECV_STATES:  # #166: remote receiver-health
                 shown += f", receiver={recv}"
+            if agent in AGENT_STATES:  # inc2: remote agent-liveness (raw, advisory)
+                shown += f", agent={agent}"
             if isinstance(posture, str) and posture:
                 shown += f", posture={_single_line(str(posture))[:24]}"
             print(f"  {n}  (last seen {_ago(peers[n]['seen'])}, "
@@ -10949,6 +10972,12 @@ def cmd_fleet(args):
             if not (isinstance(status, str) and status in PRESENCE_STATES):
                 status = "unknown"
             posture_status = f"unknown/{status}"
+            try:
+                agent = _agent_liveness(cfg, node, now=now)[0]
+            except (AttributeError, OSError, TypeError, ValueError):
+                agent = "unknown"
+            if not (isinstance(agent, str) and agent in AGENT_STATES):
+                agent = "unknown"
         else:
             peer = peers.get(node)
             peer = peer if isinstance(peer, dict) else {}
@@ -10973,14 +11002,24 @@ def cmd_fleet(args):
             else:
                 posture = "unknown"
             posture_status = f"{posture}/{status}"
+            agent = peer.get("agent")
+            agent_seen = peer.get("agent_seen")
+            if (isinstance(agent, str) and agent in AGENT_STATES
+                    and type(agent_seen) is int):
+                # advisory only while fresh; mirror recv's report-staleness window
+                agent_report_age = now - agent_seen
+                if agent_report_age < 0 or agent_report_age > RECV_STALL_SECONDS:
+                    agent = "unknown"
+            else:
+                agent = "unknown"
 
         last_seen = _ago(seen_at) if type(seen_at) is int else "never"
-        rows.append((_single_line(node), last_seen, posture_status, receiver))
+        rows.append((_single_line(node), last_seen, posture_status, receiver, agent))
 
-    table = [("NODE", "LAST-SEEN", "POSTURE/STATUS", "RECEIVER")] + rows
-    widths = [max(len(row[col]) for row in table) for col in range(4)]
+    table = [("NODE", "LAST-SEEN", "POSTURE/STATUS", "RECEIVER", "AGENT")] + rows
+    widths = [max(len(row[col]) for row in table) for col in range(5)]
     for row in table:
-        print("  ".join(row[col].ljust(widths[col]) for col in range(4)).rstrip())
+        print("  ".join(row[col].ljust(widths[col]) for col in range(5)).rstrip())
 
 
 def cmd_ping(args):
@@ -11016,7 +11055,7 @@ def cmd_ping(args):
         if ctl.get("mw") == "pong" and ctl.get("n") == nonce:
             rtt = int((time.monotonic() - t0) * 1000)
             note_peer(cfg, frm or to, "pong", ctl.get("status"),
-                      posture=ctl.get("posture"), recv=ctl.get("recv"))
+                      posture=ctl.get("posture"), recv=ctl.get("recv"), agent=ctl.get("agent"))
             print(f"MESH_PONG node={frm or to} rtt={rtt}ms")
             return
     print(f"MESH_PING_TIMEOUT node={to} after {args.timeout}s -- no watcher "

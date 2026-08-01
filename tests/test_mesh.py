@@ -1686,7 +1686,7 @@ class SendStatusInviteTests(MembershipCmdTests):
 
         self.assertIn("status=blocked", out.getvalue())
 
-    def test_fleet_is_read_only_and_renders_receiver_health(self):
+    def test_fleet_is_read_only_and_renders_receiver_and_agent_health(self):
         now = 10_000
         cfg = self._write_cfg()
         cfg["nodes"] = ["beta", "gamma", "delta", "epsilon"]
@@ -1695,6 +1695,7 @@ class SendStatusInviteTests(MembershipCmdTests):
         cfg["_path"] = os.path.abspath(mesh.CONFIG_NAME)
         cfg["_dir"] = os.getcwd()
         mesh._write_recv_heartbeat(cfg, "alpha", now=now - 5)
+        mesh._write_agent_heartbeat(cfg, "alpha", now=now - 5)
         with open(mesh.peers_file(cfg), "w", encoding="utf-8") as f:
             json.dump({
                 "beta": {
@@ -1704,6 +1705,8 @@ class SendStatusInviteTests(MembershipCmdTests):
                     "posture": "watch",
                     "recv": "healthy",
                     "recv_seen": now - 11,
+                    "agent": "active",
+                    "agent_seen": now - 11,
                 },
                 "gamma": {
                     "seen": now - 65,
@@ -1712,6 +1715,8 @@ class SendStatusInviteTests(MembershipCmdTests):
                     "posture": "mcp",
                     "recv": "stalled",
                     "recv_seen": now - 22,
+                    "agent": "idle",
+                    "agent_seen": now - 22,
                 },
                 # A peer running older code has no recv fields.
                 "delta": {
@@ -1726,6 +1731,8 @@ class SendStatusInviteTests(MembershipCmdTests):
                     "status": "listening",
                     "recv": "healthy",
                     "recv_seen": now - mesh.RECV_STALL_SECONDS - 1,
+                    "agent": "active",
+                    "agent_seen": now - mesh.RECV_STALL_SECONDS - 1,
                 },
             }, f)
 
@@ -1749,12 +1756,12 @@ class SendStatusInviteTests(MembershipCmdTests):
 
         normalized = [" ".join(line.split()) for line in out.getvalue().splitlines()]
         self.assertEqual(normalized, [
-            "NODE LAST-SEEN POSTURE/STATUS RECEIVER",
-            "alpha 5s ago unknown/listening healthy",
-            "beta 1s ago watch/listening healthy",
-            "gamma 1m ago mcp/blocked stalled",
-            "delta 3s ago unknown/listening unknown",
-            "epsilon 4s ago unknown/listening unknown",
+            "NODE LAST-SEEN POSTURE/STATUS RECEIVER AGENT",
+            "alpha 5s ago unknown/listening healthy active",
+            "beta 1s ago watch/listening healthy active",
+            "gamma 1m ago mcp/blocked stalled idle",
+            "delta 3s ago unknown/listening unknown unknown",
+            "epsilon 4s ago unknown/listening unknown unknown",
         ])
         self.assertTrue(out.getvalue().isascii(), repr(out.getvalue()))
         self.assertEqual(snapshot_files(), files_before)
@@ -17410,6 +17417,99 @@ class FleetReceiverHealthTests(unittest.TestCase):
         mesh.note_peer(cfg, "peerZ", "ack", recv=wire.get("recv"))  # we record
         peers = json.load(open(mesh.peers_file(cfg)))
         self.assertEqual(peers["peerZ"]["recv"], "healthy")
+
+
+class AgentLivenessWireTests(unittest.TestCase):
+    """inc2: presence frames also carry the sender's agent-liveness (raw
+    active/idle) so a peer's wake-state is visible fleet-wide, not just local.
+    Display-only + advisory (self-asserted, never gates); mixed-version-safe
+    (absent = unknown). The combined wake-stalled VERDICT is deliberately NOT
+    synthesized here -- recv=healthy + agent=idle is ALSO a normal quiet node, so
+    the verdict needs undrained-buffer age and lives with self-heal (lighthouse
+    scoping, msg 4e9be380)."""
+
+    def _cfg(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        return make_cfg(tmp.name)
+
+    def test_stamp_adds_agent_for_valid_state(self):
+        self.assertEqual(mesh._stamp_posture({}, agent="idle").get("agent"),
+                         "idle")
+        self.assertEqual(mesh._stamp_posture({}, agent="active").get("agent"),
+                         "active")
+
+    def test_stamp_omits_agent_when_absent_invalid_or_unknown(self):
+        self.assertNotIn("agent", mesh._stamp_posture({}))                 # pre-inc2
+        self.assertNotIn("agent", mesh._stamp_posture({}, agent="evil"))   # junk
+        self.assertNotIn("agent", mesh._stamp_posture({}, agent="unknown"))  # never on wire
+
+    def test_stamp_recv_and_agent_are_independent(self):
+        ctl = mesh._stamp_posture({}, recv="healthy", agent="idle")
+        self.assertEqual((ctl.get("recv"), ctl.get("agent")),
+                         ("healthy", "idle"))
+
+    def test_note_peer_records_valid_agent(self):
+        cfg = make_cfg(tempfile.mkdtemp())
+        cfg["nodes"] = list(cfg.get("nodes", [])) + ["peerX"]
+        mesh.note_peer(cfg, "peerX", "ack", status="listening", agent="idle")
+        peers = json.load(open(mesh.peers_file(cfg)))
+        self.assertEqual(peers["peerX"]["agent"], "idle")
+        self.assertIn("agent_seen", peers["peerX"])
+
+    def test_note_peer_ignores_untrusted_agent(self):
+        cfg = make_cfg(tempfile.mkdtemp())
+        cfg["nodes"] = list(cfg.get("nodes", [])) + ["peerY"]
+        mesh.note_peer(cfg, "peerY", "ack", agent="../../etc/passwd")
+        peers = json.load(open(mesh.peers_file(cfg)))
+        self.assertNotIn("agent", peers.get("peerY", {}))
+
+    def test_mixed_version_old_node_omits_agent(self):
+        # a pre-inc2 peer sends no agent field; we record recv but nothing for
+        # agent, and parsing does not break.
+        cfg = make_cfg(tempfile.mkdtemp())
+        cfg["nodes"] = list(cfg.get("nodes", [])) + ["oldpeer"]
+        mesh.note_peer(cfg, "oldpeer", "ack", recv="healthy", agent=None)
+        peers = json.load(open(mesh.peers_file(cfg)))
+        self.assertEqual(peers["oldpeer"]["recv"], "healthy")
+        self.assertNotIn("agent", peers["oldpeer"])
+
+    def test_end_to_end_stamp_to_record(self):
+        cfg = make_cfg(tempfile.mkdtemp())
+        cfg["nodes"] = list(cfg.get("nodes", [])) + ["peerZ"]
+        wire = mesh._stamp_posture({"mw": "ack"}, agent="active")  # sender stamps
+        mesh.note_peer(cfg, "peerZ", "ack", agent=wire.get("agent"))  # we record
+        peers = json.load(open(mesh.peers_file(cfg)))
+        self.assertEqual(peers["peerZ"]["agent"], "active")
+
+    def test_self_agent_state_reflects_liveness(self):
+        cfg = self._cfg()
+        self.assertIsNone(mesh._self_agent_state(cfg, "me"))    # no heartbeat
+        mesh._write_agent_heartbeat(cfg, "me", wake="hook")     # fresh -> active
+        self.assertEqual(mesh._self_agent_state(cfg, "me"), "active")
+        mesh._write_agent_heartbeat(cfg, "me", now=1_000_000)   # ancient -> idle
+        self.assertEqual(mesh._self_agent_state(cfg, "me"), "idle")
+
+    def test_self_agent_state_never_raises_on_non_object(self):
+        # best-effort contract (mirror of _self_recv_state): a valid-JSON
+        # non-object heartbeat yields None (unknown), never raises into send.
+        cfg = self._cfg()
+        with open(mesh.agent_heartbeat_file(cfg, "me"), "w") as f:
+            f.write("[]")
+        self.assertIsNone(mesh._self_agent_state(cfg, "me"))
+
+    def test_bool_ts_reads_unknown_not_active(self):
+        # {"ts": true}: bool is an int subclass, so isinstance(ts,int) alone would
+        # accept it; the bool guard (#170 seat, wayfinder) makes BOTH liveness
+        # reads return unknown rather than a bogus state.
+        cfg = self._cfg()
+        for hb in (mesh.agent_heartbeat_file(cfg, "me"),
+                   mesh.recv_heartbeat_file(cfg, "me")):
+            with open(hb, "w") as f:
+                json.dump({"ts": True}, f)
+        self.assertEqual(mesh._agent_liveness(cfg, "me"), ("unknown", None))
+        self.assertEqual(mesh._receiver_liveness(cfg, "me"), ("unknown", None))
+        self.assertIsNone(mesh._self_agent_state(cfg, "me"))
 
 
 class AdoptExecB2b2aTests(unittest.TestCase):
