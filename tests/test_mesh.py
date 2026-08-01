@@ -1686,6 +1686,24 @@ class SendStatusInviteTests(MembershipCmdTests):
 
         self.assertIn("status=blocked", out.getvalue())
 
+    def test_status_survives_corrupted_peer_membership(self):
+        # #173 seat (wayfinder): cmd_status reads peer recv/agent from the
+        # persisted roster; a corrupted peers.json (recv:[]/agent:{}) must not
+        # crash the display. Revert the cmd_status isinstance guards and the
+        # `[] in RECV_STATES` membership raises here.
+        cfg = self._write_cfg()
+        cfg["_path"] = os.path.abspath(mesh.CONFIG_NAME)
+        cfg["_dir"] = os.getcwd()
+        mesh.note_peer(cfg, "beta", "pong")          # learn beta into nodes+peers
+        peers = json.load(open(mesh.peers_file(cfg)))
+        peers["beta"].update({"recv": [], "agent": {}})   # externally corrupted
+        with open(mesh.peers_file(cfg), "w", encoding="utf-8") as f:
+            json.dump(peers, f)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            mesh.cmd_status(argparse.Namespace(as_node=None))   # must not raise
+        self.assertIn("beta", out.getvalue())
+
     def test_fleet_is_read_only_and_renders_receiver_and_agent_health(self):
         now = 10_000
         cfg = self._write_cfg()
@@ -17510,6 +17528,81 @@ class AgentLivenessWireTests(unittest.TestCase):
         self.assertEqual(mesh._agent_liveness(cfg, "me"), ("unknown", None))
         self.assertEqual(mesh._receiver_liveness(cfg, "me"), ("unknown", None))
         self.assertIsNone(mesh._self_agent_state(cfg, "me"))
+
+
+class LivenessWireHardeningTests(unittest.TestCase):
+    """#171 seat (wayfinder), post-merge regression: a set-membership check on an
+    untrusted/persisted recv/agent value raises TypeError on an unhashable list/
+    dict (`[] in AGENT_STATES`) and escapes the receive path. Every boundary must
+    isinstance-gate before `in`."""
+
+    def _cfg(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        return make_cfg(tmp.name)
+
+    def test_note_peer_ignores_unhashable_and_wrong_type(self):
+        # Revert any isinstance gate in note_peer and a crafted []/{} raises
+        # TypeError here instead of being ignored.
+        cfg = self._cfg()
+        for bad in ([], {}, 5, True, "evil"):
+            for field in ("status", "agent", "recv"):
+                mesh.note_peer(cfg, "attacker", "pong",
+                               **{field: bad})            # must not raise
+        peer = mesh.load_peers(cfg)["attacker"]
+        for field in ("status", "agent", "recv"):
+            self.assertNotIn(field, peer)
+
+    def test_handle_control_pong_records_valid_agent_and_survives_crafted(self):
+        # The real inbound handler path (not isolated note_peer): a valid agent
+        # is recorded; a crafted unhashable agent does not crash the receiver.
+        cfg = self._cfg()
+        mesh._handle_control(cfg, "alpha", "beta",
+                             {"mw": "pong", "status": "listening",
+                              "agent": "active"})
+        self.assertEqual(mesh.load_peers(cfg)["beta"].get("agent"), "active")
+        mesh._handle_control(cfg, "alpha", "gamma",
+                             {"mw": "pong", "status": "listening", "agent": []})
+        self.assertNotIn("agent", mesh.load_peers(cfg)["gamma"])
+
+    def test_handle_control_presence_survives_crafted_status(self):
+        # the mw=presence branch does `ctl.get("status") in PRESENCE_STATES`.
+        cfg = self._cfg()
+        mesh._handle_control(cfg, "alpha", "beta",
+                             {"mw": "presence", "status": []})   # must not raise
+        self.assertNotIn("beta", mesh.load_peers(cfg))           # crafted -> ignored
+
+    def test_local_status_survives_corrupted_status_file(self):
+        # local_status reads a persisted status; a non-string must not crash the
+        # `value in PRESENCE_STATES` read (it feeds outbound pong/ack via ctl).
+        cfg = self._cfg()
+        with open(mesh.status_file(cfg, "me"), "w") as f:
+            json.dump({"status": []}, f)
+        self.assertEqual(mesh.local_status(cfg, "me"), "listening")
+
+    def test_send_ack_stamps_agent_on_the_wire(self):
+        # Closes the coverage gap: prove the real _send_ack production wiring
+        # stamps agent onto the outbound frame, not just _stamp_posture alone.
+        cfg = self._cfg()
+        mesh._write_agent_heartbeat(cfg, "alpha", wake="sampling")
+        captured = {}
+
+        def fake_send_raw(cfg_, me_, to_, kind_, ctl=None, **kw):
+            captured["ctl"] = ctl
+
+        with mock.patch.object(mesh, "send_raw", fake_send_raw):
+            mesh._send_ack(cfg, "alpha", "beta", {"id": "e1"})
+        self.assertEqual(captured.get("ctl", {}).get("agent"), "active")
+
+    def test_self_state_never_raises_on_malformed_helper_return(self):
+        # blocker 2: the membership check sits outside the try; a malformed
+        # ([], None) helper return would raise. isinstance-gate makes it unknown.
+        cfg = self._cfg()
+        with mock.patch.object(mesh, "_agent_liveness", return_value=([], None)):
+            self.assertIsNone(mesh._self_agent_state(cfg, "alpha"))
+        with mock.patch.object(mesh, "_receiver_liveness",
+                               return_value=([], None)):
+            self.assertIsNone(mesh._self_recv_state(cfg, "alpha"))
 
 
 class AdoptExecB2b2aTests(unittest.TestCase):
