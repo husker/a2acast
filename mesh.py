@@ -3936,7 +3936,7 @@ def _self_recv_state(cfg, node):
         state = _receiver_liveness(cfg, node)[0]
     except (KeyError, OSError, ValueError, TypeError):
         return None
-    return state if state in RECV_STATES else None
+    return state if isinstance(state, str) and state in RECV_STATES else None
 
 
 def _self_agent_state(cfg, node):
@@ -3951,7 +3951,7 @@ def _self_agent_state(cfg, node):
         # honor never-raises-into-send literally (the #167 seat lesson): the
         # except list is not enumerated -- any unexpected error becomes 'unknown'.
         return None
-    return state if state in AGENT_STATES else None
+    return state if isinstance(state, str) and state in AGENT_STATES else None
 
 
 def _stamp_posture(ctl, recv=None, agent=None):
@@ -3961,9 +3961,9 @@ def _stamp_posture(ctl, recv=None, agent=None):
     on older peers, which read as 'unknown' (mixed-version-safe, display-only)."""
     if _process_posture:
         ctl["posture"] = _process_posture
-    if recv in RECV_STATES:
+    if isinstance(recv, str) and recv in RECV_STATES:
         ctl["recv"] = recv
-    if agent in AGENT_STATES:
+    if isinstance(agent, str) and agent in AGENT_STATES:
         ctl["agent"] = agent
     return ctl
 
@@ -4083,9 +4083,9 @@ def note_peer(cfg, node, via, status=None, posture=None, recv=None, agent=None):
     if isinstance(posture, str) and posture:
         # #122: untrusted wire input -- flatten and bound before storing.
         peer.update({"posture": _single_line(posture)[:24]})
-    if recv in RECV_STATES:  # #166: peer's reported receiver-health
+    if isinstance(recv, str) and recv in RECV_STATES:  # #166: peer's reported receiver-health (untrusted; `[] in set` raises)
         peer.update({"recv": recv, "recv_seen": now})
-    if agent in AGENT_STATES:  # inc2: peer's reported agent-liveness
+    if isinstance(agent, str) and agent in AGENT_STATES:  # inc2: peer's reported agent-liveness (untrusted)
         peer.update({"agent": agent, "agent_seen": now})
     peers[node] = peer
     peers = _prune_peers(cfg, peers, node, now)  # #106: bound on write
@@ -10918,9 +10918,9 @@ def cmd_status(args):
             recv = peers[n].get("recv")
             agent = peers[n].get("agent")
             shown = ""
-            if recv in RECV_STATES:  # #166: remote receiver-health
+            if isinstance(recv, str) and recv in RECV_STATES:  # #166: remote receiver-health
                 shown += f", receiver={recv}"
-            if agent in AGENT_STATES:  # inc2: remote agent-liveness (raw, advisory)
+            if isinstance(agent, str) and agent in AGENT_STATES:  # inc2: remote agent-liveness (raw, advisory)
                 shown += f", agent={agent}"
             if isinstance(posture, str) and posture:
                 shown += f", posture={_single_line(str(posture))[:24]}"

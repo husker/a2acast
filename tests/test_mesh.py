@@ -17512,6 +17512,66 @@ class AgentLivenessWireTests(unittest.TestCase):
         self.assertIsNone(mesh._self_agent_state(cfg, "me"))
 
 
+class LivenessWireHardeningTests(unittest.TestCase):
+    """#171 seat (wayfinder), post-merge regression: a set-membership check on an
+    untrusted/persisted recv/agent value raises TypeError on an unhashable list/
+    dict (`[] in AGENT_STATES`) and escapes the receive path. Every boundary must
+    isinstance-gate before `in`."""
+
+    def _cfg(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        return make_cfg(tmp.name)
+
+    def test_note_peer_ignores_unhashable_and_wrong_type(self):
+        # Revert any isinstance gate in note_peer and a crafted []/{} raises
+        # TypeError here instead of being ignored.
+        cfg = self._cfg()
+        for bad in ([], {}, 5, True, "evil"):
+            for field in ("agent", "recv"):
+                mesh.note_peer(cfg, "attacker", "pong", status="listening",
+                               **{field: bad})            # must not raise
+        peer = mesh.load_peers(cfg)["attacker"]
+        self.assertNotIn("agent", peer)
+        self.assertNotIn("recv", peer)
+
+    def test_handle_control_pong_records_valid_agent_and_survives_crafted(self):
+        # The real inbound handler path (not isolated note_peer): a valid agent
+        # is recorded; a crafted unhashable agent does not crash the receiver.
+        cfg = self._cfg()
+        mesh._handle_control(cfg, "alpha", "beta",
+                             {"mw": "pong", "status": "listening",
+                              "agent": "active"})
+        self.assertEqual(mesh.load_peers(cfg)["beta"].get("agent"), "active")
+        mesh._handle_control(cfg, "alpha", "gamma",
+                             {"mw": "pong", "status": "listening", "agent": []})
+        self.assertNotIn("agent", mesh.load_peers(cfg)["gamma"])
+
+    def test_send_ack_stamps_agent_on_the_wire(self):
+        # Closes the coverage gap: prove the real _send_ack production wiring
+        # stamps agent onto the outbound frame, not just _stamp_posture alone.
+        cfg = self._cfg()
+        mesh._write_agent_heartbeat(cfg, "alpha", wake="sampling")
+        captured = {}
+
+        def fake_send_raw(cfg_, me_, to_, kind_, ctl=None, **kw):
+            captured["ctl"] = ctl
+
+        with mock.patch.object(mesh, "send_raw", fake_send_raw):
+            mesh._send_ack(cfg, "alpha", "beta", {"id": "e1"})
+        self.assertEqual(captured.get("ctl", {}).get("agent"), "active")
+
+    def test_self_state_never_raises_on_malformed_helper_return(self):
+        # blocker 2: the membership check sits outside the try; a malformed
+        # ([], None) helper return would raise. isinstance-gate makes it unknown.
+        cfg = self._cfg()
+        with mock.patch.object(mesh, "_agent_liveness", return_value=([], None)):
+            self.assertIsNone(mesh._self_agent_state(cfg, "alpha"))
+        with mock.patch.object(mesh, "_receiver_liveness",
+                               return_value=([], None)):
+            self.assertIsNone(mesh._self_recv_state(cfg, "alpha"))
+
+
 class AdoptExecB2b2aTests(unittest.TestCase):
     """#62 B2b-2a: `adopt-supervise --exec` REALLY checks out an owner-signed
     SHA on a git working tree, smoke-tests the new code, and LOCALLY rolls back
