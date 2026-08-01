@@ -3769,7 +3769,11 @@ def _receiver_liveness(cfg, node, now=None):
     now = int(time.time()) if now is None else int(now)
     try:
         with open(recv_heartbeat_file(cfg, node), "r", encoding="utf-8") as f:
-            ts = json.load(f).get("ts")
+            data = json.load(f)
+        # The heartbeat is written as an object; a valid-JSON non-object (list,
+        # number, ...) would make .get() raise AttributeError straight into the
+        # pong/ack send path, so gate on the type (#167 seat nit, lodestar).
+        ts = data.get("ts") if isinstance(data, dict) else None
     except (OSError, ValueError):
         return ("unknown", None)
     if not isinstance(ts, int):

@@ -17124,6 +17124,15 @@ class ReceiverHeartbeatTests(unittest.TestCase):
         cfg = self._cfg()
         self.assertEqual(mesh._receiver_liveness(cfg, "ghost"), ("unknown", None))
 
+    def test_liveness_non_object_heartbeat_reads_unknown(self):
+        # #167 seat (lodestar): a valid-JSON non-object heartbeat must not raise
+        # AttributeError into the send path. Revert the isinstance guard and
+        # _receiver_liveness raises here instead of returning unknown.
+        cfg = self._cfg()
+        with open(mesh.recv_heartbeat_file(cfg, "n1"), "w", encoding="utf-8") as f:
+            f.write("[1, 2, 3]")
+        self.assertEqual(mesh._receiver_liveness(cfg, "n1"), ("unknown", None))
+
     def test_liveness_reports_stall_past_threshold(self):
         # The load-bearing case: a heartbeat older than RECV_STALL_SECONDS is the
         # silent stall lighthouse hit (subscription held, delivery ceased). Revert
