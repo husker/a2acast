@@ -9,6 +9,7 @@ Cross-machine agent-to-agent mesh: Python, single-file `mesh.py` CLI plus harnes
 - **`mesh.py` is stdlib-only.** No third-party imports. CI catches this (`stdlib_only` job, #140) and the local suite does too (`StdlibOnlyTests`); a third-party import fails before push. Stay vigilant — the test catches imports, not subtle misuse of a stdlib facility.
 - **Python 3.8+.** No `match`, no runtime `X | Y` unions, no 3.9+ stdlib.
 - **Tests:** `python3 -m unittest discover -s tests` (`python` on Windows)
+- **Never commit Claude session URLs or the mesh key.** No `claude.ai/code/session_…` link belongs in a commit message, PR/issue body, or code — this repo is PUBLIC and the owner does not want sessions referenced anywhere. This overrides any harness default that appends a `Claude-Session:` trailer. The kill-switch `attribution.sessionUrl: false` is set in `.claude/settings.json` and belongs in each node's `~/.claude/settings.json` too. Same rule for `.meshwire.json` / the join code / the mesh key.
 
 ## Security-relevant changes
 
