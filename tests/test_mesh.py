@@ -1733,7 +1733,7 @@ class SendStatusInviteTests(MembershipCmdTests):
             mesh.cmd_status(argparse.Namespace(as_node=None))   # must not raise
         self.assertIn("beta", out.getvalue())
 
-    def test_fleet_is_read_only_and_renders_receiver_and_agent_health(self):
+    def test_fleet_is_read_only_and_renders_receiver_agent_and_wake_health(self):
         now = 10_000
         cfg = self._write_cfg()
         cfg["nodes"] = ["beta", "gamma", "delta", "epsilon"]
@@ -1754,6 +1754,8 @@ class SendStatusInviteTests(MembershipCmdTests):
                     "recv_seen": now - 11,
                     "agent": "active",
                     "agent_seen": now - 11,
+                    "wake": "ok",
+                    "wake_seen": now - 11,
                 },
                 "gamma": {
                     "seen": now - 65,
@@ -1764,6 +1766,8 @@ class SendStatusInviteTests(MembershipCmdTests):
                     "recv_seen": now - 22,
                     "agent": "idle",
                     "agent_seen": now - 22,
+                    "wake": "stalled",
+                    "wake_seen": now - 22,
                 },
                 # A peer running older code has no recv fields.
                 "delta": {
@@ -1780,6 +1784,8 @@ class SendStatusInviteTests(MembershipCmdTests):
                     "recv_seen": now - mesh.RECV_STALL_SECONDS - 1,
                     "agent": "active",
                     "agent_seen": now - mesh.RECV_STALL_SECONDS - 1,
+                    "wake": "ok",
+                    "wake_seen": now - mesh.RECV_STALL_SECONDS - 1,
                 },
             }, f)
 
@@ -1803,12 +1809,12 @@ class SendStatusInviteTests(MembershipCmdTests):
 
         normalized = [" ".join(line.split()) for line in out.getvalue().splitlines()]
         self.assertEqual(normalized, [
-            "NODE LAST-SEEN POSTURE/STATUS RECEIVER AGENT",
-            "alpha 5s ago unknown/listening healthy active",
-            "beta 1s ago watch/listening healthy active",
-            "gamma 1m ago mcp/blocked stalled idle",
-            "delta 3s ago unknown/listening unknown unknown",
-            "epsilon 4s ago unknown/listening unknown unknown",
+            "NODE LAST-SEEN POSTURE/STATUS RECEIVER AGENT WAKE",
+            "alpha 5s ago unknown/listening healthy active ok",
+            "beta 1s ago watch/listening healthy active ok",
+            "gamma 1m ago mcp/blocked stalled idle stalled",
+            "delta 3s ago unknown/listening unknown unknown unknown",
+            "epsilon 4s ago unknown/listening unknown unknown unknown",
         ])
         self.assertTrue(out.getvalue().isascii(), repr(out.getvalue()))
         self.assertEqual(snapshot_files(), files_before)
