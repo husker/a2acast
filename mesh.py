@@ -4521,6 +4521,7 @@ def _message_details(body):
     value = _message_object(body)
     if (value is None or value.get("mw") != "message" or
             not _valid_task_id(value.get("id")) or
+            not isinstance(value.get("intent"), str) or  # #174: type-gate before `in`
             value.get("intent") not in MESSAGE_INTENTS or
             not isinstance(value.get("text"), str) or
             ("reply_to" in value and
@@ -4597,6 +4598,7 @@ def _validate_delegate_task_record(cfg, local_node, task_id, value):
             or not _valid_pool_node(value.get("peer"))
             or value.get("peer") == local_node
             or not _valid_task_id(value.get("contextId"))
+            or not isinstance(value.get("worker_backend"), str)  # #174: type-gate
             or value.get("worker_backend") not in WORKER_BACKENDS
             or not isinstance(value.get("text"), str)
             or re.fullmatch(r"[0-9a-f]{64}",
@@ -4604,6 +4606,7 @@ def _validate_delegate_task_record(cfg, local_node, task_id, value):
             or not isinstance(value.get("updated"), int)
             or isinstance(value.get("updated"), bool)
             or not 0 <= value["updated"] <= MAX_RELAY_TIME
+            or not isinstance(value.get("state"), str)  # #174: type-gate before `in`
             or value.get("state") not in TERMINAL_STATES | {"submitted"}
             or _contains_config_secret(cfg, value)):
         raise ValueError("delegate task record is invalid")
