@@ -17528,12 +17528,12 @@ class LivenessWireHardeningTests(unittest.TestCase):
         # TypeError here instead of being ignored.
         cfg = self._cfg()
         for bad in ([], {}, 5, True, "evil"):
-            for field in ("agent", "recv"):
-                mesh.note_peer(cfg, "attacker", "pong", status="listening",
+            for field in ("status", "agent", "recv"):
+                mesh.note_peer(cfg, "attacker", "pong",
                                **{field: bad})            # must not raise
         peer = mesh.load_peers(cfg)["attacker"]
-        self.assertNotIn("agent", peer)
-        self.assertNotIn("recv", peer)
+        for field in ("status", "agent", "recv"):
+            self.assertNotIn(field, peer)
 
     def test_handle_control_pong_records_valid_agent_and_survives_crafted(self):
         # The real inbound handler path (not isolated note_peer): a valid agent
@@ -17546,6 +17546,21 @@ class LivenessWireHardeningTests(unittest.TestCase):
         mesh._handle_control(cfg, "alpha", "gamma",
                              {"mw": "pong", "status": "listening", "agent": []})
         self.assertNotIn("agent", mesh.load_peers(cfg)["gamma"])
+
+    def test_handle_control_presence_survives_crafted_status(self):
+        # the mw=presence branch does `ctl.get("status") in PRESENCE_STATES`.
+        cfg = self._cfg()
+        mesh._handle_control(cfg, "alpha", "beta",
+                             {"mw": "presence", "status": []})   # must not raise
+        self.assertNotIn("beta", mesh.load_peers(cfg))           # crafted -> ignored
+
+    def test_local_status_survives_corrupted_status_file(self):
+        # local_status reads a persisted status; a non-string must not crash the
+        # `value in PRESENCE_STATES` read (it feeds outbound pong/ack via ctl).
+        cfg = self._cfg()
+        with open(mesh.status_file(cfg, "me"), "w") as f:
+            json.dump({"status": []}, f)
+        self.assertEqual(mesh.local_status(cfg, "me"), "listening")
 
     def test_send_ack_stamps_agent_on_the_wire(self):
         # Closes the coverage gap: prove the real _send_ack production wiring

@@ -3972,7 +3972,7 @@ def local_status(cfg, node):
     try:
         with open(status_file(cfg, node), "r", encoding="utf-8") as f:
             value = json.load(f).get("status")
-        return value if value in PRESENCE_STATES else "listening"
+        return value if isinstance(value, str) and value in PRESENCE_STATES else "listening"
     except (OSError, ValueError, AttributeError):
         return "listening"
 
@@ -4078,7 +4078,7 @@ def note_peer(cfg, node, via, status=None, posture=None, recv=None, agent=None):
     now = int(time.time())
     peer = peers.get(node) if isinstance(peers.get(node), dict) else {}
     peer.update({"seen": now, "via": via})
-    if status in PRESENCE_STATES:
+    if isinstance(status, str) and status in PRESENCE_STATES:  # untrusted wire (`[] in set` raises)
         peer.update({"status": status, "status_seen": now})
     if isinstance(posture, str) and posture:
         # #122: untrusted wire input -- flatten and bound before storing.
@@ -8678,7 +8678,7 @@ def _handle_control(cfg, me, frm, ctl, verdict=None, ev=None):
         note_peer(cfg, frm, "ack", ctl.get("status"),
                   posture=ctl.get("posture"), recv=ctl.get("recv"), agent=ctl.get("agent"))
         return None
-    if kind == "presence" and ctl.get("status") in PRESENCE_STATES:
+    if kind == "presence" and isinstance(ctl.get("status"), str) and ctl.get("status") in PRESENCE_STATES:
         note_peer(cfg, frm, "presence", ctl["status"])
         return None
     if kind == "crash":
