@@ -17782,9 +17782,21 @@ class AdoptExecB2b2aTests(unittest.TestCase):
         self.assertFalse(called)
         self.assertIn("DRY-RUN", err)
 
-    def test_supervise_exec_pkg_type_stays_dryrun(self):
+    def test_supervise_exec_routes_pkg_types_to_pkg_exec(self):
+        # Contract superseded by B2b-2b: pkg types no longer stay dry-run
+        # under --exec — they route to the pkg exec layer (whose own gates
+        # then apply; this fixture's git-style artifact fails the sha256
+        # format gate with nothing run).
         called, err = self._routing_case("pip", exec_mode=True)
-        self.assertFalse(called)  # pip is not a git-tree type
+        self.assertFalse(called)  # ...the GIT exec layer, that is
+        self.assertIn("B2b-2b", err)
+        self.assertNotIn("exec not enabled", err)
+
+    def test_supervise_exec_unvalidated_type_stays_dryrun(self):
+        # uv-tool-git is still in NO exec slice (needs a uv reinstall path):
+        # the WOULDEXEC guard remains for genuinely unvalidated types.
+        called, err = self._routing_case("uv-tool-git", exec_mode=True)
+        self.assertFalse(called)
         self.assertIn("exec not enabled", err)
 
 
@@ -17838,6 +17850,228 @@ class WatchdogSupervisorTests(unittest.TestCase):
         self.assertFalse(fired.wait(timeout=0.3), "watchdog killed a healthy node")
         stop.set()
         t.join(timeout=2)
+
+
+class PkgAdoptExecTests(unittest.TestCase):
+    """#62 B2b-2b: real exec for pipx/pip/uv-tool-pypi. Hermetic — fetch/run/
+    smoke/origin are injected; no network, no installer binaries."""
+
+    GOOD = b"good-wheel-bytes"
+    OLD = b"previous-wheel-bytes"
+
+    def _cfg(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        return make_cfg(tmp.name)
+
+    def _descriptor(self, version="9.9.9", blob=GOOD):
+        return {"action": "adopt-release", "version": version,
+                "artifact": hashlib.sha256(blob).hexdigest()}
+
+    def _fetch(self, new_blob=GOOD, old_blob=OLD, missing=()):
+        def fetch(version, destdir):
+            if version in missing:
+                return None
+            blob = new_blob if version == "9.9.9" else old_blob
+            path = os.path.join(destdir, f"a2acast-{version}-py3-none-any.whl")
+            with open(path, "wb") as f:
+                f.write(blob)
+            return path
+        return fetch
+
+    def _exec(self, cfg, rec=None, descriptor=None, install_type="pipx",
+              fetch=None, rc=0, smoke="9.9.9", origin=True):
+        rec = rec if rec is not None else {"status": "pending"}
+        calls = []
+
+        def run(argv):
+            calls.append(list(argv))
+            return rc if len(calls) == 1 else 0  # rollback install succeeds
+        # CI runners have no pipx/uv on PATH; argv construction must not
+        # depend on the host (run is injected — nothing executes).
+        with mock.patch.object(mesh.shutil, "which",
+                               lambda name: "/fake/bin/" + name):
+            ok = mesh._adopt_exec_pkg(
+                cfg, "nonce1", rec, descriptor or self._descriptor(),
+                install_type,
+                fetch=fetch or self._fetch(),
+                run=run,
+                smoke=lambda: smoke,
+                origin_ok=lambda t, p: origin,
+                pending={})
+        return ok, rec, calls
+
+    def test_tampered_wheel_nothing_installed(self):
+        # (a) THE trust gate: fetched bytes that don't hash to the OWNER-
+        # SIGNED artifact must never reach an installer. Drop the hash-select
+        # and this fails.
+        cfg = self._cfg()
+        ok, rec, calls = self._exec(
+            cfg, fetch=self._fetch(new_blob=b"tampered-bytes"))
+        self.assertFalse(ok)
+        self.assertEqual(rec["status"], "failed")
+        self.assertEqual(calls, [], "installer ran on unverified bytes")
+
+    def test_install_argv_uses_verified_file_never_spec(self):
+        # (b-argv) The resolver must install exactly the verified FILE — a
+        # bare a2acast==V spec would let it re-fetch unverified bytes.
+        cfg = self._cfg()
+        ok, rec, calls = self._exec(cfg)
+        self.assertTrue(ok)
+        self.assertEqual(rec["status"], "applied")
+        self.assertEqual(len(calls), 1)
+        wheel_args = [a for a in calls[0] if a.endswith(".whl")]
+        self.assertEqual(len(wheel_args), 1)
+        self.assertTrue(os.path.isfile(wheel_args[0]),
+                        "installed path must persist past the exec (origin "
+                        "gate re-hashes it on the NEXT adopt)")
+        self.assertFalse(any("a2acast==" in a for a in calls[0]))
+        # And the persisted file is byte-identical to what was verified.
+        with open(wheel_args[0], "rb") as f:
+            self.assertEqual(f.read(), self.GOOD)
+
+    def test_origin_not_repinnable_refused_pending_stays(self):
+        # (c) Precondition refusal: record STAYS pending, nothing runs.
+        cfg = self._cfg()
+        ok, rec, calls = self._exec(cfg, origin=False)
+        self.assertFalse(ok)
+        self.assertEqual(rec["status"], "pending")
+        self.assertEqual(calls, [])
+
+    def test_origin_gate_second_adopt_and_dev_origin(self):
+        # (c) The self-defeat trap, both directions: a dev/local origin
+        # refuses; our own applied-record origin (receipt now names the
+        # installed wheel path) re-pins. Drop the applied-record arm and the
+        # second-adopt case fails.
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        wheel = os.path.join(tmp.name, "a2acast-9.9.9-py3-none-any.whl")
+        with open(wheel, "wb") as f:
+            f.write(self.GOOD)
+        art = hashlib.sha256(self.GOOD).hexdigest()
+        orig = mesh._pipx_receipt_origin
+        self.addCleanup(lambda: setattr(mesh, "_pipx_receipt_origin", orig))
+        for origin, pending, want in (
+                ("a2acast", {}, True),                        # PyPI origin
+                ("/Users/dev/meshwire", {}, False),           # dev origin
+                (wheel, {"n": {"status": "applied",           # 2nd adopt
+                               "applied_wheel_path": wheel,
+                               "applied_artifact": art}}, True),
+                (wheel, {"n": {"status": "applied",           # tampered file
+                               "applied_wheel_path": wheel,
+                               "applied_artifact": "0" * 64}}, False)):
+            mesh._pipx_receipt_origin = lambda o=origin: o
+            self.assertEqual(
+                mesh._pkg_origin_repinnable("pipx", pending), want,
+                f"origin={origin!r}")
+
+    def test_missing_rollback_wheel_refuses_premutation(self):
+        # (rollback precondition) No local rollback point -> no exec at all.
+        cfg = self._cfg()
+        ok, rec, calls = self._exec(
+            cfg, fetch=self._fetch(missing=(mesh.VERSION,)))
+        self.assertFalse(ok)
+        self.assertEqual(rec["status"], "pending")
+        self.assertEqual(calls, [])
+
+    def test_smoke_version_mismatch_rolls_back(self):
+        # (b) Failure atomicity: installed env must report EXACTLY the pinned
+        # version; anything else re-installs the recorded rollback wheel.
+        # Drop the version assert and this fails.
+        cfg = self._cfg()
+        ok, rec, calls = self._exec(cfg, smoke="9.9.8")
+        self.assertFalse(ok)
+        self.assertEqual(rec["status"], "failed")
+        self.assertEqual(len(calls), 2, "rollback install did not run")
+        self.assertIn(rec["rollback_wheel"], calls[1])
+
+    def test_tampered_rollback_wheel_never_installed(self):
+        # (b) Rollback re-verify: bytes that no longer match the hash
+        # recorded before mutation must not install even to roll back.
+        cfg = self._cfg()
+        rec = {"status": "pending"}
+        calls = []
+
+        def run(argv):
+            calls.append(list(argv))
+            # Simulate an attacker swapping the rollback wheel while the
+            # (failing) install runs.
+            with open(rec["rollback_wheel"], "wb") as f:
+                f.write(b"swapped-rollback-bytes")
+            return 0
+        with mock.patch.object(mesh.shutil, "which",
+                               lambda name: "/fake/bin/" + name):
+            mesh._adopt_exec_pkg(
+                cfg, "n1", rec, self._descriptor(), "pipx",
+                fetch=self._fetch(), run=run, smoke=lambda: "wrong",
+                origin_ok=lambda t, p: True, pending={})
+        self.assertEqual(rec["status"], "failed")
+        self.assertEqual(len(calls), 1, "rollback installed unverified bytes")
+
+    def test_consumed_or_unverified_record_never_reaches_exec(self):
+        # (e) B2a composition: a record that fails owner re-verify (consumed
+        # nonce, tampered token) must never reach the exec layer.
+        cfg = self._cfg()
+        with open(mesh._adopt_pending_file(cfg), "w", encoding="utf-8") as f:
+            json.dump({"n1": {"status": "pending", "token": "tok",
+                              "descriptor": self._descriptor()}}, f)
+        with mock.patch.object(mesh, "_verify_approval",
+                               return_value=(False, "nonce consumed")), \
+                mock.patch.object(mesh, "_adopt_exec_pkg") as ex:
+            mesh._adopt_supervise_once(cfg, install_type="pipx",
+                                       exec_mode=True)
+        ex.assert_not_called()
+
+    def test_dry_run_default_and_exec_wiring(self):
+        # Legitimate-use guard both ways: without --exec pkg types stay
+        # WOULDEXEC; with it, the pkg exec layer is invoked.
+        cfg = self._cfg()
+        with open(mesh._adopt_pending_file(cfg), "w", encoding="utf-8") as f:
+            json.dump({"n1": {"status": "pending", "token": "tok",
+                              "descriptor": self._descriptor()}}, f)
+        with mock.patch.object(mesh, "_verify_approval",
+                               return_value=(True, "")), \
+                mock.patch.object(mesh, "_adopt_exec_pkg") as ex:
+            mesh._adopt_supervise_once(cfg, install_type="pipx",
+                                       exec_mode=False)
+            ex.assert_not_called()
+            mesh._adopt_supervise_once(cfg, install_type="pipx",
+                                       exec_mode=True)
+            ex.assert_called_once()
+
+    def test_version_and_artifact_format_gates(self):
+        cfg = self._cfg()
+        for version, artifact in (
+                ("--index-url=evil", "a" * 64),   # argv-shaped version
+                ("9.9.9", "nothex"),              # non-sha artifact
+                ("9.9.9", "abc123")):             # git-length sha on pkg type
+            rec = {"status": "pending"}
+            ok, rec, calls = self._exec(
+                cfg, rec=rec,
+                descriptor={"action": "adopt-release", "version": version,
+                            "artifact": artifact})
+            self.assertFalse(ok, f"{version}/{artifact}")
+            self.assertEqual(calls, [])
+
+    def test_fetch_release_wheel_pins_host(self):
+        # (d) structural poisoned-index defense: the fetch takes its file URL
+        # from the pypi.org JSON, but a hostile body cannot redirect the
+        # download off files.pythonhosted.org. Drop the host check and this
+        # fails.
+        evil = {"urls": [{"filename": "a2acast-9.9.9-py3-none-any.whl",
+                          "url": "https://evil.example.com/x.whl"}]}
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        # A fresh readable body per call: the first serves the release JSON,
+        # any later call serves wheel bytes — so if the host gate were
+        # dropped, the evil download would SUCCEED and the test would fail
+        # (a single exhausted BytesIO would mask the mutation).
+        bodies = [io.BytesIO(json.dumps(evil).encode()),
+                  io.BytesIO(b"evil-wheel-bytes")]
+        with mock.patch.object(mesh, "http",
+                               side_effect=lambda *a, **k: bodies.pop(0)):
+            self.assertIsNone(
+                mesh._fetch_release_wheel("9.9.9", tmp.name))
 
 
 class PresenceLivenessTests(unittest.TestCase):
