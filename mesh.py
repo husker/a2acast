@@ -181,6 +181,11 @@ WEDGED_HOOK_SECONDS = 120
 # must ALSO be stale before the node reads wake-stalled.
 WAKE_STALL_SECONDS = 1800
 HOOK_MODES = {"defer", "relay"}
+# #177: a presence holder that has not yet delivered its first relay event has
+# no heartbeat to prove health with; inside this window a live lock is trusted
+# on pid alone. Kept SMALL on purpose (first keepalive lands well inside it):
+# a zombie that dies in-grace can capture hooks only until the grace expires.
+PRESENCE_STARTUP_GRACE = 90
 HOOK_LOCK_PREFIX = "a2acast-agent-hook-"
 PRESENCE_LOCK_PREFIX = "mw-presence-"
 SUPERVISE_LOCK_PREFIX = "mw-supervise-"
@@ -3775,8 +3780,14 @@ def _write_recv_heartbeat(cfg, node, now=None):
     stale file is the only externally-visible signal of a silent stall, so this
     is best-effort and must NEVER raise into the receive loop."""
     try:
+        # `pid` (#177): writer identity. The recv heartbeat is shared by every
+        # relay reader (presence watch_loop AND a hook's relay fallback), so
+        # presence-health checks must be able to tell WHOSE delivery the
+        # freshness proves — a fallback hook's heartbeat must never
+        # re-validate a zombie presence holder (the oscillation trap).
         _write_json_secure(recv_heartbeat_file(cfg, node),
-                           {"ts": int(time.time()) if now is None else int(now)})
+                           {"ts": int(time.time()) if now is None else int(now),
+                            "pid": os.getpid()})
     except OSError:
         pass
 
@@ -10712,8 +10723,50 @@ def _shutdown_supervisor_receiver(receiver, receiver_thread,
 
 
 def _presence_is_live(cfg, node):
+    """#177: liveness != health. A pid-alive lock holder whose watch_loop
+    (daemon thread) has died is a ZOMBIE: it captures every turn-end hook into
+    defer mode against an activity file nothing will ever write — the node
+    reads `listening` while receiving nothing. So a live pid must also PROVE
+    delivery: a #161 recv heartbeat fresh within RECV_STALL_SECONDS and —
+    because the heartbeat file is shared with a hook's relay fallback —
+    written by the LOCK HOLDER ITSELF (pid match). Without the pid term, the
+    fallback hook's own heartbeat would re-validate the zombie and the node
+    would oscillate between capture and delivery on alternate turns.
+
+    Mixed-version leniency: a pre-#177 holder writes no pid into the
+    heartbeat; a fresh pidless heartbeat is accepted (an old-code HEALTHY
+    holder is the common case; an old-code zombie's heartbeat is stale anyway
+    unless a fallback hook is actively refreshing it — that residual
+    oscillation closes as the fleet upgrades). Startup grace: a holder that
+    just acquired the lock has not delivered yet; trust a young lock
+    (PRESENCE_STARTUP_GRACE) on pid alone, so a zombie that dies in-grace can
+    capture only until the grace expires. Failing toward relay is safe: the
+    mesh is at-least-once and duplicate delivery is harmless."""
     path = presence_lock_file(cfg, node)
-    return os.path.exists(path) and _hook_lock_is_live(path)
+    if not (os.path.exists(path) and _hook_lock_is_live(path)):
+        return False
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            lock_pid = json.load(f).get("pid")
+    except (OSError, ValueError, AttributeError):
+        return False
+    try:
+        with open(recv_heartbeat_file(cfg, node), "r", encoding="utf-8") as f:
+            hb = json.load(f)
+    except (OSError, ValueError):
+        hb = None
+    if isinstance(hb, dict):
+        ts = hb.get("ts")
+        if (isinstance(ts, int) and not isinstance(ts, bool)
+                and 0 <= time.time() - ts <= RECV_STALL_SECONDS):
+            hb_pid = hb.get("pid")
+            if hb_pid is None or hb_pid == lock_pid:
+                return True
+    try:
+        lock_age = time.time() - os.path.getmtime(path)
+    except OSError:
+        return False
+    return 0 <= lock_age <= PRESENCE_STARTUP_GRACE
 
 
 def _compact_hook_output(output):

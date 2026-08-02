@@ -17840,6 +17840,109 @@ class WatchdogSupervisorTests(unittest.TestCase):
         t.join(timeout=2)
 
 
+class PresenceLivenessTests(unittest.TestCase):
+    """#177: liveness != health. A pid-alive presence holder whose watch_loop
+    died (zombie) must FAIL _presence_is_live so hooks fall back to relay
+    instead of deferring forever to a presence that never delivers."""
+
+    def _cfg(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        return make_cfg(tmp.name)
+
+    def _lock(self, cfg, node, pid=None, age=None):
+        path = mesh.presence_lock_file(cfg, node)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"pid": os.getpid() if pid is None else pid}, f)
+        if age:
+            t = time.time() - age
+            os.utime(path, (t, t))
+        self.addCleanup(lambda: os.path.exists(path) and os.unlink(path))
+        return path
+
+    def _heartbeat(self, cfg, node, age=0, pid="self", omit_pid=False):
+        rec = {"ts": int(time.time() - age)}
+        if not omit_pid:
+            rec["pid"] = os.getpid() if pid == "self" else pid
+        with open(mesh.recv_heartbeat_file(cfg, node), "w",
+                  encoding="utf-8") as f:
+            json.dump(rec, f)
+
+    def test_zombie_holder_is_not_live(self):
+        # THE #177 bug: live pid + stale heartbeat + aged lock read as live
+        # on old code, capturing every hook into defer. Revert the fix and
+        # this fails.
+        cfg = self._cfg()
+        self._lock(cfg, "n1", age=mesh.PRESENCE_STARTUP_GRACE + 60)
+        self._heartbeat(cfg, "n1", age=mesh.RECV_STALL_SECONDS + 60)
+        self.assertFalse(mesh._presence_is_live(cfg, "n1"))
+
+    def test_fallback_hook_heartbeat_does_not_revalidate_zombie(self):
+        # The oscillation trap: the recv heartbeat file is shared, so a relay
+        # fallback hook refreshing it must not make the zombie read healthy
+        # again. Fresh heartbeat, WRONG writer pid -> not live. Drop the
+        # pid-match term and this fails.
+        cfg = self._cfg()
+        self._lock(cfg, "n1", age=mesh.PRESENCE_STARTUP_GRACE + 60)
+        self._heartbeat(cfg, "n1", age=5, pid=os.getpid() + 20111)
+        self.assertFalse(mesh._presence_is_live(cfg, "n1"))
+
+    def test_healthy_holder_is_live(self):
+        # Load-bearing the other way: a holder proving its own delivery must
+        # stay live, or every healthy presence degrades to double-subscribe.
+        cfg = self._cfg()
+        self._lock(cfg, "n1", age=mesh.PRESENCE_STARTUP_GRACE + 60)
+        self._heartbeat(cfg, "n1", age=5, pid="self")
+        self.assertTrue(mesh._presence_is_live(cfg, "n1"))
+
+    def test_oldcode_pidless_fresh_heartbeat_accepted(self):
+        # Mixed-version leniency: a pre-#177 holder writes no pid; a fresh
+        # pidless heartbeat is accepted (documented residual: an old-code
+        # zombie + active fallback hook can still oscillate until upgraded).
+        cfg = self._cfg()
+        self._lock(cfg, "n1", age=mesh.PRESENCE_STARTUP_GRACE + 60)
+        self._heartbeat(cfg, "n1", age=5, omit_pid=True)
+        self.assertTrue(mesh._presence_is_live(cfg, "n1"))
+
+    def test_startup_grace_is_honored_and_bounded(self):
+        cfg = self._cfg()
+        # Young lock, no heartbeat yet: trusted (grace).
+        self._lock(cfg, "n1")
+        self.assertTrue(mesh._presence_is_live(cfg, "n1"))
+        # Same holder past the grace with still no heartbeat: a zombie that
+        # died in-grace stops capturing. Drop the grace bound and this fails.
+        path = mesh.presence_lock_file(cfg, "n1")
+        t = time.time() - mesh.PRESENCE_STARTUP_GRACE - 30
+        os.utime(path, (t, t))
+        self.assertFalse(mesh._presence_is_live(cfg, "n1"))
+
+    def test_dead_pid_holder_is_not_live(self):
+        # Unchanged base behavior: dead holder pid stays not-live regardless
+        # of heartbeat state.
+        cfg = self._cfg()
+        proc = subprocess.Popen([sys.executable, "-c", "pass"])
+        proc.wait()
+        self._lock(cfg, "n1", pid=proc.pid)
+        self._heartbeat(cfg, "n1", age=5, pid=proc.pid)
+        self.assertFalse(mesh._presence_is_live(cfg, "n1"))
+
+    def test_hook_falls_back_to_relay_under_zombie_presence(self):
+        # Integration: with a zombie presence staged, the turn-end arm must
+        # take the RELAY branch (cmd_watch), not defer. On pre-#177 code the
+        # defer branch runs and cmd_watch is never invoked.
+        cfg = self._cfg()
+        self._lock(cfg, "n1", age=mesh.PRESENCE_STARTUP_GRACE + 60)
+        self._heartbeat(cfg, "n1", age=mesh.RECV_STALL_SECONDS + 60)
+        with mock.patch.object(mesh, "load_config", return_value=cfg), \
+                mock.patch.object(mesh, "find_config", return_value=True), \
+                mock.patch.object(mesh, "cmd_watch") as watch:
+            mesh._wait_for_hook_message(
+                argparse.Namespace(as_node="n1", timeout=1),
+                hook_input={}, harness="claude")
+        watch.assert_called_once()
+        self.assertEqual(watch.call_args.args[0].timeout, 1)
+
+
 class WakeWatchdogTests(unittest.TestCase):
     """#158 wake-stall increment: the wake-path watchdog. The #161 heartbeat
     proves frames ARRIVE; #170 proves an agent WOKE; neither proves deliveries
