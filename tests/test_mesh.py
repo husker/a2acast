@@ -17880,9 +17880,16 @@ class PkgAdoptExecTests(unittest.TestCase):
         return fetch
 
     def _exec(self, cfg, rec=None, descriptor=None, install_type="pipx",
-              fetch=None, rc=0, smoke="9.9.9", origin=True):
+              fetch=None, rc=0, smoke=("9.9.8", "9.9.9"), origin=True):
+        """smoke is (pre-flight current, post-install reported): the exec
+        probes the installed env BEFORE mutating (its version anchors the
+        rollback wheel) and again after (must equal the pin)."""
         rec = rec if rec is not None else {"status": "pending"}
         calls = []
+        seq = list(smoke)
+
+        def smoke_fn():
+            return seq.pop(0) if len(seq) > 1 else seq[0]
 
         def run(argv):
             calls.append(list(argv))
@@ -17896,7 +17903,7 @@ class PkgAdoptExecTests(unittest.TestCase):
                 install_type,
                 fetch=fetch or self._fetch(),
                 run=run,
-                smoke=lambda: smoke,
+                smoke=smoke_fn,
                 origin_ok=lambda t, p: origin,
                 pending={})
         return ok, rec, calls
@@ -17953,6 +17960,11 @@ class PkgAdoptExecTests(unittest.TestCase):
         self.addCleanup(lambda: setattr(mesh, "_pipx_receipt_origin", orig))
         for origin, pending, want in (
                 ("a2acast", {}, True),                        # PyPI origin
+                ("a2acast==0.19.0", {}, True),                # LIVE finding:
+                # a real `pipx install a2acast==V` records the FULL spec
+                ("a2acast>=0.19", {}, True),                  # spec forms
+                ("a2acastx==1.0", {}, False),                 # name prefix trick
+                ("evilpkg==1.0", {}, False),                  # different pkg
                 ("/Users/dev/meshwire", {}, False),           # dev origin
                 (wheel, {"n": {"status": "applied",           # 2nd adopt
                                "applied_wheel_path": wheel,
@@ -17967,9 +17979,21 @@ class PkgAdoptExecTests(unittest.TestCase):
 
     def test_missing_rollback_wheel_refuses_premutation(self):
         # (rollback precondition) No local rollback point -> no exec at all.
+        # The rollback anchor is the INSTALLED env's probed version (9.9.8),
+        # NOT the supervisor's VERSION constant (live finding, #180).
         cfg = self._cfg()
         ok, rec, calls = self._exec(
-            cfg, fetch=self._fetch(missing=(mesh.VERSION,)))
+            cfg, fetch=self._fetch(missing=("9.9.8",)))
+        self.assertFalse(ok)
+        self.assertEqual(rec["status"], "pending")
+        self.assertEqual(calls, [])
+
+    def test_unreadable_current_version_refuses_premutation(self):
+        # (live finding, #180) An environment whose version cannot be read
+        # has no rollback anchor AND no working post-install smoke: refuse
+        # before touching anything.
+        cfg = self._cfg()
+        ok, rec, calls = self._exec(cfg, smoke=(None, "9.9.9"))
         self.assertFalse(ok)
         self.assertEqual(rec["status"], "pending")
         self.assertEqual(calls, [])
@@ -17979,7 +18003,7 @@ class PkgAdoptExecTests(unittest.TestCase):
         # version; anything else re-installs the recorded rollback wheel.
         # Drop the version assert and this fails.
         cfg = self._cfg()
-        ok, rec, calls = self._exec(cfg, smoke="9.9.8")
+        ok, rec, calls = self._exec(cfg, smoke=("9.9.8", "9.9.8"))
         self.assertFalse(ok)
         self.assertEqual(rec["status"], "failed")
         self.assertEqual(len(calls), 2, "rollback install did not run")
@@ -17999,11 +18023,13 @@ class PkgAdoptExecTests(unittest.TestCase):
             with open(rec["rollback_wheel"], "wb") as f:
                 f.write(b"swapped-rollback-bytes")
             return 0
+        seq = ["9.9.8", "9.9.7"]  # pre-flight ok; post-install mismatch
         with mock.patch.object(mesh.shutil, "which",
                                lambda name: "/fake/bin/" + name):
             mesh._adopt_exec_pkg(
                 cfg, "n1", rec, self._descriptor(), "pipx",
-                fetch=self._fetch(), run=run, smoke=lambda: "wrong",
+                fetch=self._fetch(), run=run,
+                smoke=lambda: seq.pop(0) if len(seq) > 1 else seq[0],
                 origin_ok=lambda t, p: True, pending={})
         self.assertEqual(rec["status"], "failed")
         self.assertEqual(len(calls), 1, "rollback installed unverified bytes")
@@ -18052,6 +18078,43 @@ class PkgAdoptExecTests(unittest.TestCase):
                             "artifact": artifact})
             self.assertFalse(ok, f"{version}/{artifact}")
             self.assertEqual(calls, [])
+
+    def test_smoke_runs_isolated_from_cwd(self):
+        # LIVE finding: plain `python -c` puts CWD on sys.path, so a
+        # supervisor run from the repo dir would smoke the REPO's mesh, not
+        # the installed env. -I is load-bearing; drop it and this fails.
+        # (pip family: the env python IS sys.executable, no lookup needed.)
+        seen = {}
+
+        def fake_run(argv, **kw):
+            seen["argv"] = list(argv)
+            return mock.Mock(returncode=0, stdout="9.9.9\n")
+        with mock.patch.object(mesh.subprocess, "run", fake_run):
+            self.assertEqual(mesh._pkg_smoke_version("pip"), "9.9.9")
+        self.assertIn("-I", seen["argv"])
+
+    def test_env_python_rejects_sh_trampoline_and_strips_shebang_args(self):
+        # LIVE finding: pipx emits a #!/bin/sh trampoline when the venv path
+        # is long (both shebang forms exist in the field), and the python
+        # form carries " -E". The interpreter lookup must never return
+        # /bin/sh, and must strip arguments from a python shebang.
+        with mock.patch.object(mesh, "_tool_reported_dir",
+                               lambda argv: None), \
+                mock.patch.object(mesh.shutil, "which",
+                                  lambda n: "/fake/bin/" + n), \
+                mock.patch.object(mesh, "_mesh_shebang",
+                                  lambda exe: "/bin/sh"):
+            self.assertIsNone(mesh._pkg_env_python("pipx"))
+        with mock.patch.object(mesh, "_tool_reported_dir",
+                               lambda argv: None), \
+                mock.patch.object(mesh.shutil, "which",
+                                  lambda n: "/fake/bin/" + n), \
+                mock.patch.object(mesh, "_mesh_shebang",
+                                  lambda exe: "/venv/bin/python -E"), \
+                mock.patch.object(mesh.os.path, "isfile",
+                                  lambda p: p == "/venv/bin/python"):
+            self.assertEqual(mesh._pkg_env_python("pipx"),
+                             "/venv/bin/python")
 
     def test_fetch_release_wheel_pins_host(self):
         # (d) structural poisoned-index defense: the fetch takes its file URL

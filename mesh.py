@@ -3133,8 +3133,15 @@ def _pkg_origin_repinnable(install_type, pending):
             return False
     if install_type == "pipx":
         origin = _pipx_receipt_origin()
-        if origin == "a2acast":
-            return True
+        # LIVE-VALIDATION finding (#180): a real `pipx install a2acast==V`
+        # records the FULL requirement spec ("a2acast==0.19.0"), not the bare
+        # name — matching only "a2acast" refuses every genuine PyPI-origin
+        # node. Accept any spec whose PROJECT NAME is a2acast: the name is
+        # the prefix before the first specifier/extras/marker character.
+        if isinstance(origin, str):
+            name = re.split(r"[=<>!~;@\[\s]", origin.strip(), maxsplit=1)[0]
+            if name.lower().replace("-", "_") == "a2acast":
+                return True
         if not isinstance(origin, str) or not origin:
             return False
         for rec in (pending or {}).values():
@@ -3163,17 +3170,59 @@ def _pkg_install_argv(install_type, wheel_path):
     return None
 
 
-def _pkg_smoke_version():
-    """The VERSION reported by the INSTALLED environment (the console
-    script's shebang interpreter -- pipx/uv venv python, or the system python
-    for pip), or None. Per-family interpreter matters: the smoke must run the
-    environment we just mutated, not whichever python the supervisor runs."""
-    py = _mesh_shebang(shutil.which("mesh") or "")
+def _tool_reported_dir(argv):
+    """stdout of a short tool query (e.g. `pipx environment --value ...`,
+    `uv tool dir`), stripped, or None."""
+    try:
+        p = subprocess.run(argv, capture_output=True, text=True, timeout=60)
+        out = p.stdout.strip()
+        return out if p.returncode == 0 and out else None
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def _pkg_env_python(install_type):
+    """The INSTALLED environment's own interpreter, per family, or None.
+    LIVE-VALIDATION finding (#180): the console script's shebang is NOT a
+    reliable interpreter source -- pipx emits a `#!/bin/sh` trampoline when
+    the venv path exceeds the shebang length limit (both forms exist in the
+    field, selected by path length!), and the python form carries ` -E` as an
+    argument. So: derive the venv python from the TOOL's own environment
+    query, with a python-looking shebang as last-resort fallback."""
+    if install_type == "pip":
+        return sys.executable
+    base = None
+    if install_type == "pipx":
+        exe = shutil.which("pipx")
+        base = _tool_reported_dir(
+            [exe, "environment", "--value", "PIPX_LOCAL_VENVS"]) if exe else None
+    elif install_type == "uv-tool-pypi":
+        exe = shutil.which("uv")
+        base = _tool_reported_dir([exe, "tool", "dir"]) if exe else None
+    if base:
+        cand = os.path.join(base, "a2acast", "bin", "python")
+        if os.path.isfile(cand):
+            return cand
+    shebang = _mesh_shebang(shutil.which("mesh") or "")
+    py = shebang.split()[0] if shebang.split() else ""
+    if py and os.path.basename(py).startswith("python") and os.path.isfile(py):
+        return py
+    return None
+
+
+def _pkg_smoke_version(install_type):
+    """The VERSION reported by the INSTALLED environment, or None. Runs the
+    family's own interpreter (_pkg_env_python) with -I: isolated mode is
+    load-bearing (LIVE finding, #180) -- plain `python -c` puts the CWD on
+    sys.path, so a supervisor run from a directory containing mesh.py (the
+    repo!) would report the REPO's version instead of the installed one.
+    -I keeps the interpreter's own (venv) site-packages."""
+    py = _pkg_env_python(install_type)
     if not py:
         return None
     try:
         p = subprocess.run(
-            [py, "-c", "import mesh; print(mesh.VERSION)"],
+            [py, "-I", "-c", "import mesh; print(mesh.VERSION)"],
             capture_output=True, text=True, timeout=60)
         return p.stdout.strip() if p.returncode == 0 else None
     except (OSError, subprocess.SubprocessError):
@@ -3195,7 +3244,7 @@ def _adopt_exec_pkg(cfg, nonce, rec, descriptor, install_type,
     fetch = fetch or _fetch_release_wheel
     run = run or (lambda argv: subprocess.run(
         argv, capture_output=True, text=True, timeout=600).returncode)
-    smoke = smoke or _pkg_smoke_version
+    smoke = smoke or (lambda: _pkg_smoke_version(install_type))
     origin_ok = origin_ok or _pkg_origin_repinnable
     tag = _single_line(str(nonce))[:16]
     version = str(descriptor.get("version"))
@@ -3228,22 +3277,33 @@ def _adopt_exec_pkg(cfg, nonce, rec, descriptor, install_type,
     argv_probe = _pkg_install_argv(install_type, "probe")
     if argv_probe is None:
         return refuse("installer binary not found for this install type")
-    # Rollback point BEFORE any mutation: the currently-running version's
-    # wheel, kept locally; its hash is recorded NOW, while the running code is
-    # still the trusted code. No wheel -> no rollback point -> no exec.
+    # Pre-flight: the INSTALLED environment's current version, probed with
+    # the same smoke used post-install. LIVE-VALIDATION finding (#180): the
+    # supervisor's own VERSION constant is the WRONG rollback anchor -- a
+    # supervisor running from a repo checkout diverges from the managed
+    # install, and it would fetch the wrong rollback wheel. Probing also
+    # proves the smoke path works BEFORE we mutate anything: an environment
+    # whose version we cannot read is an environment we cannot verify after.
+    current = smoke()
+    if not (isinstance(current, str) and _ADOPT_VERSION_RE.fullmatch(current)):
+        return refuse("cannot read the installed environment's current "
+                      "version; no rollback anchor and no working smoke")
+    # Rollback point BEFORE any mutation: the installed version's wheel, kept
+    # locally; its hash is recorded NOW, while the running code is still the
+    # trusted code. No wheel -> no rollback point -> no exec.
     rollback_dir = os.path.join(cfg["_dir"], ".meshwire.adopt-rollback")
     try:
         os.makedirs(rollback_dir, exist_ok=True)
     except OSError:
         return refuse("cannot create rollback store")
-    rollback_wheel = fetch(VERSION, rollback_dir)
+    rollback_wheel = fetch(current, rollback_dir)
     rollback_hash = _file_sha256(rollback_wheel) if rollback_wheel else None
     if not rollback_wheel or not rollback_hash:
-        return refuse(f"current version {VERSION} wheel unavailable; "
+        return refuse(f"current version {current} wheel unavailable; "
                       f"no rollback point")
     rec["rollback_wheel"] = rollback_wheel
     rec["rollback_sha256"] = rollback_hash
-    rec["previous_version"] = VERSION
+    rec["previous_version"] = current
     # tempfile.mkdtemp is 0700 by construction: nothing else can seed
     # candidate files between fetch and hash-select (seat TOCTOU note).
     workdir = tempfile.mkdtemp(prefix="mw-adopt-")
@@ -3265,7 +3325,7 @@ def _adopt_exec_pkg(cfg, nonce, rec, descriptor, install_type,
         argv = _pkg_install_argv(install_type, wheel)
         print(f"MESH_ADOPT_EXEC nonce={tag} version={_single_line(version)} "
               f"install_type={install_type} op={argv} "
-              f"previous={VERSION} (#62 B2b-2b)", file=sys.stderr)
+              f"previous={current} (#62 B2b-2b)", file=sys.stderr)
         rc = run(argv)
         got = smoke() if rc == 0 else None
         if rc == 0 and got == version:
