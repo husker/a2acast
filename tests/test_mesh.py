@@ -17908,6 +17908,7 @@ class PkgAdoptExecTests(unittest.TestCase):
                 pending={})
         return ok, rec, calls
 
+    @unittest.skipUnless(os.name == "posix", "pkg exec refuses on Windows (unvalidated slice)")
     def test_tampered_wheel_nothing_installed(self):
         # (a) THE trust gate: fetched bytes that don't hash to the OWNER-
         # SIGNED artifact must never reach an installer. Drop the hash-select
@@ -17919,6 +17920,7 @@ class PkgAdoptExecTests(unittest.TestCase):
         self.assertEqual(rec["status"], "failed")
         self.assertEqual(calls, [], "installer ran on unverified bytes")
 
+    @unittest.skipUnless(os.name == "posix", "pkg exec refuses on Windows (unvalidated slice)")
     def test_install_argv_uses_verified_file_never_spec(self):
         # (b-argv) The resolver must install exactly the verified FILE — a
         # bare a2acast==V spec would let it re-fetch unverified bytes.
@@ -17937,6 +17939,7 @@ class PkgAdoptExecTests(unittest.TestCase):
         with open(wheel_args[0], "rb") as f:
             self.assertEqual(f.read(), self.GOOD)
 
+    @unittest.skipUnless(os.name == "posix", "pkg exec refuses on Windows (unvalidated slice)")
     def test_origin_not_repinnable_refused_pending_stays(self):
         # (c) Precondition refusal: record STAYS pending, nothing runs.
         cfg = self._cfg()
@@ -17977,6 +17980,7 @@ class PkgAdoptExecTests(unittest.TestCase):
                 mesh._pkg_origin_repinnable("pipx", pending), want,
                 f"origin={origin!r}")
 
+    @unittest.skipUnless(os.name == "posix", "pkg exec refuses on Windows (unvalidated slice)")
     def test_missing_rollback_wheel_refuses_premutation(self):
         # (rollback precondition) No local rollback point -> no exec at all.
         # The rollback anchor is the INSTALLED env's probed version (9.9.8),
@@ -17988,6 +17992,7 @@ class PkgAdoptExecTests(unittest.TestCase):
         self.assertEqual(rec["status"], "pending")
         self.assertEqual(calls, [])
 
+    @unittest.skipUnless(os.name == "posix", "pkg exec refuses on Windows (unvalidated slice)")
     def test_unreadable_current_version_refuses_premutation(self):
         # (live finding, #180) An environment whose version cannot be read
         # has no rollback anchor AND no working post-install smoke: refuse
@@ -17998,6 +18003,7 @@ class PkgAdoptExecTests(unittest.TestCase):
         self.assertEqual(rec["status"], "pending")
         self.assertEqual(calls, [])
 
+    @unittest.skipUnless(os.name == "posix", "pkg exec refuses on Windows (unvalidated slice)")
     def test_smoke_version_mismatch_rolls_back(self):
         # (b) Failure atomicity: installed env must report EXACTLY the pinned
         # version; anything else re-installs the recorded rollback wheel.
@@ -18009,6 +18015,7 @@ class PkgAdoptExecTests(unittest.TestCase):
         self.assertEqual(len(calls), 2, "rollback install did not run")
         self.assertIn(rec["rollback_wheel"], calls[1])
 
+    @unittest.skipUnless(os.name == "posix", "pkg exec refuses on Windows (unvalidated slice)")
     def test_tampered_rollback_wheel_never_installed(self):
         # (b) Rollback re-verify: bytes that no longer match the hash
         # recorded before mutation must not install even to roll back.
@@ -18066,6 +18073,8 @@ class PkgAdoptExecTests(unittest.TestCase):
             ex.assert_called_once()
 
     def test_version_and_artifact_format_gates(self):
+        # No POSIX guard: the format gates run BEFORE the Windows refusal,
+        # so this behavior is identical on every platform.
         cfg = self._cfg()
         for version, artifact in (
                 ("--index-url=evil", "a" * 64),   # argv-shaped version
@@ -18115,6 +18124,16 @@ class PkgAdoptExecTests(unittest.TestCase):
                                   lambda p: p == "/venv/bin/python"):
             self.assertEqual(mesh._pkg_env_python("pipx"),
                              "/venv/bin/python")
+
+    def test_windows_refuses_pkg_exec(self):
+        # The nt gate itself, pinned cross-platform: on Windows the pkg exec
+        # is an unvalidated slice and must refuse with the record pending.
+        cfg = self._cfg()
+        with mock.patch.object(mesh.os, "name", "nt"):
+            ok, rec, calls = self._exec(cfg)
+        self.assertFalse(ok)
+        self.assertEqual(rec["status"], "pending")
+        self.assertEqual(calls, [])
 
     def test_fetch_release_wheel_pins_host(self):
         # (d) structural poisoned-index defense: the fetch takes its file URL
