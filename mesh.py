@@ -3020,6 +3020,348 @@ def _adopt_exec_git_tree(cfg, nonce, rec, descriptor, tree=None):
     return True
 
 
+# #62 B2b-2b: PKG-family real exec (pipx / pip / uv-tool-pypi). Trust model:
+# the installer is a COPY tool, never a trust tool -- we fetch the release
+# wheel ourselves over a STRUCTURALLY PINNED origin (stdlib urllib to pypi.org;
+# design delta from the seat-approved `pip download`+env-scrub, flagged in the
+# PR: no pip subprocess exists in the fetch path, so a poisoned PIP_INDEX_URL /
+# pip.conf has NOTHING to poison), verify its sha256 against the OWNER-SIGNED
+# artifact hash, and install the verified FILE via enumerated argv.
+_PKG_EXEC_TYPES = frozenset({"uv-tool-pypi", "pipx", "pip"})
+# Owner-signed or not, descriptor strings never enter argv unshaped: a version
+# is PEP 440-shaped with no leading dash; a pkg artifact is exactly 64 hex.
+_ADOPT_VERSION_RE = re.compile(r"[0-9][0-9A-Za-z.+!]{0,39}$")
+_PYPI_RELEASE_URL = "https://pypi.org/pypi/a2acast/{version}/json"
+
+
+def _fetch_release_wheel(version, destdir):
+    """Download the (single, pure-Python) py3-none-any wheel for `version`
+    from pypi.org into `destdir`; return its path or None. The URL base is a
+    module constant, not configuration: nothing in the environment can point
+    this fetch anywhere else. Integrity is NOT trusted from here -- the caller
+    verifies sha256 against the owner-signed hash before anything installs."""
+    try:
+        with http(_PYPI_RELEASE_URL.format(version=version), timeout=60) as r:
+            meta = json.load(r)
+        urls = meta.get("urls") if isinstance(meta, dict) else None
+        wheel = None
+        for entry in urls if isinstance(urls, list) else []:
+            if (isinstance(entry, dict)
+                    and str(entry.get("filename", "")).endswith(
+                        "py3-none-any.whl")):
+                wheel = entry
+                break
+        if wheel is None:
+            return None
+        url = wheel.get("url")
+        name = os.path.basename(str(wheel.get("filename")))
+        if (not isinstance(url, str)
+                or not url.startswith("https://files.pythonhosted.org/")
+                or not name or os.sep in name or "/" in name):
+            return None  # a hostile JSON body cannot pick the host or path
+        path = os.path.join(destdir, name)
+        with http(url, timeout=300) as r, open(path, "wb") as f:
+            shutil.copyfileobj(r, f)
+        return path
+    except (urllib.error.URLError, HTTPException, OSError, ValueError):
+        return None
+
+
+def _file_sha256(path):
+    h = hashlib.sha256()
+    try:
+        with open(path, "rb") as f:
+            for block in iter(lambda: f.read(1 << 16), b""):
+                h.update(block)
+    except OSError:
+        return None
+    return h.hexdigest()
+
+
+def _select_by_owner_hash(destdir, want_hash):
+    """The file in `destdir` whose sha256 equals the owner-signed hash --
+    EXACTLY one, or None. Selection is by the property (hash), never by
+    filename or only-file-present; `destdir` is a fresh mkdtemp (0700), so
+    nothing else can seed candidates, but the exactly-one rule holds anyway."""
+    matches = []
+    try:
+        names = os.listdir(destdir)
+    except OSError:
+        return None
+    for name in names:
+        p = os.path.join(destdir, name)
+        if os.path.isfile(p) and _file_sha256(p) == want_hash:
+            matches.append(p)
+    return matches[0] if len(matches) == 1 else None
+
+
+def _pipx_receipt_origin():
+    """pipx's recorded origin for a2acast: the `package_or_url` string, or
+    None if unreadable. Read via `pipx list --json` -- the same receipt the
+    detection layer trusts."""
+    exe = shutil.which("pipx")
+    if not exe:
+        return None
+    try:
+        p = subprocess.run([exe, "list", "--json"], capture_output=True,
+                           text=True, timeout=60)
+        data = json.loads(p.stdout) if p.returncode == 0 else None
+        return (data["venvs"]["a2acast"]["metadata"]["main_package"]
+                ["package_or_url"])
+    except (OSError, subprocess.SubprocessError, ValueError, KeyError,
+            TypeError):
+        return None
+
+
+def _pkg_origin_repinnable(install_type, pending):
+    """#62 B2b-2b origin gate: exec only when the CURRENT install's origin is
+    re-pinnable (its version is known and re-fetchable, so a rollback point
+    exists). Adversarial finding baked in: our own verified-wheel install
+    rewrites the pipx receipt origin to a FILE PATH, so the gate tests the
+    property -- the receipt names the release, OR it names the artifact of one
+    of OUR OWN applied adopt records and the file still hashes to that
+    record's owner-verified artifact (a prior adopt is proof the version is
+    re-fetchable). A dev/local origin (e.g. `pipx install .`) refuses."""
+    if install_type == "uv-tool-pypi":
+        return True  # detection already required a registry-source uv receipt
+    if install_type == "pip":
+        try:
+            from importlib import metadata as _ilm
+            dist = _ilm.distribution("a2acast")
+            return dist.read_text("direct_url.json") is None  # PEP 610
+        except Exception:
+            return False
+    if install_type == "pipx":
+        origin = _pipx_receipt_origin()
+        # LIVE-VALIDATION finding (#180): a real `pipx install a2acast==V`
+        # records the FULL requirement spec ("a2acast==0.19.0"), not the bare
+        # name — matching only "a2acast" refuses every genuine PyPI-origin
+        # node. Accept any spec whose PROJECT NAME is a2acast: the name is
+        # the prefix before the first specifier/extras/marker character.
+        if isinstance(origin, str):
+            name = re.split(r"[=<>!~;@\[\s]", origin.strip(), maxsplit=1)[0]
+            if name.lower().replace("-", "_") == "a2acast":
+                return True
+        if not isinstance(origin, str) or not origin:
+            return False
+        for rec in (pending or {}).values():
+            if (isinstance(rec, dict) and rec.get("status") == "applied"
+                    and rec.get("applied_wheel_path") == origin
+                    and isinstance(rec.get("applied_artifact"), str)
+                    and _file_sha256(origin) == rec.get("applied_artifact")):
+                return True
+        return False
+    return False
+
+
+def _pkg_install_argv(install_type, wheel_path):
+    """Enumerated install argv for the VERIFIED wheel file, or None ->
+    refuse. Never a shell string, never a bare `a2acast==V` spec -- the
+    resolver must install exactly the bytes we verified."""
+    if install_type == "pipx":
+        exe = shutil.which("pipx")
+        return [exe, "install", "--force", wheel_path] if exe else None
+    if install_type == "pip":
+        return [sys.executable, "-m", "pip", "install", "--upgrade",
+                wheel_path]
+    if install_type == "uv-tool-pypi":
+        exe = shutil.which("uv")
+        return [exe, "tool", "install", "--force", wheel_path] if exe else None
+    return None
+
+
+def _tool_reported_dir(argv):
+    """stdout of a short tool query (e.g. `pipx environment --value ...`,
+    `uv tool dir`), stripped, or None."""
+    try:
+        p = subprocess.run(argv, capture_output=True, text=True, timeout=60)
+        out = p.stdout.strip()
+        return out if p.returncode == 0 and out else None
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def _pkg_env_python(install_type):
+    """The INSTALLED environment's own interpreter, per family, or None.
+    LIVE-VALIDATION finding (#180): the console script's shebang is NOT a
+    reliable interpreter source -- pipx emits a `#!/bin/sh` trampoline when
+    the venv path exceeds the shebang length limit (both forms exist in the
+    field, selected by path length!), and the python form carries ` -E` as an
+    argument. So: derive the venv python from the TOOL's own environment
+    query, with a python-looking shebang as last-resort fallback."""
+    if install_type == "pip":
+        return sys.executable
+    base = None
+    if install_type == "pipx":
+        exe = shutil.which("pipx")
+        base = _tool_reported_dir(
+            [exe, "environment", "--value", "PIPX_LOCAL_VENVS"]) if exe else None
+    elif install_type == "uv-tool-pypi":
+        exe = shutil.which("uv")
+        base = _tool_reported_dir([exe, "tool", "dir"]) if exe else None
+    if base:
+        cand = os.path.join(base, "a2acast", "bin", "python")
+        if os.path.isfile(cand):
+            return cand
+    shebang = _mesh_shebang(shutil.which("mesh") or "")
+    py = shebang.split()[0] if shebang.split() else ""
+    if py and os.path.basename(py).startswith("python") and os.path.isfile(py):
+        return py
+    return None
+
+
+def _pkg_smoke_version(install_type):
+    """The VERSION reported by the INSTALLED environment, or None. Runs the
+    family's own interpreter (_pkg_env_python) with -I: isolated mode is
+    load-bearing (LIVE finding, #180) -- plain `python -c` puts the CWD on
+    sys.path, so a supervisor run from a directory containing mesh.py (the
+    repo!) would report the REPO's version instead of the installed one.
+    -I keeps the interpreter's own (venv) site-packages."""
+    py = _pkg_env_python(install_type)
+    if not py:
+        return None
+    try:
+        p = subprocess.run(
+            [py, "-I", "-c", "import mesh; print(mesh.VERSION)"],
+            capture_output=True, text=True, timeout=60)
+        return p.stdout.strip() if p.returncode == 0 else None
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def _adopt_exec_pkg(cfg, nonce, rec, descriptor, install_type,
+                    fetch=None, run=None, smoke=None, origin_ok=None,
+                    pending=None):
+    """#62 B2b-2b REAL EXEC for pipx/pip/uv-tool-pypi. Safety-ordered mirror
+    of _adopt_exec_git_tree: format gates -> platform/origin/binary
+    PRECONDITIONS (refuse, record stays pending) -> rollback wheel fetched +
+    hashed BEFORE mutation -> new wheel fetched into a private 0700 tmpdir ->
+    sha256 vs the OWNER-SIGNED artifact (exactly-one match) -> install the
+    verified file -> smoke asserts the installed env reports EXACTLY the
+    pinned version -> on failure, re-verify + install the recorded rollback
+    wheel; mark applied/failed (no loop-retry). Collaborators injectable for
+    hermetic tests; defaults are the real ones."""
+    fetch = fetch or _fetch_release_wheel
+    run = run or (lambda argv: subprocess.run(
+        argv, capture_output=True, text=True, timeout=600).returncode)
+    smoke = smoke or (lambda: _pkg_smoke_version(install_type))
+    origin_ok = origin_ok or _pkg_origin_repinnable
+    tag = _single_line(str(nonce))[:16]
+    version = str(descriptor.get("version"))
+    artifact = str(descriptor.get("artifact")).strip().lower()
+
+    def fail(reason):
+        rec["status"] = "failed"
+        print(f"MESH_ADOPT_FAILED nonce={tag} "
+              f"version={_single_line(version)[:40]} "
+              f"reason={_single_line(reason)} (#62 B2b-2b)", file=sys.stderr)
+        return False
+
+    def refuse(reason):
+        print(f"MESH_ADOPT_REFUSED nonce={tag} "
+              f"version={_single_line(version)[:40]} "
+              f"install_type={install_type} reason={_single_line(reason)} "
+              f"(#62 B2b-2b)", file=sys.stderr)
+        return False
+
+    if not _ADOPT_VERSION_RE.fullmatch(version):
+        return fail("version pin is not PEP 440-shaped")
+    if not re.fullmatch(r"[0-9a-f]{64}", artifact):
+        return fail("pkg artifact pin is not a sha256")
+    # Preconditions: this NODE can't exec (yet) -- the record stays pending.
+    if os.name == "nt":
+        return refuse("pkg exec is not validated on Windows in this slice")
+    if not origin_ok(install_type, pending):
+        return refuse("install origin is not a re-pinnable release; "
+                      "no rollback point")
+    argv_probe = _pkg_install_argv(install_type, "probe")
+    if argv_probe is None:
+        return refuse("installer binary not found for this install type")
+    # Pre-flight: the INSTALLED environment's current version, probed with
+    # the same smoke used post-install. LIVE-VALIDATION finding (#180): the
+    # supervisor's own VERSION constant is the WRONG rollback anchor -- a
+    # supervisor running from a repo checkout diverges from the managed
+    # install, and it would fetch the wrong rollback wheel. Probing also
+    # proves the smoke path works BEFORE we mutate anything: an environment
+    # whose version we cannot read is an environment we cannot verify after.
+    current = smoke()
+    if not (isinstance(current, str) and _ADOPT_VERSION_RE.fullmatch(current)):
+        return refuse("cannot read the installed environment's current "
+                      "version; no rollback anchor and no working smoke")
+    # Rollback point BEFORE any mutation: the installed version's wheel, kept
+    # locally; its hash is recorded NOW, while the running code is still the
+    # trusted code. No wheel -> no rollback point -> no exec.
+    rollback_dir = os.path.join(cfg["_dir"], ".meshwire.adopt-rollback")
+    try:
+        os.makedirs(rollback_dir, exist_ok=True)
+    except OSError:
+        return refuse("cannot create rollback store")
+    rollback_wheel = fetch(current, rollback_dir)
+    rollback_hash = _file_sha256(rollback_wheel) if rollback_wheel else None
+    if not rollback_wheel or not rollback_hash:
+        return refuse(f"current version {current} wheel unavailable; "
+                      f"no rollback point")
+    rec["rollback_wheel"] = rollback_wheel
+    rec["rollback_sha256"] = rollback_hash
+    rec["previous_version"] = current
+    # tempfile.mkdtemp is 0700 by construction: nothing else can seed
+    # candidate files between fetch and hash-select (seat TOCTOU note).
+    workdir = tempfile.mkdtemp(prefix="mw-adopt-")
+    try:
+        fetch(version, workdir)
+        wheel = _select_by_owner_hash(workdir, artifact)
+        if wheel is None:
+            return fail("no fetched file matches the owner-signed artifact "
+                        "hash (exactly-one rule); NOTHING installed")
+        # Persist the verified wheel OUTSIDE the tmpdir before installing:
+        # pipx records the installed file path as its receipt origin, and the
+        # next adopt's origin gate re-hashes that file -- installing from the
+        # about-to-be-rmtree'd workdir would resurrect the self-defeat trap.
+        wheel_kept = os.path.join(rollback_dir, os.path.basename(wheel))
+        shutil.copy2(wheel, wheel_kept)
+        if _file_sha256(wheel_kept) != artifact:
+            return fail("persisted wheel failed re-verify after copy")
+        wheel = wheel_kept
+        argv = _pkg_install_argv(install_type, wheel)
+        print(f"MESH_ADOPT_EXEC nonce={tag} version={_single_line(version)} "
+              f"install_type={install_type} op={argv} "
+              f"previous={current} (#62 B2b-2b)", file=sys.stderr)
+        rc = run(argv)
+        got = smoke() if rc == 0 else None
+        if rc == 0 and got == version:
+            rec["status"] = "applied"
+            rec["applied_artifact"] = artifact
+            rec["applied_wheel_path"] = wheel
+            print(f"MESH_ADOPT_APPLIED nonce={tag} version={version} "
+                  f"sha256={artifact[:12]} -- installed env reports the "
+                  f"pinned version; live on next receiver cycle (#62 B2b-2b)",
+                  file=sys.stderr)
+            return True
+        reason = (f"install rc={rc}" if rc != 0 else
+                  f"smoke reports {_single_line(str(got))[:40]!r}, "
+                  f"pinned {version!r}")
+        # Roll back: NEVER install unverified bytes -- the recorded wheel must
+        # still hash to the hash recorded before mutation.
+        if _file_sha256(rec.get("rollback_wheel")) != rec.get(
+                "rollback_sha256"):
+            print(f"MESH_ADOPT_ROLLBACK_FAILED nonce={tag} rollback wheel no "
+                  f"longer matches its recorded hash -- MANUAL RECOVERY "
+                  f"NEEDED (#62 B2b-2b)", file=sys.stderr)
+            return fail(reason + "; AND rollback wheel failed re-verify")
+        rrc = run(_pkg_install_argv(install_type, rec["rollback_wheel"]))
+        if rrc != 0:
+            print(f"MESH_ADOPT_ROLLBACK_FAILED nonce={tag} rollback install "
+                  f"rc={rrc} -- MANUAL RECOVERY NEEDED (#62 B2b-2b)",
+                  file=sys.stderr)
+            return fail(reason + "; AND rollback install failed")
+        print(f"MESH_ADOPT_ROLLED_BACK nonce={tag} version={version} "
+              f"restored={rec['previous_version']} reason={reason} "
+              f"(#62 B2b-2b)", file=sys.stderr)
+        return fail(reason + "; rolled back")
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
 def _adopt_supervise_once(cfg, install_type=None, exec_mode=False):
     """#62 B2b: process pending adoptions -- re-verify owner provenance, detect
     + map the install operation. exec_mode=False (DRY-RUN, the default): LOG
@@ -3073,11 +3415,15 @@ def _adopt_supervise_once(cfg, install_type=None, exec_mode=False):
         if exec_mode and install_type in _GIT_TREE_TYPES:
             _adopt_exec_git_tree(cfg, nonce, rec, descriptor)  # sets rec status
             mutated = True
+        elif exec_mode and install_type in _PKG_EXEC_TYPES:
+            _adopt_exec_pkg(cfg, nonce, rec, descriptor, install_type,
+                            pending=pending)  # sets rec status (or refuses)
+            mutated = True
         elif exec_mode:
             print(f"MESH_ADOPT_WOULDEXEC version={version} "
                   f"install_type={install_type} op=[{op}] -- exec not enabled "
-                  f"for this install type in B2b-2a (git working tree only); "
-                  f"NO install run (#62 B2b-2a)", file=sys.stderr)
+                  f"for this install type (git tree: B2b-2a; pkg: B2b-2b); "
+                  f"NO install run (#62 B2b)", file=sys.stderr)
         else:
             print(f"MESH_ADOPT_WOULDEXEC version={version} "
                   f"install_type={install_type} op=[{op}] -- DRY-RUN, owner-"
@@ -3095,9 +3441,10 @@ def cmd_adopt_supervise(args):
     cfg = load_config()
     exec_mode = bool(getattr(args, "exec", False))
     if exec_mode:
-        print("MESH_ADOPT_EXEC_MODE on -- will actually checkout owner-signed "
-              "SHAs on a git working tree (#62 B2b-2a). Other install types stay "
-              "dry-run.", file=sys.stderr)
+        print("MESH_ADOPT_EXEC_MODE on -- will actually apply owner-signed "
+              "pins: git-tree checkout (B2b-2a) or verified-wheel install for "
+              "pipx/pip/uv-tool-pypi (B2b-2b). Unmappable/unvalidated types "
+              "stay dry-run (#62).", file=sys.stderr)
     seen = _adopt_supervise_once(cfg, exec_mode=exec_mode)
     if not seen:
         mode = "B2b-2a exec" if exec_mode else "B2b-1 dry-run"
