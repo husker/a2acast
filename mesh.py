@@ -111,6 +111,7 @@ def _append_activity(cfg, node, kind, frm, text, unsolicited=False):
 TASKS_NAME = ".meshwire.tasks.json"
 DELEGATE_TASKS_NAME = ".meshwire.delegate-tasks.{}.json"
 PEERS_NAME = ".meshwire.peers.json"
+AUTO_NODES_KEY = "auto_nodes"
 # #106: peers.json is written from the untrusted per-frame receive path, so
 # it needs the bounds every other store here has. A hard entry cap (keep the
 # most-recently-seen) bounds a flood -- and because every frame re-stamps an
@@ -844,18 +845,54 @@ def my_node(cfg, override=None, harness=None, learn=True):
     if not name:
         sys.exit("error: this machine has no node identity. Run "
                  "`mesh iam <node>` (or pass --as / set A2ACAST_NODE).")
-    if name not in cfg["nodes"]:
+    if name not in cfg["nodes"] or name in _auto_nodes(cfg):
         if not learn:
             return name
         if cfg.get("_path"):
-            def _add_node(latest):
-                latest.setdefault("nodes", [])
-                if name not in latest["nodes"]:
-                    latest["nodes"].append(name)
-            _mutate_config(cfg, _add_node)
+            _mutate_config(
+                cfg, lambda latest: _mark_operator_node(latest, name))
         else:
-            cfg["nodes"].append(name)
+            _mark_operator_node(cfg, name)
     return name
+
+
+def _auto_nodes(cfg):
+    """Wire-discovered roster names that spend the bounded auto budget.
+
+    Configs predating #76 F3 have no provenance field. Their existing roster
+    is grandfathered as operator-known: the old total-roster cap already
+    bounded any historical wire growth, and guessing which names were local
+    would turn a migration into an identity rewrite. Invalid/stale entries do
+    not count; the next mutation rewrites the normalized subset.
+    """
+    roster = cfg.get("nodes")
+    raw = cfg.get(AUTO_NODES_KEY)
+    if not isinstance(roster, list) or not isinstance(raw, list):
+        return []
+    known = set(n for n in roster if isinstance(n, str))
+    result = []
+    seen = set()
+    for node in raw:
+        if (isinstance(node, str) and node and node != BROADCAST
+                and node in known and node not in seen):
+            result.append(node)
+            seen.add(node)
+    return result
+
+
+def _mark_operator_node(cfg, node):
+    """Add/promote a node through a direct local operator-controlled path."""
+    roster = cfg.setdefault("nodes", [])
+    if not isinstance(roster, list):
+        raise ValueError("mesh node roster must be a list")
+    if node not in roster:
+        roster.append(node)
+    if AUTO_NODES_KEY in cfg:
+        remaining = [name for name in _auto_nodes(cfg) if name != node]
+        if remaining:
+            cfg[AUTO_NODES_KEY] = remaining
+        else:
+            cfg.pop(AUTO_NODES_KEY, None)
 
 
 def topic(cfg, node):
@@ -4563,8 +4600,10 @@ def load_peers(cfg):
 def _prune_peers(cfg, peers, keep_node, now=None):
     """Bound peers.json (#106) with ROSTER-AWARE eviction (lodestar PR-107).
 
-    Keep every roster peer WHOLE. cfg['nodes'] is already bounded by
-    _pin_cap, so that set is safe to retain in full -- and doing so fixes
+    Keep every roster peer WHOLE. Its wire-discovered portion is bounded by
+    _pin_cap through AUTO_NODES_KEY; any larger operator-known portion is
+    local and not wire-inflatable. The set is therefore safe to retain in
+    full -- and doing so fixes
     three bugs a plain keep-newest introduced:
       V1: an evicted record rebuilds WITHOUT its presence status on the next
           ordinary frame, and status is load-bearing (a 'blocked' worker
@@ -4619,24 +4658,57 @@ def note_peer(cfg, node, via, status=None, posture=None, recv=None, agent=None,
         # addressing, so an unbounded auto-grow lets any mesh-key holder
         # bloat it 1:1 with fabricated first-contact names (this is the
         # root lodestar's PR-99 pin-cap finding exposed). Bound the
-        # AUTO-discovery growth at the same wire-uninflatable cap as the
-        # pin store; operator-deliberate adds (init/join/iam) are separate
-        # and never capped. The sighting is still recorded in peers.json
-        # below, so nothing is lost for observability, and addressing is
-        # unaffected (send validates softly -- topics are name-derived).
-        if len(cfg["nodes"]) < _pin_cap(cfg):
-            def _add_node(latest):
-                latest.setdefault("nodes", [])
-                if node not in latest["nodes"]:
-                    latest["nodes"].append(node)
-            _mutate_config(cfg, _add_node)
-        elif node not in peers:
+        # AUTO-discovery growth at the same wire-uninflatable cap as the pin
+        # store. #76 F3: count ONLY names this receive path added -- local
+        # operator entries are not attacker-controlled and must not spend the
+        # wire budget. AUTO_NODES_KEY is durable provenance; old configs start
+        # empty/grandfathered because the previous total cap already bounded
+        # their roster. The decision is made against the latest config INSIDE
+        # _mutate_config's lock so concurrent first contacts cannot overshoot.
+        decision = {}
+
+        def _admit_auto_node(latest):
+            if not decision:
+                roster = latest.setdefault("nodes", [])
+                if not isinstance(roster, list):
+                    raise ValueError("mesh node roster must be a list")
+                auto = _auto_nodes(latest)
+                view = dict(latest)
+                view["_dir"] = cfg["_dir"]
+                cap = _pin_cap(view)
+                if node in roster:
+                    decision.update(kind="existing", auto=node in auto,
+                                    cap=cap, count=len(auto))
+                elif len(auto) >= cap:
+                    decision.update(kind="refused", auto=False, cap=cap,
+                                    count=len(auto))
+                else:
+                    decision.update(kind="added", auto=True, cap=cap,
+                                    count=len(auto) + 1)
+            kind = decision["kind"]
+            if kind in ("added", "existing"):
+                roster = latest.setdefault("nodes", [])
+                if node not in roster:
+                    roster.append(node)
+                auto = _auto_nodes(latest)
+                if decision["auto"] and node not in auto:
+                    auto.append(node)
+                if auto:
+                    latest[AUTO_NODES_KEY] = auto
+                else:
+                    latest.pop(AUTO_NODES_KEY, None)
+
+        _mutate_config(cfg, _admit_auto_node)
+        if decision.get("kind") == "refused" and node not in peers:
             # First time we decline to admit this name -- warn once, gated on
             # the already-loaded store (once-per-name, not once-per-frame).
-            print(f"MESH_WARN: roster at its cap ({len(cfg['nodes'])}) -- "
+            print(f"MESH_WARN: roster at its auto-discovery cap "
+                  f"({decision['count']}/{decision['cap']}; "
+                  f"{len(cfg['nodes'])} total nodes) -- "
                   f"not adding auto-discovered '{_single_line(node)}' to the "
                   f"durable roster; its sighting is still tracked. Prune "
-                  f"nodes or raise pin_cap to admit it (#100)",
+                  f"stale auto-discovered nodes or raise pin_cap to admit it "
+                  f"(#76 F3)",
                   file=sys.stderr)
     now = int(time.time())
     peer = peers.get(node) if isinstance(peers.get(node), dict) else {}
@@ -8368,10 +8440,19 @@ def cmd_rotate_key(args):
         new_server, new_nodes = cfg["server"], list(cfg["nodes"])
 
     def _rotate(latest):
+        prior_auto = _auto_nodes(latest)
         latest["id"] = new_id
         latest["key"] = new_key
         latest["server"] = new_server
         latest["nodes"] = list(new_nodes)
+        # Rotation changes the mesh capability, not how existing names
+        # entered the roster. Preserve local provenance for surviving names;
+        # names introduced only by a private rotation code are operator-known.
+        retained_auto = [node for node in prior_auto if node in new_nodes]
+        if retained_auto:
+            latest[AUTO_NODES_KEY] = retained_auto
+        else:
+            latest.pop(AUTO_NODES_KEY, None)
 
     _mutate_config(cfg, _rotate)
     print(f"rotated key for mesh '{cfg['mesh']}' — new commands now reject "
@@ -8397,12 +8478,9 @@ def cmd_iam(args):
         old = my_node(cfg, None, harness)
     except SystemExit:
         old = None
-    if args.node not in cfg["nodes"]:
-        def _add_node(latest):
-            latest.setdefault("nodes", [])
-            if args.node not in latest["nodes"]:
-                latest["nodes"].append(args.node)
-        _mutate_config(cfg, _add_node)
+    if args.node not in cfg["nodes"] or args.node in _auto_nodes(cfg):
+        _mutate_config(
+            cfg, lambda latest: _mark_operator_node(latest, args.node))
     with open(node_file(cfg, harness), "w", encoding="utf-8") as f:
         f.write(args.node + "\n")
     print(f"this machine is now '{args.node}' in mesh '{cfg['mesh']}'")
@@ -13786,6 +13864,10 @@ def cmd_pool_setup(args):
         for node in worker_nodes:
             if node not in seen_workers:
                 roster.append(node)
+        # pool-setup is a direct local operator action. Its explicitly named
+        # coordinator/workers must not remain charged to wire discovery.
+        for node in [coordinator] + worker_nodes:
+            _mark_operator_node(latest, node)
 
     def publish(latest):
         current = dict(latest)
