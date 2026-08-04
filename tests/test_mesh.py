@@ -979,6 +979,44 @@ class PeerTests(unittest.TestCase):
                 mesh.note_peer(cfg, "declined-name", "message")
             self.assertEqual(calls["n"], 1)
 
+    def test_full_auto_budget_never_enters_config_mutation(self):
+        # #76 F3 review: once the local wire budget is visibly full, refused
+        # frames cannot change config state. Do not let one repeated name (or
+        # a rotation of fresh names) force a config lock + fsync per frame.
+        with tempfile.TemporaryDirectory() as d:
+            cfg = make_cfg(d)
+            for i in range(mesh._pin_cap(cfg)):
+                mesh.note_peer(cfg, f"auto{i}", "message")
+
+            with mock.patch.object(mesh, "_mutate_config") as mutate, \
+                 contextlib.redirect_stderr(io.StringIO()):
+                mesh.note_peer(cfg, "refused", "message")
+                mesh.note_peer(cfg, "refused", "pong")
+                mesh.note_peer(cfg, "rotated-refusal", "message")
+
+            mutate.assert_not_called()
+            self.assertNotIn("refused", cfg["nodes"])
+            self.assertNotIn("rotated-refusal", cfg["nodes"])
+            self.assertIn("refused", mesh.load_peers(cfg))
+            self.assertIn("rotated-refusal", mesh.load_peers(cfg))
+
+    def test_note_peer_survives_config_lock_contention(self):
+        # Receive-path config contention must not crash the watcher after its
+        # transport checkpoint has advanced. Preserve the sighting and warn;
+        # a later frame can retry admission when the lock is available.
+        with tempfile.TemporaryDirectory() as d:
+            cfg = make_cfg(d)
+            err = io.StringIO()
+            with mock.patch.object(
+                    mesh, "_mutate_config",
+                    side_effect=RuntimeError("config lock is unavailable")), \
+                 contextlib.redirect_stderr(err):
+                mesh.note_peer(cfg, "contended", "message")
+
+            self.assertNotIn("contended", cfg["nodes"])
+            self.assertIn("contended", mesh.load_peers(cfg))
+            self.assertIn("config lock is unavailable", err.getvalue())
+
     def test_note_peer_caps_auto_roster_growth_but_still_tracks(self):
         # #100: a flood of fabricated first-contact names cannot grow the
         # durable (invite-embedded) roster without bound; past the cap the

@@ -4663,42 +4663,61 @@ def note_peer(cfg, node, via, status=None, posture=None, recv=None, agent=None,
         # operator entries are not attacker-controlled and must not spend the
         # wire budget. AUTO_NODES_KEY is durable provenance; old configs start
         # empty/grandfathered because the previous total cap already bounded
-        # their roster. The decision is made against the latest config INSIDE
+        # their roster. A visibly full local budget is a safe refusal: stale
+        # state can only make it over-conservative, never admit past the cap,
+        # and avoids an attacker forcing a config lock + fsync on every frame.
+        # Possible admissions are decided against the latest config INSIDE
         # _mutate_config's lock so concurrent first contacts cannot overshoot.
         decision = {}
+        local_auto = _auto_nodes(cfg)
+        local_cap = _pin_cap(cfg)
+        if len(local_auto) >= local_cap:
+            decision.update(kind="refused", auto=False, cap=local_cap,
+                            count=len(local_auto))
+        else:
+            def _admit_auto_node(latest):
+                if not decision:
+                    # _mutate_config invokes this closure against locked disk
+                    # state and then the caller's cfg. Freeze the first verdict
+                    # so the stale in-memory pass cannot reverse it.
+                    roster = latest.setdefault("nodes", [])
+                    if not isinstance(roster, list):
+                        raise ValueError("mesh node roster must be a list")
+                    auto = _auto_nodes(latest)
+                    view = dict(latest)
+                    view["_dir"] = cfg["_dir"]
+                    cap = _pin_cap(view)
+                    if node in roster:
+                        decision.update(kind="existing", auto=node in auto,
+                                        cap=cap, count=len(auto))
+                    elif len(auto) >= cap:
+                        decision.update(kind="refused", auto=False, cap=cap,
+                                        count=len(auto))
+                    else:
+                        decision.update(kind="added", auto=True, cap=cap,
+                                        count=len(auto) + 1)
+                kind = decision["kind"]
+                if kind in ("added", "existing"):
+                    roster = latest.setdefault("nodes", [])
+                    if node not in roster:
+                        roster.append(node)
+                    auto = _auto_nodes(latest)
+                    if decision["auto"] and node not in auto:
+                        auto.append(node)
+                    if auto:
+                        latest[AUTO_NODES_KEY] = auto
+                    else:
+                        latest.pop(AUTO_NODES_KEY, None)
 
-        def _admit_auto_node(latest):
-            if not decision:
-                roster = latest.setdefault("nodes", [])
-                if not isinstance(roster, list):
-                    raise ValueError("mesh node roster must be a list")
-                auto = _auto_nodes(latest)
-                view = dict(latest)
-                view["_dir"] = cfg["_dir"]
-                cap = _pin_cap(view)
-                if node in roster:
-                    decision.update(kind="existing", auto=node in auto,
-                                    cap=cap, count=len(auto))
-                elif len(auto) >= cap:
-                    decision.update(kind="refused", auto=False, cap=cap,
-                                    count=len(auto))
-                else:
-                    decision.update(kind="added", auto=True, cap=cap,
-                                    count=len(auto) + 1)
-            kind = decision["kind"]
-            if kind in ("added", "existing"):
-                roster = latest.setdefault("nodes", [])
-                if node not in roster:
-                    roster.append(node)
-                auto = _auto_nodes(latest)
-                if decision["auto"] and node not in auto:
-                    auto.append(node)
-                if auto:
-                    latest[AUTO_NODES_KEY] = auto
-                else:
-                    latest.pop(AUTO_NODES_KEY, None)
-
-        _mutate_config(cfg, _admit_auto_node)
+            try:
+                _mutate_config(cfg, _admit_auto_node)
+            except RuntimeError as exc:
+                # This receive-path observation is best-effort. A busy config
+                # lock must not kill the watcher after transport checkpointing.
+                if (decision
+                        or str(exc) != "config lock is unavailable"):
+                    raise
+                decision.update(kind="lock_unavailable")
         if decision.get("kind") == "refused" and node not in peers:
             # First time we decline to admit this name -- warn once, gated on
             # the already-loaded store (once-per-name, not once-per-frame).
@@ -4709,6 +4728,11 @@ def note_peer(cfg, node, via, status=None, posture=None, recv=None, agent=None,
                   f"durable roster; its sighting is still tracked. Prune "
                   f"stale auto-discovered nodes or raise pin_cap to admit it "
                   f"(#76 F3)",
+                  file=sys.stderr)
+        elif decision.get("kind") == "lock_unavailable" and node not in peers:
+            print(f"MESH_WARN: config lock is unavailable -- not adding "
+                  f"'{_single_line(node)}' to the durable roster; its sighting "
+                  f"is still tracked and a later frame can retry",
                   file=sys.stderr)
     now = int(time.time())
     peer = peers.get(node) if isinstance(peers.get(node), dict) else {}
