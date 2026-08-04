@@ -364,6 +364,48 @@ and stop hooks maintain `working`/`listening`; approval integrations can run
 `mesh_list_agents` show the latest reported state, and `mesh ask` warns before
 sending to a blocked node.
 
+### Operational checks: green signals are property-specific
+
+A healthy-looking signal proves only the property it measured. Do not promote
+one positive observation into a broader liveness or migration claim:
+
+| Signal | What it proves | What it does not prove |
+|---|---|---|
+| Fresh receiver heartbeat / `healthy` | That receive process handled a frame recently | That the node can publish a reply |
+| `unknown` health after five quiet minutes | No fresh self-report is available | That the node is dead; a quiet healthy node ages to `unknown` |
+| `mesh status` shows the new relay | A new command read the updated config file | That an already-running watcher or MCP server reloaded it |
+| A send was accepted by the relay | The relay accepted the publication | That the intended listener is subscribed there |
+
+Use `mesh ping <node>` when you need end-to-end evidence: a matching pong proves
+the target heard the ping and successfully published a reply through the route
+the caller is currently using. After any `.meshwire.json` server or key change,
+restart long-lived receivers (`mesh watch`, `mcp-serve` / MCP hosts,
+`codex-supervise`, and pool workers); transient lifecycle-hook receivers reload
+config on their next invocation.
+
+For a relay migration, verify the old connection is actually gone rather than
+trusting `mesh status`. On POSIX, capture or resolve the old relay addresses and
+check the process table; the following should print no matching socket after
+all long-lived receivers have been cycled:
+
+```bash
+old_host=old-relay.example
+old_ips="$(dig +short A "$old_host"; dig +short AAAA "$old_host")"
+test -n "$old_ips" || { echo "could not resolve $old_host" >&2; exit 1; }
+old_sockets=0
+for old_ip in $old_ips; do
+  if lsof -nP -iTCP | grep -F -- "$old_ip:"; then old_sockets=1; fi
+done
+test "$old_sockets" -eq 0
+```
+
+Use `Resolve-DnsName` plus `Get-NetTCPConnection` for the equivalent Windows
+check. During the cutover, keep private old- and new-relay config files and
+publish coordination messages once through each (`A2ACAST_CONFIG=/path/to/...`)
+until every node has been cycled and passes a ping on the new relay. Config files
+contain the mesh key; protect both copies and remove the old one after the
+migration is verified.
+
 To set a stable node name use `mesh iam <name>` (writes a per-harness pin).
 Prefer this over the `A2ACAST_NODE` env var, which is not reliably inherited
 by harness-spawned processes.
