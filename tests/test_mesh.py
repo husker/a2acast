@@ -966,7 +966,7 @@ class PeerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             cfg = make_cfg(d)
             # fill the roster to the cap so the next name is declined
-            for i in range(mesh._pin_cap(cfg) - len(cfg["nodes"])):
+            for i in range(mesh._pin_cap(cfg)):
                 mesh.note_peer(cfg, f"n{i}", "message")
             calls = {"n": 0}
             real = mesh.load_peers
@@ -979,6 +979,44 @@ class PeerTests(unittest.TestCase):
                 mesh.note_peer(cfg, "declined-name", "message")
             self.assertEqual(calls["n"], 1)
 
+    def test_full_auto_budget_never_enters_config_mutation(self):
+        # #76 F3 review: once the local wire budget is visibly full, refused
+        # frames cannot change config state. Do not let one repeated name (or
+        # a rotation of fresh names) force a config lock + fsync per frame.
+        with tempfile.TemporaryDirectory() as d:
+            cfg = make_cfg(d)
+            for i in range(mesh._pin_cap(cfg)):
+                mesh.note_peer(cfg, f"auto{i}", "message")
+
+            with mock.patch.object(mesh, "_mutate_config") as mutate, \
+                 contextlib.redirect_stderr(io.StringIO()):
+                mesh.note_peer(cfg, "refused", "message")
+                mesh.note_peer(cfg, "refused", "pong")
+                mesh.note_peer(cfg, "rotated-refusal", "message")
+
+            mutate.assert_not_called()
+            self.assertNotIn("refused", cfg["nodes"])
+            self.assertNotIn("rotated-refusal", cfg["nodes"])
+            self.assertIn("refused", mesh.load_peers(cfg))
+            self.assertIn("rotated-refusal", mesh.load_peers(cfg))
+
+    def test_note_peer_survives_config_lock_contention(self):
+        # Receive-path config contention must not crash the watcher after its
+        # transport checkpoint has advanced. Preserve the sighting and warn;
+        # a later frame can retry admission when the lock is available.
+        with tempfile.TemporaryDirectory() as d:
+            cfg = make_cfg(d)
+            err = io.StringIO()
+            with mock.patch.object(
+                    mesh, "_mutate_config",
+                    side_effect=RuntimeError("config lock is unavailable")), \
+                 contextlib.redirect_stderr(err):
+                mesh.note_peer(cfg, "contended", "message")
+
+            self.assertNotIn("contended", cfg["nodes"])
+            self.assertIn("contended", mesh.load_peers(cfg))
+            self.assertIn("config lock is unavailable", err.getvalue())
+
     def test_note_peer_caps_auto_roster_growth_but_still_tracks(self):
         # #100: a flood of fabricated first-contact names cannot grow the
         # durable (invite-embedded) roster without bound; past the cap the
@@ -987,24 +1025,104 @@ class PeerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             cfg = make_cfg(d)
             cap = mesh._pin_cap(cfg)  # 16 (floor) with no certs
-            # fill the roster to the cap with discovered names
-            for i in range(cap - len(cfg["nodes"])):
+            # fill the AUTO-DISCOVERED slice to its cap; the two deliberate
+            # make_cfg roster entries do not spend the wire budget (#76 F3)
+            for i in range(cap):
                 mesh.note_peer(cfg, f"disc{i}", "message")
-            self.assertEqual(len(cfg["nodes"]), cap)
+            self.assertEqual(len(cfg.get("auto_nodes", [])), cap)
             err = io.StringIO()
             with contextlib.redirect_stderr(err):
                 mesh.note_peer(cfg, "flooder", "message")
             # roster did NOT grow past the cap...
             self.assertNotIn("flooder", cfg["nodes"])
-            self.assertEqual(len(cfg["nodes"]), cap)
+            self.assertEqual(len(cfg.get("auto_nodes", [])), cap)
             # ...but the sighting IS tracked, and the warn fired once
             self.assertIn("flooder", mesh.load_peers(cfg))
-            self.assertIn("roster at its cap", err.getvalue())
+            self.assertIn("roster at its auto-discovery cap", err.getvalue())
             # second frame from the same name: no duplicate warn
             err2 = io.StringIO()
             with contextlib.redirect_stderr(err2):
                 mesh.note_peer(cfg, "flooder", "pong")
-            self.assertNotIn("roster at its cap", err2.getvalue())
+            self.assertNotIn("roster at its auto-discovery cap", err2.getvalue())
+
+    def test_operator_nodes_do_not_consume_auto_discovery_budget(self):
+        # #76 F3: the cap exists to bound WIRE-driven growth. Deliberate local
+        # roster entries are not wire-inflatable and therefore must not spend
+        # that budget. The old len(cfg["nodes"]) proxy locked discovery out
+        # completely once an operator-managed mesh exceeded the floor.
+        with tempfile.TemporaryDirectory() as d:
+            cfg = make_cfg(d)
+            cap = mesh._pin_cap(cfg)
+            cfg["nodes"] = [f"operator{i}" for i in range(cap + 2)]
+
+            mesh.note_peer(cfg, "legit-new-peer", "message")
+
+            self.assertIn("legit-new-peer", cfg["nodes"])
+            self.assertEqual(cfg.get("auto_nodes"), ["legit-new-peer"])
+
+    def test_wire_discovery_still_stops_at_its_own_cap(self):
+        # Load-bearing opposite direction: excluding operator nodes must not
+        # disable the bound. Even with an arbitrarily large operator roster,
+        # authenticated wire names get exactly one capped budget.
+        with tempfile.TemporaryDirectory() as d:
+            cfg = make_cfg(d)
+            cap = mesh._pin_cap(cfg)
+            cfg["nodes"] = [f"operator{i}" for i in range(cap + 2)]
+            for i in range(cap):
+                mesh.note_peer(cfg, f"auto{i}", "message")
+            self.assertEqual(len(cfg.get("auto_nodes", [])), cap)
+
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                mesh.note_peer(cfg, "overflow", "message")
+            self.assertNotIn("overflow", cfg["nodes"])
+            self.assertIn("roster at its auto-discovery cap", err.getvalue())
+
+    def test_stale_receivers_cannot_overshoot_auto_discovery_budget(self):
+        # Two long-running receivers can hold copies loaded before either
+        # first-contact frame arrives. Admission must be decided from the
+        # locked, latest disk config, not either stale in-memory count.
+        with tempfile.TemporaryDirectory() as d:
+            cfg = make_cfg(d)
+            cap = mesh._pin_cap(cfg)
+            for i in range(cap - 1):
+                mesh.note_peer(cfg, f"auto{i}", "message")
+
+            def stale_copy():
+                copy = dict(cfg)
+                copy["nodes"] = list(cfg["nodes"])
+                copy["auto_nodes"] = list(cfg["auto_nodes"])
+                return copy
+
+            receiver_a = stale_copy()
+            receiver_b = stale_copy()
+            mesh.note_peer(receiver_a, "last-slot", "message")
+            with contextlib.redirect_stderr(io.StringIO()):
+                mesh.note_peer(receiver_b, "overflow", "message")
+
+            with open(cfg["_path"], encoding="utf-8") as handle:
+                disk = json.load(handle)
+            self.assertEqual(len(disk["auto_nodes"]), cap)
+            self.assertIn("last-slot", disk["nodes"])
+            self.assertNotIn("overflow", disk["nodes"])
+
+    def test_local_identity_promotes_an_auto_discovered_name(self):
+        # Provenance must be reversible by a direct local act. Once this
+        # machine deliberately adopts a previously auto-discovered name, that
+        # name no longer consumes the wire budget and one new peer fits.
+        with tempfile.TemporaryDirectory() as d:
+            cfg = make_cfg(d)
+            cap = mesh._pin_cap(cfg)
+            for i in range(cap):
+                mesh.note_peer(cfg, f"auto{i}", "message")
+            self.assertEqual(len(cfg.get("auto_nodes", [])), cap)
+
+            self.assertEqual(
+                mesh.my_node(cfg, override="auto0", harness=None), "auto0")
+            self.assertNotIn("auto0", cfg.get("auto_nodes", []))
+            mesh.note_peer(cfg, "replacement", "message")
+            self.assertIn("replacement", cfg["nodes"])
+            self.assertEqual(len(cfg.get("auto_nodes", [])), cap)
 
     def test_note_peer_ignores_broadcast_and_empty(self):
         with tempfile.TemporaryDirectory() as d:
@@ -1256,6 +1374,19 @@ class MembershipCmdTests(unittest.TestCase):
         self.assertNotEqual(rotated["id"], old_id)
         self.assertNotEqual(rotated["key"], old_key)
         self.assertIn("mesh rotate-key mesh1-", out.getvalue())
+
+    def test_rotate_key_preserves_auto_discovery_provenance(self):
+        cfg = make_cfg()
+        cfg["nodes"].append("wire-peer")
+        cfg["auto_nodes"] = ["wire-peer"]
+        with open(mesh.CONFIG_NAME, "w") as f:
+            json.dump(cfg, f)
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            mesh.cmd_rotate_key(argparse.Namespace(code=None))
+
+        rotated = mesh.load_config()
+        self.assertEqual(rotated["auto_nodes"], ["wire-peer"])
 
     def test_rotate_key_applies_same_mesh_code_on_peer(self):
         cfg = make_cfg()
@@ -14807,6 +14938,7 @@ class PoolConfigTests(unittest.TestCase):
         self.cfg["nodes"].extend([
             "machine-worker-codex", "machine-worker-codex",
         ])
+        self.cfg["auto_nodes"] = ["machine-worker-codex"]
         mesh._save_config(self.cfg)
         with mock.patch.object(mesh, "load_config", return_value=self.cfg), \
              mock.patch.object(mesh, "_default_node_name",
@@ -14834,6 +14966,8 @@ class PoolConfigTests(unittest.TestCase):
         self.assertEqual(disk["nodes"].count("machine-worker-codex"), 1)
         self.assertEqual(disk["nodes"].count("machine-worker-copilot"), 1)
         self.assertEqual(disk["nodes"].count("machine-worker-ollama"), 1)
+        self.assertNotIn("machine-worker-codex",
+                         disk.get("auto_nodes", []))
         if os.name == "posix":  # Windows privacy is ACLs, not mode bits
             self.assertEqual(stat.S_IMODE(os.stat(
                 mesh.pool_config_file(self.cfg)).st_mode), 0o600)
