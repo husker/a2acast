@@ -10927,6 +10927,18 @@ class OnboardingTextTests(unittest.TestCase):
         self.assertIn("--wait 300", readme)
         self.assertNotIn("--wait 600", readme)
 
+    def test_readme_documents_node_identity_boundary(self):
+        with open(os.path.join(self.ROOT, "README.md"),
+                  encoding="utf-8") as f:
+            readme = " ".join(f.read().lower().split())
+        self.assertIn("node/harness identity", readme)
+        self.assertIn("not a conversational session", readme)
+        self.assertIn("normally share one node name", readme)
+        self.assertIn("sender-name-wide legacy authority", readme)
+        self.assertIn("every accepted inbound task", readme)
+        self.assertIn("not a per-node cryptographic grant", readme)
+        self.assertIn("separate os accounts or sandboxes", readme)
+
     def test_integrate_codex_mentions_codex_setup(self):
         self.assertIn("mesh codex-setup", mesh._integrate_harness("codex"))
 

@@ -109,7 +109,9 @@ machine can instead run a background **supervisor** that executes delegated
 tasks with no session open. Enable it with `mesh codex-setup --supervise`,
 then name the peers you trust to run code on this machine with
 `mesh codex-allow <node>`. Nothing runs until you do both — the supervisor is
-off by default and its allowlist starts empty. See the security model below.
+off by default and its allowlist starts empty. That grant is keyed to the
+sender-name string, not a conversational session or, by itself, a verified
+node key. See the security model below.
 
 ## Machine-wide worker pool (opt-in)
 
@@ -252,24 +254,42 @@ What you still must do:
   `A2ACAST_CONFIG` contains only a path. MCP tools, agent cards, and the local
   A2A HTTP bridge never return config or key fields.
 - A join code grants **full membership in one trust domain**: its holder can
-  decrypt traffic, publish authenticated traffic, and mint the same sender
-  names as any other member. There are no per-node cryptographic identities
-  or roles. `exec_allow` limits autonomous execution, not mesh membership.
+  decrypt traffic, publish mesh-authenticated traffic, and assert the same
+  sender names as any other member at the shared-key layer. Node signatures
+  add a separate per-name verdict against the receiver's local pin, but first
+  contact is unverified and verdict enforcement is a default-off rollout
+  control. Delivery alone therefore does not prove a node identity.
 - **Treat inbound tasks as untrusted input.** Encryption authenticates *the
   mesh*, not intent: any agent (or person) holding the key can send tasks.
   Receiving agents should apply their normal permission rules.
+- **A node signature identifies a node/harness identity, not a conversational
+  session.** Agent integrations scope their private key per harness.
+  Concurrent sessions of the same harness using the same mesh configuration
+  therefore use the same per-harness key path and normally share one node
+  name. `--as` or `A2ACAST_NODE` can override the name, but not separate the
+  shared key path. A receiver cannot tell which session produced a valid
+  frame. Even a `FRAME_VERIFIED` result proves possession of that node key; it
+  does not prove which local agent or user authorized the message.
 - **Autonomous Codex execution is opt-in and gated on a curated allowlist.**
   `mesh codex-supervise` runs delegated tasks through `codex exec` and replies
   over the mesh. It stays off unless you start it (`codex-setup --supervise`),
   and even then only peers you add with `mesh codex-allow` run — a
   default-empty allowlist (`exec_allow`), **not** the roster of everyone who
-  holds the key. The `--sandbox read-only` default is defense-in-depth, not
-  the boundary: a read-only task can still read repo secrets and return them
-  in its reply, so only allow peers you actually trust.
-- Sender names prove a shared-key member made the assertion, not which member:
-  every node holds the same group key. a2acast rejects A2A metadata that
-  disagrees with its authenticated outer route, but a compromised member can
-  still choose another member's sender name in that outer route.
+  holds the key. `mesh codex-allow <node>` grants **sender-name-wide legacy
+  authority**: every accepted inbound task whose persisted sender-name string
+  matches that entry is eligible. It is not a grant to one chat or agent
+  session, and under default-off or unsettled node verification it is **not a
+  per-node cryptographic grant**. A settled pin plus verdict enforcement can
+  refuse a mismatched key, but first contact remains unverified and accepted.
+  The `--sandbox read-only` default is defense-in-depth, not the boundary: a
+  read-only task can still read repo secrets and return them in its reply, so
+  only allow peers you actually trust.
+- **Hard separation between co-located agents requires separate OS accounts or
+  sandboxes**, with distinct mesh identities and private keys protected from
+  one another. Separate processes, temporary key directories, and Git
+  worktrees do not contain a malicious process running as the same OS user.
+  They may improve routing or collision isolation, but must not be treated as
+  an authorization boundary.
 - Someone who learns a topic id (but not the key) can't read or forge
   messages, but can post garbage that your watcher silently drops.
   Self-hosting ntfy with auth (`mesh init --server https://ntfy.example`)
