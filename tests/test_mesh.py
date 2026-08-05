@@ -10478,15 +10478,19 @@ class MCPServeTests(unittest.TestCase):
         request = next(m for m in self._sent(out)
                        if m.get("method") == "sampling/createMessage")
         srv.handle({"jsonrpc": "2.0", "id": request["id"], "result": {}})
-        # The working->listening flip happens on a background thread; poll
-        # generously (~10s cap, breaks early on success) so a heavily-loaded
-        # CI runner -- Windows py3.14 has been seen at ~90s/suite -- doesn't
-        # time out before the thread is scheduled. Breaks immediately when
-        # the status settles, so the cap is only ever hit on a real failure.
-        for _ in range(1000):
-            if mesh.local_status(srv.cfg, "alpha") == "listening":
-                break
-            mesh.time.sleep(0.01)
+        # The working->listening flip happens at the END of the sampling turn,
+        # on the _await_and_refire thread, which holds _sampling_flag until it
+        # has flipped the status back (mesh.py: set "listening" then release).
+        # Block on that lock instead of polling local_status against a
+        # wall-clock cap -- the old 10s poll raced a heavily-loaded CI runner
+        # (Windows py3.9/py3.14 flaked here). acquire() returns the instant the
+        # turn completes and the timeout only ever fires on a genuine hang, so
+        # this is deterministic rather than timing-dependent. Still load-bearing
+        # both ways: a broken flip leaves the status "working" (assert fails),
+        # a stuck turn never releases the flag (acquire times out, assert fails).
+        self.assertTrue(srv._sampling_flag.acquire(timeout=30),
+                        "sampling turn did not complete")
+        srv._sampling_flag.release()
         self.assertEqual(mesh.local_status(srv.cfg, "alpha"), "listening")
 
     def test_sampling_request_removes_delivery_framing_tokens(self):
