@@ -9478,18 +9478,6 @@ def _cmd_watch_owned(args, cfg, me):
         if fingerprint in replay_seen:
             continue
         task_record = _TASK_RECORD_UNSET
-        while not ctl and frm != me:
-            try:
-                task_record = _record_delivery_task(
-                    cfg, me, frm, body, recipient=recipient)
-                break
-            except TaskLedgerBusy as exc:
-                print(f"MESH_WARN: {exc}; retrying same event",
-                      file=sys.stderr)
-                if deadline is not None and time.time() >= deadline:
-                    _finish_watch_timeout(me, timeout, follow)
-                    return
-                time.sleep(0.05)
 
         def checkpoint(ev=ev, fingerprint=fingerprint, _wts=_wts):
             # Transport checkpoint: cursor forward + replay fingerprint.
@@ -9515,6 +9503,7 @@ def _cmd_watch_owned(args, cfg, me):
         _observe_revlist_freshness(cfg, me, frm, _sbase, verdict)
         _observe_downgrade(cfg, frm, verdict)
         if _refuse_frame(cfg, frm, verdict) is not None:
+            checkpoint()  # deliberate refusal: consume, never replay forever
             continue  # #74: refused frames are not delivered
         if verdict == FRAME_VERIFIED:
             # #76 Phase A: log-only cert observability for verified frames,
@@ -9531,6 +9520,21 @@ def _cmd_watch_owned(args, cfg, me):
                     print("MESH_WATCH_DONE kind=node_joined", flush=True)
                     return
             continue
+        # #186 / #136 Phase 0: only a frame that survived the verdict/refusal
+        # gate may create a supervisor-actionable task. Keep the task write
+        # before checkpointing so lock contention remains safely retryable.
+        while True:
+            try:
+                task_record = _record_delivery_task(
+                    cfg, me, frm, body, recipient=recipient)
+                break
+            except TaskLedgerBusy as exc:
+                print(f"MESH_WARN: {exc}; retrying same event",
+                      file=sys.stderr)
+                if deadline is not None and time.time() >= deadline:
+                    _finish_watch_timeout(me, timeout, follow)
+                    return
+                time.sleep(0.05)
         note_peer(cfg, frm, "message")
         _send_ack(cfg, me, frm, ev)
         if task_record is _TASK_RECORD_UNSET:
@@ -10204,20 +10208,24 @@ class MeshMCPServer:
             if fingerprint in replay_seen:
                 continue
             task_record = _TASK_RECORD_UNSET
-            if not ctl and frm != me:
-                task_record = _record_delivery_task(
-                    cfg, me, frm, body, recipient=recipient)
-            if et == since:
-                seen = [i for i in seen if i]
-                seen.append(ev.get("id"))
-            else:
-                seen = [ev.get("id")]
-            since = et
-            _write_json_secure(cf, {"since": et, "seen": seen[-50:]})
-            if fingerprint:
-                _note_replay(replay_seen, fingerprint, _wts)
-                save_replays(cfg, me, replay_seen)
+
+            def checkpoint(ev=ev, et=et, fingerprint=fingerprint,
+                           _wts=_wts):
+                nonlocal since, seen
+                if et == since:
+                    seen = [i for i in seen if i]
+                    seen.append(ev.get("id"))
+                else:
+                    seen = [ev.get("id")]
+                since = et
+                _write_json_secure(
+                    cf, {"since": et, "seen": seen[-50:]})
+                if fingerprint:
+                    _note_replay(replay_seen, fingerprint, _wts)
+                    save_replays(cfg, me, replay_seen)
+
             if frm == me:
+                checkpoint()
                 continue
             # stage 3: classify sender authenticity (non-enforcing).
             verdict = _frame_verdict(
@@ -10227,16 +10235,24 @@ class MeshMCPServer:
             _observe_revlist_freshness(cfg, me, frm, _sbase, verdict)
             _observe_downgrade(cfg, frm, verdict)
             if _refuse_frame(cfg, frm, verdict) is not None:
+                checkpoint()  # deliberate refusal: consume without a task
                 continue  # #74: refused frames are not delivered
             if verdict == FRAME_VERIFIED:
                 # #76 Phase A: log-only cert observability (see cmd_watch).
                 _report_cert_status(cfg, frm, _load_pins(cfg).get(frm))
             if ctl:
                 line = _handle_control(cfg, me, frm, ctl, verdict=verdict, ev=ev)
+                checkpoint()
                 if line:
                     self.deliver({"kind": "node_joined", "from": frm,
                                   "text": line, "verify": verdict})
                 continue
+            # #186 / #136 Phase 0: task persistence is allowed only after the
+            # frame survives the shared verdict/refusal gate, and still must
+            # complete before the transport checkpoint advances.
+            task_record = _record_delivery_task(
+                cfg, me, frm, body, recipient=recipient)
+            checkpoint()
             note_peer(cfg, frm, "message")
             _send_ack(cfg, me, frm, ev)
             if task_record is _TASK_RECORD_UNSET:

@@ -2173,6 +2173,73 @@ class WatchTests(MembershipCmdTests):
         self.assertIn("real message", out.getvalue())
         self._assert_trusted_watch_done(out.getvalue(), "message")
 
+    def test_refused_direct_task_is_checkpointed_but_not_recorded(self):
+        # #186 / #136 Phase 0: verdict enforcement must run before the task
+        # ledger. A forged frame attributed to an exec-allowlisted node is
+        # deliberately consumed, but can never become supervisor-actionable.
+        cfg = self._setup_mesh()
+        cfg["enforce_verdicts"] = True
+        cfg["exec_allow"] = ["beta"]
+        with open(".meshwire.json", "w") as f:
+            json.dump(cfg, f)
+        env = mesh.make_send_envelope(
+            "beta", "alpha", "forged work", task_id="forged-direct-186",
+            context_id="forged-direct-context-186")
+        ev = self._msg_event(
+            cfg, "beta", json.dumps(env), "forged-direct-event", 200)
+
+        with mock.patch.object(mesh, "_stream_events",
+                               return_value=iter([ev])), \
+             mock.patch.object(mesh, "_frame_verdict",
+                               return_value=mesh.FRAME_MISMATCH), \
+             contextlib.redirect_stdout(io.StringIO()), \
+             contextlib.redirect_stderr(io.StringIO()):
+            mesh.cmd_watch(argparse.Namespace(
+                timeout=60, as_node=None, follow=False))
+
+        loaded = mesh.load_config()
+        self.assertNotIn("forged-direct-186", mesh.load_tasks(loaded))
+        self.assertEqual(mesh._supervise_pending(loaded, "alpha"), [])
+        with open(".meshwire.cursor-alpha") as f:
+            self.assertEqual(json.load(f),
+                             {"since": 200,
+                              "seen": ["forged-direct-event"]})
+
+    def test_verified_direct_task_is_recorded_before_checkpoint(self):
+        # Load-bearing opposite direction: moving the ledger write behind the
+        # verdict must not turn enforcement into a task-suppression switch.
+        cfg = self._setup_mesh()
+        cfg["enforce_verdicts"] = True
+        cfg["exec_allow"] = ["beta"]
+        with open(".meshwire.json", "w") as f:
+            json.dump(cfg, f)
+        env = mesh.make_send_envelope(
+            "beta", "alpha", "verified work",
+            task_id="verified-direct-186",
+            context_id="verified-direct-context-186")
+        ev = self._msg_event(
+            cfg, "beta", json.dumps(env), "verified-direct-event", 200)
+
+        with mock.patch.object(mesh, "_stream_events",
+                               return_value=iter([ev])), \
+             mock.patch.object(mesh, "_frame_verdict",
+                               return_value=mesh.FRAME_VERIFIED), \
+             mock.patch.object(mesh, "_post",
+                               return_value={"id": "ack"}), \
+             contextlib.redirect_stdout(io.StringIO()), \
+             contextlib.redirect_stderr(io.StringIO()):
+            mesh.cmd_watch(argparse.Namespace(
+                timeout=60, as_node=None, follow=False))
+
+        loaded = mesh.load_config()
+        pending = mesh._supervise_pending(loaded, "alpha")
+        self.assertEqual([task_id for task_id, _ in pending],
+                         ["verified-direct-186"])
+        with open(".meshwire.cursor-alpha") as f:
+            self.assertEqual(json.load(f),
+                             {"since": 200,
+                              "seen": ["verified-direct-event"]})
+
     def _strict_utf8_watch_output(self, cfg, evs):
         raw = io.BytesIO()
         out = io.TextIOWrapper(raw, encoding="utf-8", errors="strict")
@@ -9915,6 +9982,50 @@ class VerifyWireTests(unittest.TestCase):
         self.assertEqual(len(delivered), 1, "forged frame must still deliver")
         self.assertEqual(delivered[0]["verify"], mesh.FRAME_MISMATCH)
         self.assertIn("MESH_WARN: signature mismatch", err)
+
+    def test_enforced_forged_mcp_task_never_reaches_supervisor(self):
+        # #186 / #136 Phase 0, real signature composition: the shared mesh
+        # key makes the wrapper decryptable, but the forger lacks beta's
+        # pinned node key. Refusal must precede every actionable ledger write.
+        self.cfg["enforce_verdicts"] = True
+        self.cfg["exec_allow"] = ["beta"]
+        mesh._bind_peer(self.cfg, "beta", self.beta_pub)
+        forger = make_cfg(tempfile.mkdtemp())
+        forger["id"] = self.cfg["id"]
+        forger["key"] = self.cfg["key"]
+        forger["mesh"] = self.cfg["mesh"]
+        mesh._ensure_node_key(forger, "beta", "claude")
+        env = mesh.make_send_envelope(
+            "beta", "alpha", "forged work", task_id="forged-mcp-186",
+            context_id="forged-mcp-context-186")
+
+        delivered, err = self._run(self._signed_event(
+            forger, body=json.dumps(env), eid="forged-mcp-event"))
+
+        self.assertEqual(delivered, [])
+        self.assertIn("signature mismatch", err)
+        self.assertNotIn("forged-mcp-186", mesh.load_tasks(self.cfg))
+        self.assertEqual(mesh._supervise_pending(self.cfg, "alpha"), [])
+
+    def test_enforced_verified_mcp_task_reaches_supervisor_once(self):
+        # Load-bearing opposite direction: a real beta signature still yields
+        # exactly one durable task and one supervisor-eligible record.
+        self.cfg["enforce_verdicts"] = True
+        self.cfg["exec_allow"] = ["beta"]
+        mesh._bind_peer(self.cfg, "beta", self.beta_pub)
+        env = mesh.make_send_envelope(
+            "beta", "alpha", "verified work",
+            task_id="verified-mcp-186",
+            context_id="verified-mcp-context-186")
+
+        delivered, _ = self._run(self._signed_event(
+            self.beta, body=json.dumps(env), eid="verified-mcp-event"))
+
+        self.assertEqual(len(delivered), 1)
+        self.assertEqual(delivered[0]["verify"], mesh.FRAME_VERIFIED)
+        pending = mesh._supervise_pending(self.cfg, "alpha")
+        self.assertEqual([task_id for task_id, _ in pending],
+                         ["verified-mcp-186"])
 
     def test_unsigned_from_unpinned_is_unverified_first_contact(self):
         # An unsigned frame from a name we have never pinned is first
