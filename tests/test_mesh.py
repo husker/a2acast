@@ -515,8 +515,14 @@ class JoinAlreadyJoinedTests(unittest.TestCase):
         """Renaming under Codex writes the pin but cannot reach the baked-in
         --as in its MCP registration. The rename must not look like it took."""
         out = io.StringIO()
+        # cmd_iam emits a best-effort rename announce; stub the send so the test
+        # stays hermetic. Left unmocked it reached the real ntfy.example host and
+        # flaked under concurrent CI load (old issue #6). The announce is
+        # orthogonal to the staleness note this test asserts.
         with mock.patch.object(mesh, "_detect_harness", return_value="codex"), \
-             mock.patch.object(mesh, "_mutate_config"), contextlib.redirect_stdout(out):
+             mock.patch.object(mesh, "_mutate_config"), \
+             mock.patch.object(mesh, "send_raw"), \
+             contextlib.redirect_stdout(out):
             mesh.cmd_iam(argparse.Namespace(node="renamed"))
         text = out.getvalue()
         self.assertIn("renamed", text)
@@ -528,9 +534,13 @@ class JoinAlreadyJoinedTests(unittest.TestCase):
         """Claude resolves identity at runtime, so there is nothing stale to
         warn about and the noise would be wrong."""
         out = io.StringIO()
+        # Stub the best-effort rename announce for hermeticity (see the
+        # codex-harness test above -- previously hit ntfy.example and flaked).
         with mock.patch.object(mesh, "_detect_harness",
                                return_value="claude"), \
-             mock.patch.object(mesh, "_mutate_config"), contextlib.redirect_stdout(out):
+             mock.patch.object(mesh, "_mutate_config"), \
+             mock.patch.object(mesh, "send_raw"), \
+             contextlib.redirect_stdout(out):
             mesh.cmd_iam(argparse.Namespace(node="renamed"))
         self.assertNotIn("baked", out.getvalue())
 
