@@ -109,8 +109,9 @@ machine can instead run a background **supervisor** that executes delegated
 tasks with no session open. Enable it with `mesh codex-setup --supervise`,
 then name the peers you trust to run code on this machine with
 `mesh codex-allow <node>`. Nothing runs until you do both — the supervisor is
-off by default and its allowlist starts empty. That grant is node-wide, not
-session-scoped. See the security model below.
+off by default and its allowlist starts empty. That grant is keyed to the
+sender-name string, not a conversational session or, by itself, a verified
+node key. See the security model below.
 
 ## Machine-wide worker pool (opt-in)
 
@@ -264,20 +265,25 @@ What you still must do:
 - **A node signature identifies a node/harness identity, not a conversational
   session.** Agent integrations scope their private key per harness.
   Concurrent sessions of the same harness using the same mesh configuration
-  therefore share one node name and key, and a receiver cannot tell which of
-  those sessions produced a valid frame. Even a `FRAME_VERIFIED` result proves
-  possession of that node key; it does not prove which local agent or user
-  authorized the message.
+  therefore use the same per-harness key path and normally share one node
+  name. `--as` or `A2ACAST_NODE` can override the name, but not separate the
+  shared key path. A receiver cannot tell which session produced a valid
+  frame. Even a `FRAME_VERIFIED` result proves possession of that node key; it
+  does not prove which local agent or user authorized the message.
 - **Autonomous Codex execution is opt-in and gated on a curated allowlist.**
   `mesh codex-supervise` runs delegated tasks through `codex exec` and replies
   over the mesh. It stays off unless you start it (`codex-setup --supervise`),
   and even then only peers you add with `mesh codex-allow` run — a
   default-empty allowlist (`exec_allow`), **not** the roster of everyone who
-  holds the key. `mesh codex-allow <node>` grants **node-wide authority**; it
-  is not a grant to one chat or agent session. The `--sandbox read-only`
-  default is defense-in-depth, not the boundary: a read-only task can still
-  read repo secrets and return them in its reply, so only allow peers you
-  actually trust.
+  holds the key. `mesh codex-allow <node>` grants **sender-name-wide legacy
+  authority**: every accepted inbound task whose persisted sender-name string
+  matches that entry is eligible. It is not a grant to one chat or agent
+  session, and under default-off or unsettled node verification it is **not a
+  per-node cryptographic grant**. A settled pin plus verdict enforcement can
+  refuse a mismatched key, but first contact remains unverified and accepted.
+  The `--sandbox read-only` default is defense-in-depth, not the boundary: a
+  read-only task can still read repo secrets and return them in its reply, so
+  only allow peers you actually trust.
 - **Hard separation between co-located agents requires separate OS accounts or
   sandboxes**, with distinct mesh identities and private keys protected from
   one another. Separate processes, temporary key directories, and Git

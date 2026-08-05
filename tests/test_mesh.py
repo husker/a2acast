@@ -10933,7 +10933,10 @@ class OnboardingTextTests(unittest.TestCase):
             readme = " ".join(f.read().lower().split())
         self.assertIn("node/harness identity", readme)
         self.assertIn("not a conversational session", readme)
-        self.assertIn("node-wide authority", readme)
+        self.assertIn("normally share one node name", readme)
+        self.assertIn("sender-name-wide legacy authority", readme)
+        self.assertIn("every accepted inbound task", readme)
+        self.assertIn("not a per-node cryptographic grant", readme)
         self.assertIn("separate os accounts or sandboxes", readme)
 
     def test_integrate_codex_mentions_codex_setup(self):
