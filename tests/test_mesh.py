@@ -1916,7 +1916,9 @@ class SendStatusInviteTests(MembershipCmdTests):
                     "via": "message",
                     "status": "listening",
                 },
-                # A once-healthy report is not current evidence forever.
+                # A once-healthy report that has aged past the window reads as
+                # stale(<age>), NOT unknown -- #182: distinct from delta above,
+                # which never reported at all.
                 "epsilon": {
                     "seen": now - 4,
                     "via": "pong",
@@ -1955,7 +1957,7 @@ class SendStatusInviteTests(MembershipCmdTests):
             "beta 1s ago watch/listening healthy active ok",
             "gamma 1m ago mcp/blocked stalled idle stalled",
             "delta 3s ago unknown/listening unknown unknown unknown",
-            "epsilon 4s ago unknown/listening unknown unknown unknown",
+            "epsilon 4s ago unknown/listening stale(5m) stale(5m) stale(5m)",
         ])
         self.assertTrue(out.getvalue().isascii(), repr(out.getvalue()))
         self.assertEqual(snapshot_files(), files_before)
@@ -17748,6 +17750,73 @@ class FleetReceiverHealthTests(unittest.TestCase):
         mesh.note_peer(cfg, "peerZ", "ack", recv=wire.get("recv"))  # we record
         peers = json.load(open(mesh.peers_file(cfg)))
         self.assertEqual(peers["peerZ"]["recv"], "healthy")
+
+
+class FleetStaleHealthRenderingTests(unittest.TestCase):
+    """#182: an aged health report renders as stale(<age>), distinct from a
+    never-reported peer's 'unknown', so a quiet healthy node stops reading as
+    offline. Display-only -- the on-wire vocabulary is unchanged."""
+
+    def test_short_age_is_compact_and_never_negative(self):
+        self.assertEqual(mesh._short_age(5), "5s")
+        self.assertEqual(mesh._short_age(301), "5m")
+        self.assertEqual(mesh._short_age(7200), "2h")
+        self.assertEqual(mesh._short_age(172800), "2d")
+        self.assertEqual(mesh._short_age(-4), "0s")
+
+    def test_fresh_report_renders_its_value(self):
+        now = 10_000
+        self.assertEqual(
+            mesh._fleet_health_cell("healthy", now - 10, now, mesh.RECV_STATES),
+            "healthy")
+
+    def test_aged_report_is_stale_with_age_not_unknown(self):
+        now = 10_000
+        # one second past the window -> stale, carrying its age (and visually
+        # distinct from the real 'stalled' state)
+        self.assertEqual(
+            mesh._fleet_health_cell(
+                "healthy", now - mesh.RECV_STALL_SECONDS - 1, now,
+                mesh.RECV_STATES),
+            "stale(5m)")
+        # exactly at the window is still fresh (boundary is inclusive)
+        self.assertEqual(
+            mesh._fleet_health_cell(
+                "healthy", now - mesh.RECV_STALL_SECONDS, now,
+                mesh.RECV_STATES),
+            "healthy")
+
+    def test_never_reported_or_invalid_is_unknown(self):
+        now = 10_000
+        self.assertEqual(
+            mesh._fleet_health_cell(None, None, now, mesh.RECV_STATES),
+            "unknown")                                    # never reported
+        self.assertEqual(
+            mesh._fleet_health_cell("evil", now - 5, now, mesh.RECV_STATES),
+            "unknown")                                    # not a valid state
+        self.assertEqual(
+            mesh._fleet_health_cell("healthy", "5", now, mesh.RECV_STATES),
+            "unknown")                                    # seen not an int
+        self.assertEqual(
+            mesh._fleet_health_cell("healthy", True, now, mesh.RECV_STATES),
+            "unknown")                                    # bool is not an int
+
+    def test_future_stamp_is_unknown_not_stale(self):
+        now = 10_000
+        # clock skew: a report stamped in the future is not trustworthy
+        self.assertEqual(
+            mesh._fleet_health_cell("healthy", now + 50, now, mesh.RECV_STATES),
+            "unknown")
+
+    def test_agent_and_wake_states_use_the_same_rule(self):
+        now = 10_000
+        self.assertEqual(
+            mesh._fleet_health_cell("idle", now - 10, now, mesh.AGENT_STATES),
+            "idle")
+        self.assertEqual(
+            mesh._fleet_health_cell(
+                "ok", now - mesh.RECV_STALL_SECONDS - 60, now, mesh.WAKE_STATES),
+            "stale(6m)")
 
 
 class AgentLivenessWireTests(unittest.TestCase):
