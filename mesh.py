@@ -9388,9 +9388,13 @@ def _record_delivery_task(cfg, me, frm, body, recipient=None):
 
 
 def _emit_message(cfg, me, frm, body, ev, recipient=None,
-                  task_record=_TASK_RECORD_UNSET):
-    """Print one inbound message or task; return its local delivery kind."""
+                  task_record=_TASK_RECORD_UNSET, actor=None):
+    """Print one inbound message or task; return its local delivery kind.
+
+    #188 Phase 2b: `actor` is the verified actor fingerprint (or None). When
+    set it is surfaced in the delivery evidence -- it NEVER gates delivery."""
     body = _sanitize_delivery_text(body)
+    actor_meta = f" actor={_single_line(actor)}" if actor else ""
     env = _parse_envelope(body)
     if env:
         details = _envelope_details(env)
@@ -9422,7 +9426,7 @@ def _emit_message(cfg, me, frm, body, ev, recipient=None,
                         file=sys.stderr)
                 return False
             print(f"MESH_TASK from={_single_line(frm)} task={task_id} "
-                  f"state=submitted: {_single_line(text)}")
+                  f"state=submitted{actor_meta}: {_single_line(text)}")
             print(f"  -> to answer: mesh reply {task_id} --state completed "
                   f"\"<result>\"")
             delivery_kind = "task"
@@ -9436,7 +9440,7 @@ def _emit_message(cfg, me, frm, body, ev, recipient=None,
             unsolicited = disposition == TASK_RECORD_UNSOLICITED
             warning = f" ({UNSOLICITED_TASK_UPDATE})" if unsolicited else ""
             print(f"MESH_TASK_UPDATE{warning} from={_single_line(frm)} "
-                  f"task={task_id} state={_single_line(state)}: "
+                  f"task={task_id} state={_single_line(state)}{actor_meta}: "
                   f"{_single_line(text)}")
             delivery_kind = "task_update"
         print(json.dumps(env), flush=True)
@@ -9460,13 +9464,15 @@ def _emit_message(cfg, me, frm, body, ev, recipient=None,
             if message["reply_to"]:
                 metadata += f" reply_to={_single_line(message['reply_to'])}"
         print(f"MESH_MESSAGE from={_single_line(frm)!r} "
-              f"to={_single_line(me)}{metadata}: "
+              f"to={_single_line(me)}{metadata}{actor_meta}: "
               f"{_single_line(message['text'])}")
         rendered = {"from": frm, "message": message["text"],
                     "id": message["id"], "intent": message["intent"],
                     "time": ev.get("time")}
         if message["reply_to"]:
             rendered["reply_to"] = message["reply_to"]
+        if actor:
+            rendered["actor"] = actor
         print(json.dumps(rendered), flush=True)
         delivery_kind = "message"
     return delivery_kind
@@ -9896,12 +9902,14 @@ def _cmd_watch_owned(args, cfg, me):
         _report_verdict(frm, ev, verdict)
         _observe_revlist_freshness(cfg, me, frm, _sbase, verdict)
         _observe_downgrade(cfg, frm, verdict)
-        # #188 Phase 1: receiver-side actor attestation, INERT. Gated internally
-        # on FRAME_VERIFIED + actor_receive (default off => no-op, no subprocess).
-        # Discarded in Phase 1; Phase 2 threads it into delivery evidence.
-        _actor_verdict(cfg, verdict, _sbase,
-                       ev.get("topic") if isinstance(ev.get("topic"), str)
-                       else None, _wts)
+        # #188: receiver-side actor attestation. Gated internally on
+        # FRAME_VERIFIED + actor_receive (default off => no-op, no subprocess).
+        # Phase 2b surfaces the verified fingerprint in delivery evidence; it
+        # never gates delivery.
+        _actor_state, actor_fpr = _actor_verdict(
+            cfg, verdict, _sbase,
+            ev.get("topic") if isinstance(ev.get("topic"), str)
+            else None, _wts)
         if _refuse_frame(cfg, frm, verdict) is not None:
             checkpoint()  # deliberate refusal: consume, never replay forever
             continue  # #74: refused frames are not delivered
@@ -9939,11 +9947,11 @@ def _cmd_watch_owned(args, cfg, me):
         _send_ack(cfg, me, frm, ev)
         if task_record is _TASK_RECORD_UNSET:
             delivery_kind = _emit_message(
-                cfg, me, frm, body, ev, recipient=recipient)
+                cfg, me, frm, body, ev, recipient=recipient, actor=actor_fpr)
         else:
             delivery_kind = _emit_message(
                 cfg, me, frm, body, ev, recipient=recipient,
-                task_record=task_record)
+                task_record=task_record, actor=actor_fpr)
         if delivery_kind is False:
             # Undeliverable after decrypt (invalid or colliding envelope):
             # consume it once -- rescanning forever helps nobody -- but leave
@@ -10634,10 +10642,12 @@ class MeshMCPServer:
             _report_verdict(frm, ev, verdict)
             _observe_revlist_freshness(cfg, me, frm, _sbase, verdict)
             _observe_downgrade(cfg, frm, verdict)
-            # #188 Phase 1: receiver-side actor attestation, INERT (see cmd_watch).
-            _actor_verdict(cfg, verdict, _sbase,
-                           ev.get("topic") if isinstance(ev.get("topic"), str)
-                           else None, _wts)
+            # #188: receiver-side actor attestation (see cmd_watch). Phase 2b
+            # surfaces the verified fingerprint on the delivery; never gates it.
+            _actor_state, actor_fpr = _actor_verdict(
+                cfg, verdict, _sbase,
+                ev.get("topic") if isinstance(ev.get("topic"), str)
+                else None, _wts)
             if _refuse_frame(cfg, frm, verdict) is not None:
                 checkpoint()  # deliberate refusal: consume without a task
                 continue  # #74: refused frames are not delivered
@@ -10666,6 +10676,8 @@ class MeshMCPServer:
                     frm, recipient, body, ev, task_record=task_record)
             if delivery:
                 delivery["verify"] = verdict
+                if actor_fpr:  # #188 Phase 2b: surface verified actor, if any
+                    delivery["actor"] = actor_fpr
                 self.deliver(delivery)
 
 

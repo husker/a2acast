@@ -9565,7 +9565,7 @@ class AckReceiverTests(MembershipCmdTests):
             order.append(("ack", ctl))
             return {"id": "x"}
 
-        def fake_emit(c, me, frm, body, ev, recipient=None):
+        def fake_emit(c, me, frm, body, ev, recipient=None, actor=None):
             order.append(("emit", ev.get("id")))
 
         out = io.StringIO()
@@ -10096,6 +10096,48 @@ class VerifyWireTests(unittest.TestCase):
             delivered = list(self.srv._buf)
             self.srv._buf.clear()
         return delivered, err.getvalue()
+
+    def test_verified_actor_is_surfaced_on_delivery(self):
+        # #188 Phase 2b: end-to-end -- a sender that emits a valid actor and a
+        # receiver with actor_receive on surfaces the verified fingerprint on
+        # the delivery. It never gates delivery.
+        self.cfg["actor_receive"] = True
+        mesh._bind_peer(self.cfg, "beta", self.beta_pub)
+        self.beta["actor_emit"] = True
+        self.beta["_actor_context"] = True
+        saved = mesh._ACTOR_IDENTITY
+        mesh._ACTOR_IDENTITY = None
+        try:
+            delivered, _ = self._run(
+                self._signed_event(self.beta, body="hi", eid="e-actor"))
+        finally:
+            cur = mesh._ACTOR_IDENTITY
+            if cur is not None:
+                shutil.rmtree(cur[0], ignore_errors=True)
+            mesh._ACTOR_IDENTITY = saved
+        self.assertEqual(len(delivered), 1)
+        self.assertEqual(delivered[0]["verify"], mesh.FRAME_VERIFIED)
+        self.assertTrue(delivered[0].get("actor", "").startswith("SHA256:"))
+
+    def test_no_actor_surfaced_when_sender_does_not_emit(self):
+        self.cfg["actor_receive"] = True
+        mesh._bind_peer(self.cfg, "beta", self.beta_pub)
+        delivered, _ = self._run(self._signed_event(self.beta, body="hi"))
+        self.assertEqual(len(delivered), 1)
+        self.assertNotIn("actor", delivered[0])
+
+    def test_emit_message_surfaces_actor_and_none_is_byte_identical(self):
+        ev = {"id": "e1", "time": 1}
+        with_actor = io.StringIO()
+        with contextlib.redirect_stdout(with_actor):
+            mesh._emit_message(self.cfg, "alpha", "beta", "hi", ev,
+                               actor="SHA256:abc")
+        self.assertIn("actor=SHA256:abc", with_actor.getvalue())
+        self.assertIn('"actor": "SHA256:abc"', with_actor.getvalue())
+        none_actor = io.StringIO()
+        with contextlib.redirect_stdout(none_actor):
+            mesh._emit_message(self.cfg, "alpha", "beta", "hi", ev)
+        self.assertNotIn("actor", none_actor.getvalue())
 
     def test_first_contact_delivers_and_pins_as_unverified(self):
         delivered, _ = self._run(self._signed_event(self.beta))
