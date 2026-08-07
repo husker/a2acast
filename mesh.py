@@ -2207,6 +2207,161 @@ def _frame_verdict(cfg, frm, recipient, body, ctl, sig, pubkey, wire_ts, ev,
     return _verify_frame(cfg, frm, pubkey, sig, relay_topic, wire_ts, base)
 
 
+# --- #188 Phase 1: receiver-side actor-instance attestation (default OFF) -----
+# An OPTIONAL signed wrapper field `a` lets a sender attest a per-process actor
+# key beneath its durable node key. Phase 1 is RECEIVE-ONLY: parse + verify + a
+# fingerprint, all behind the `actor_receive` opt-in (default off => behaviour is
+# byte-identical). Nothing here emits, surfaces, stores, or authorizes; those are
+# later, separately-gated phases. See issue #188.
+ACTOR_WIRE_VERSION = 1
+ACTOR_PK_MAX = 256
+ACTOR_SIG_MAX = 1024
+ACTOR_META_MAX = 32
+ACTOR_OBJ_MAX = 4096
+_ACTOR_KEYS = frozenset(("v", "pk", "kind", "harness", "sig"))
+ACTOR_SIG_PRINCIPAL = "a2acast-actor"
+
+
+def _actor_key_namespace(cfg):
+    return f"a2acast-actor@{cfg['id']}"
+
+
+def _actor_sig_message(cfg, relay_topic, timestamp, base_minus_asig):
+    """Bytes the ACTOR key signs: the same wire AAD as the node signature, a
+    DISTINCT domain-separation tag, then the canonical base with `a.sig` removed.
+    The distinct tag is what stops an actor signature verifying as a node
+    signature or the reverse (mirrors _node_sig_message's `a2acast-nodesig`)."""
+    if not isinstance(timestamp, int) or isinstance(timestamp, bool):
+        raise ValueError("signature timestamp must be an int")
+    aad = _wire_aad(cfg, relay_topic or "", timestamp)
+    canon = json.dumps(base_minus_asig, sort_keys=True, separators=(",", ":"),
+                       ensure_ascii=True, allow_nan=False).encode("utf-8")
+    return aad + b"\x00a2acast-actorsig\x00" + canon
+
+
+def _parse_actor(a):
+    """Bounded, subprocess-free validation of an inbound `a` object. Returns a
+    normalized dict {v, pk, kind, harness, sig} -- `pk` reduced to the two-field
+    normalized ssh-ed25519 form via _normalize_pubkey -- or None on ANY problem.
+    Never raises. Runs BEFORE any subprocess, so a malformed/oversized actor
+    never reaches ssh-keygen, and a newline/comment in `pk` cannot inject a
+    second allowed-signers line (normalization drops everything after the blob)."""
+    try:
+        if not isinstance(a, dict):
+            return None
+        if set(a) - _ACTOR_KEYS:
+            return None                        # reject unknown/extra fields
+        if a.get("v") != ACTOR_WIRE_VERSION:
+            return None
+        pk, sig = a.get("pk"), a.get("sig")
+        if not (isinstance(pk, str) and 0 < len(pk) <= ACTOR_PK_MAX):
+            return None
+        if not (isinstance(sig, str) and 0 < len(sig) <= ACTOR_SIG_MAX):
+            return None
+        kind, harness = a.get("kind", ""), a.get("harness", "")
+        if not (isinstance(kind, str) and len(kind) <= ACTOR_META_MAX):
+            return None
+        if not (isinstance(harness, str) and len(harness) <= ACTOR_META_MAX):
+            return None
+        try:
+            norm_pk = _normalize_pubkey(pk)
+        except ValueError:
+            return None
+        if norm_pk.split(" ", 1)[0] != "ssh-ed25519":
+            return None                        # exactly one key type allowed
+        obj = {"v": ACTOR_WIRE_VERSION, "pk": norm_pk, "sig": sig,
+               "kind": kind, "harness": harness}
+        if len(json.dumps(obj, separators=(",", ":"),
+                          ensure_ascii=True).encode("utf-8")) > ACTOR_OBJ_MAX:
+            return None
+        return obj
+    except (TypeError, ValueError):
+        return None
+
+
+def _reconstruct_actor_base(base_payload):
+    """The exact base the actor signed: the node-verified base with `a.sig`
+    removed. Operates on the RAW wire `a` (the bytes the actor actually signed);
+    normalization applies to the verifying KEY, never to the signed MESSAGE."""
+    if not isinstance(base_payload, dict):
+        return None
+    a = base_payload.get("a")
+    if not isinstance(a, dict):
+        return None
+    out = dict(base_payload)
+    out["a"] = {k: v for k, v in a.items() if k != "sig"}
+    return out
+
+
+def _verify_actor(cfg, base_payload, relay_topic, timestamp):
+    """True iff `base_payload` carries a well-formed `a` whose signature verifies
+    against its own normalized key over the actor-signed message. Bounds and
+    normalizes BEFORE any subprocess; EVERY operational failure (tempfile,
+    missing/broken ssh-keygen, OSError, TimeoutExpired) returns False. Never
+    raises -- a receive-path exception here would be a poison pill after the MCP
+    loop resubscribes-before-checkpoint (see #185/#187)."""
+    parsed = _parse_actor(base_payload.get("a")
+                          if isinstance(base_payload, dict) else None)
+    if parsed is None:
+        return False
+    try:
+        recon = _reconstruct_actor_base(base_payload)
+        if recon is None:
+            return False
+        message = _actor_sig_message(cfg, relay_topic, timestamp, recon)
+        binary = _ssh_keygen_binary()
+    except (ValueError, KeyError, TypeError):
+        return False
+    workdir = None
+    try:
+        workdir = tempfile.mkdtemp(prefix="mw-actorverify-")
+        sig_path = os.path.join(workdir, "m.sig")
+        with open(sig_path, "w", encoding="utf-8") as f:
+            f.write(parsed["sig"])
+        signers_path = os.path.join(workdir, "signers")
+        with open(signers_path, "w", encoding="utf-8") as f:
+            f.write(f"{ACTOR_SIG_PRINCIPAL} "
+                    f"namespaces=\"{_actor_key_namespace(cfg)}\" "
+                    f"{parsed['pk']}\n")
+        completed = subprocess.run(
+            [binary, "-Y", "verify", "-f", signers_path,
+             "-I", ACTOR_SIG_PRINCIPAL,
+             "-n", _actor_key_namespace(cfg), "-s", sig_path],
+            input=message, capture_output=True, timeout=60)
+        return completed.returncode == 0
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return False
+    finally:
+        if workdir is not None:
+            shutil.rmtree(workdir, ignore_errors=True)
+
+
+def _actor_verdict(cfg, verdict, base_payload, relay_topic, timestamp):
+    """Receiver-side actor attestation, hard-gated. Returns:
+       ("absent", None)     -- no actor attempted: feature off, no `a`, or the
+                               node frame is not FRAME_VERIFIED
+       ("unverified", None) -- `a` present but failed bounds or signature
+       ("verified", fpr)    -- `a` present and verified; fpr from the verified key
+    No actor-specific interpretation and no subprocess runs unless the node
+    verdict is FRAME_VERIFIED AND `actor_receive` is enabled. Never raises;
+    Phase 1 callers discard the result (nothing surfaced, stored, or gated)."""
+    if verdict != FRAME_VERIFIED or cfg.get("actor_receive") is not True:
+        return ("absent", None)
+    if not (isinstance(base_payload, dict)
+            and isinstance(base_payload.get("a"), dict)):
+        return ("absent", None)
+    parsed = _parse_actor(base_payload.get("a"))
+    if parsed is None:
+        return ("unverified", None)
+    if not _verify_actor(cfg, base_payload, relay_topic, timestamp):
+        return ("unverified", None)
+    try:
+        fpr = _key_fingerprint(parsed["pk"])
+    except (ValueError, KeyError, TypeError):
+        return ("unverified", None)
+    return ("verified", fpr)
+
+
 def _report_verdict(frm, ev, verdict):
     """Surface a non-verified verdict without affecting delivery. Mismatch is
     louder (a pinned peer's signature failed -- forgery or corruption);
@@ -9616,6 +9771,12 @@ def _cmd_watch_owned(args, cfg, me):
         _report_verdict(frm, ev, verdict)
         _observe_revlist_freshness(cfg, me, frm, _sbase, verdict)
         _observe_downgrade(cfg, frm, verdict)
+        # #188 Phase 1: receiver-side actor attestation, INERT. Gated internally
+        # on FRAME_VERIFIED + actor_receive (default off => no-op, no subprocess).
+        # Discarded in Phase 1; Phase 2 threads it into delivery evidence.
+        _actor_verdict(cfg, verdict, _sbase,
+                       ev.get("topic") if isinstance(ev.get("topic"), str)
+                       else None, _wts)
         if _refuse_frame(cfg, frm, verdict) is not None:
             checkpoint()  # deliberate refusal: consume, never replay forever
             continue  # #74: refused frames are not delivered
@@ -10348,6 +10509,10 @@ class MeshMCPServer:
             _report_verdict(frm, ev, verdict)
             _observe_revlist_freshness(cfg, me, frm, _sbase, verdict)
             _observe_downgrade(cfg, frm, verdict)
+            # #188 Phase 1: receiver-side actor attestation, INERT (see cmd_watch).
+            _actor_verdict(cfg, verdict, _sbase,
+                           ev.get("topic") if isinstance(ev.get("topic"), str)
+                           else None, _wts)
             if _refuse_frame(cfg, frm, verdict) is not None:
                 checkpoint()  # deliberate refusal: consume without a task
                 continue  # #74: refused frames are not delivered

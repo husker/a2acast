@@ -17819,6 +17819,182 @@ class FleetStaleHealthRenderingTests(unittest.TestCase):
             "stale(6m)")
 
 
+class ActorAttestationReceiveTests(unittest.TestCase):
+    """#188 Phase 1: receiver-side actor-instance attestation. Receive-only,
+    default-off, no emission/surfacing/storage/authorization. Verifies the
+    dual-signature receive path and its bounds, and that everything is gated
+    behind FRAME_VERIFIED + `actor_receive`."""
+
+    TOPIC = "mw-t-abc123-beta"
+    TS = 1000
+
+    def _cfg(self):
+        cfg = {"mesh": "t", "id": "abc123", "server": "https://ntfy.example",
+               "key": "0" * 64, "actor_receive": True,
+               "_dir": tempfile.mkdtemp()}
+        self.addCleanup(shutil.rmtree, cfg["_dir"], ignore_errors=True)
+        return cfg
+
+    def _mint(self, cfg, kind="mcp", harness="codex", extra=None, pk_wire=None):
+        """Generate an ephemeral actor key and return a base carrying a fully
+        signed `a`. pk_wire overrides the on-wire key (to test injection)."""
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        key = os.path.join(d, "k")
+        subprocess.run(["ssh-keygen", "-t", "ed25519", "-N", "", "-f", key,
+                        "-C", "actor"], check=True, capture_output=True)
+        with open(key + ".pub") as f:
+            pub = f.read().strip()
+        wire_pk = pk_wire if pk_wire is not None else mesh._normalize_pubkey(pub)
+        base = dict(extra or {"f": "beta", "t": "alpha"})
+        a = {"v": 1, "pk": wire_pk, "kind": kind, "harness": harness}
+        base["a"] = a
+        recon = {**base, "a": dict(a)}  # `a` has no sig yet
+        msg = mesh._actor_sig_message(cfg, self.TOPIC, self.TS, recon)
+        mp = os.path.join(d, "m")
+        with open(mp, "wb") as f:
+            f.write(msg)
+        subprocess.run(["ssh-keygen", "-Y", "sign", "-f", key, "-n",
+                        mesh._actor_key_namespace(cfg), mp],
+                       check=True, capture_output=True)
+        with open(mp + ".sig") as f:
+            a["sig"] = f.read()
+        return base
+
+    def test_valid_actor_verifies_and_verdict_is_verified(self):
+        cfg = self._cfg()
+        base = self._mint(cfg)
+        self.assertTrue(mesh._verify_actor(cfg, base, self.TOPIC, self.TS))
+        state, fpr = mesh._actor_verdict(
+            cfg, mesh.FRAME_VERIFIED, base, self.TOPIC, self.TS)
+        self.assertEqual(state, "verified")
+        self.assertTrue(fpr and fpr.startswith("SHA256:"))
+
+    def test_tampered_sig_pk_or_body_fail(self):
+        cfg = self._cfg()
+        base = self._mint(cfg)
+        bad_sig = json.loads(json.dumps(base))
+        bad_sig["a"]["sig"] = bad_sig["a"]["sig"].replace("A", "B", 1)
+        self.assertFalse(mesh._verify_actor(cfg, bad_sig, self.TOPIC, self.TS))
+        bad_body = json.loads(json.dumps(base))
+        bad_body["f"] = "mallory"
+        self.assertFalse(mesh._verify_actor(cfg, bad_body, self.TOPIC, self.TS))
+        # a different (valid) key's pk with the original sig cannot verify
+        other = self._mint(cfg)
+        swap = json.loads(json.dumps(base))
+        swap["a"]["pk"] = other["a"]["pk"]
+        self.assertFalse(mesh._verify_actor(cfg, swap, self.TOPIC, self.TS))
+
+    def test_actor_signature_is_bound_to_route_and_time(self):
+        cfg = self._cfg()
+        base = self._mint(cfg)
+        self.assertFalse(mesh._verify_actor(
+            cfg, base, "mw-t-abc123-WRONG", self.TS))
+        self.assertFalse(mesh._verify_actor(cfg, base, self.TOPIC, self.TS + 1))
+
+    def test_copy_actor_b_onto_a_changed_frame_fails(self):
+        cfg = self._cfg()
+        # actor B signs over frame n=x; presenting B's `a` on n=y must fail,
+        # because the actor signature covers the body.
+        b = self._mint(cfg, extra={"f": "beta", "t": "alpha", "n": "x"})
+        forged = {"f": "beta", "t": "alpha", "n": "y", "a": b["a"]}
+        self.assertFalse(mesh._verify_actor(cfg, forged, self.TOPIC, self.TS))
+
+    def test_malformed_actor_never_reaches_ssh_keygen(self):
+        cfg = self._cfg()
+        base = self._mint(cfg)
+        good_a = base["a"]
+        bads = [
+            None, [], "x", {},                                   # non-object/empty
+            {**good_a, "v": 2},                                  # wrong version
+            {k: v for k, v in good_a.items() if k != "pk"},      # missing pk
+            {**good_a, "extra": 1},                              # unknown field
+            {**good_a, "pk": "not a key"},                       # unparseable pk
+            {**good_a, "pk": "ssh-rsa " + "A" * 40},             # wrong key type
+            {**good_a, "kind": "x" * 100},                       # oversized meta
+            {**good_a, "sig": "s" * (mesh.ACTOR_SIG_MAX + 1)},   # oversized sig
+        ]
+        for bad in bads:
+            self.assertIsNone(mesh._parse_actor(bad), repr(bad)[:60])
+        with mock.patch.object(
+                mesh.subprocess, "run",
+                side_effect=AssertionError("ssh-keygen must not run")):
+            for bad in bads:
+                self.assertFalse(
+                    mesh._verify_actor(cfg, {"f": "beta", "a": bad},
+                                       self.TOPIC, self.TS))
+
+    def test_pk_normalization_strips_signers_line_injection(self):
+        cfg = self._cfg()
+        base = self._mint(cfg)
+        clean = base["a"]["pk"]
+        injected = clean + "\nEVIL namespaces=\"x\" ssh-ed25519 AAAAEVIL"
+        parsed = mesh._parse_actor({**base["a"], "pk": injected})
+        # normalization reduces to the two-field form; no newline can reach the
+        # allowed-signers file, so no second signer is injected.
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed["pk"], clean)
+        self.assertNotIn("\n", parsed["pk"])
+
+    def test_verdict_absent_when_feature_off(self):
+        cfg = self._cfg()
+        cfg["actor_receive"] = False
+        base = self._mint(cfg)
+        with mock.patch.object(
+                mesh.subprocess, "run",
+                side_effect=AssertionError("ssh-keygen must not run")):
+            self.assertEqual(
+                mesh._actor_verdict(cfg, mesh.FRAME_VERIFIED, base,
+                                    self.TOPIC, self.TS),
+                ("absent", None))
+
+    def test_verdict_absent_when_node_not_verified(self):
+        cfg = self._cfg()
+        base = self._mint(cfg)  # a valid actor, but the NODE verdict is not VERIFIED
+        with mock.patch.object(
+                mesh.subprocess, "run",
+                side_effect=AssertionError("ssh-keygen must not run")):
+            for verdict in (mesh.FRAME_MISMATCH, mesh.FRAME_UNVERIFIED,
+                            mesh.FRAME_UNSIGNED):
+                self.assertEqual(
+                    mesh._actor_verdict(cfg, verdict, base, self.TOPIC, self.TS),
+                    ("absent", None))
+
+    def test_actor_verify_is_non_fatal_on_operational_failure(self):
+        cfg = self._cfg()
+        base = self._mint(cfg)
+        for exc in (OSError("boom"),
+                    subprocess.TimeoutExpired(cmd="ssh-keygen", timeout=60)):
+            with mock.patch.object(mesh.subprocess, "run", side_effect=exc):
+                # must degrade, never propagate
+                self.assertFalse(
+                    mesh._verify_actor(cfg, base, self.TOPIC, self.TS))
+                self.assertEqual(
+                    mesh._actor_verdict(cfg, mesh.FRAME_VERIFIED, base,
+                                        self.TOPIC, self.TS),
+                    ("unverified", None))
+
+    def test_actor_signature_does_not_verify_as_a_node_signature(self):
+        # domain separation: the same key + signature over the actor-tagged
+        # message must not verify under the node tag/namespace.
+        cfg = self._cfg()
+        base = self._mint(cfg)
+        norm_pk = base["a"]["pk"]
+        recon = mesh._reconstruct_actor_base(base)
+        # the node verifier over the node-tagged message rejects the actor sig
+        self.assertFalse(mesh._verify_node_sig(
+            cfg, "beta", norm_pk, self.TOPIC, self.TS, recon, base["a"]["sig"]))
+
+    def test_default_off_send_emits_no_actor_field(self):
+        # Phase 1 never emits `a`. A normally-signed wrapper carries no `a` key.
+        cfg = make_cfg(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, cfg["_dir"], ignore_errors=True)
+        mesh._ensure_node_key(cfg, "alpha", "claude")
+        _ts, payload = mesh._sign_wrapper_payload(
+            cfg, "beta", {"mw": "message", "x": "hi"}, harness="claude")
+        self.assertNotIn("a", payload)
+
+
 class AgentLivenessWireTests(unittest.TestCase):
     """inc2: presence frames also carry the sender's agent-liveness (raw
     active/idle) so a peer's wake-state is visible fleet-wide, not just local.
