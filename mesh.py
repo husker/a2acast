@@ -17,6 +17,7 @@ Stdlib only. Works on Linux, macOS, Windows (Python 3.8+).
 """
 
 import argparse
+import atexit
 import base64
 import contextlib
 import email.message
@@ -2362,6 +2363,109 @@ def _actor_verdict(cfg, verdict, base_payload, relay_topic, timestamp):
     return ("verified", fpr)
 
 
+# --- #188 Phase 2: sender-side actor emission (default OFF, fleet-gated) -------
+# Emit the `a` field the Phase 1 receiver already parses. Gated on `actor_emit`
+# -- a DISTINCT operator assertion from `actor_receive`, standing for "the
+# intended receivers already parse `a` fleet-wide" (the same mixed-version
+# discipline as revlist_freshness/enforce_verdicts). Default off => sends are
+# byte-identical. No surfacing or authorization here; those are separate.
+_ACTOR_IDENTITY = None  # (dir, key_path, normalized_pub): one ephemeral actor
+                        # key per PROCESS. A same-UID process can read this key;
+                        # that ceiling is documented, not solved (#188).
+
+
+def _actor_emit_enabled(cfg):
+    """Phase 2 sender gate. Distinct from `actor_receive`: enabling it asserts
+    the fleet's receivers already parse `a`. Default off => byte-identical."""
+    return cfg.get("actor_emit") is True
+
+
+def _actor_identity(cfg):
+    """This process's ephemeral actor keypair: created once, reused for the
+    process lifetime, removed at clean exit. Returns (key_path, normalized_pub)
+    or None if a key cannot be made. Never persisted -- a restart yields a new
+    fingerprint, invalidating any stale standing actor grant."""
+    global _ACTOR_IDENTITY
+    if _ACTOR_IDENTITY is not None:
+        return _ACTOR_IDENTITY[1], _ACTOR_IDENTITY[2]
+    try:
+        binary = _ssh_keygen_binary()
+        d = tempfile.mkdtemp(prefix="mw-actor-")
+    except (OSError, ValueError):
+        return None
+    key_path = os.path.join(d, "k")
+    try:
+        completed = subprocess.run(
+            [binary, "-t", "ed25519", "-N", "", "-q", "-f", key_path,
+             "-C", "a2acast-actor"],
+            capture_output=True, text=True, timeout=60, env=_signing_env())
+        if completed.returncode != 0:
+            shutil.rmtree(d, ignore_errors=True)
+            return None
+        with open(key_path + ".pub", encoding="utf-8") as f:
+            pub = _normalize_pubkey(f.read())
+    except (OSError, ValueError, subprocess.SubprocessError):
+        shutil.rmtree(d, ignore_errors=True)
+        return None
+    _ACTOR_IDENTITY = (d, key_path, pub)
+    atexit.register(shutil.rmtree, d, True)  # remove on clean exit (best-effort)
+    return key_path, pub
+
+
+def _sign_as_actor(cfg, key_path, relay_topic, timestamp, base_minus_asig):
+    """Sign the actor message (base with `a.sig` absent) with the ephemeral actor
+    key. Mirrors _sign_as_node with the DISTINCT actor namespace + tag."""
+    binary = _ssh_keygen_binary()
+    message = _actor_sig_message(cfg, relay_topic, timestamp, base_minus_asig)
+    workdir = tempfile.mkdtemp(prefix="mw-actorsign-")
+    try:
+        mp = os.path.join(workdir, "m")
+        with open(mp, "wb") as f:
+            f.write(message)
+        completed = subprocess.run(
+            [binary, "-Y", "sign", "-f", key_path,
+             "-n", _actor_key_namespace(cfg), mp],
+            capture_output=True, text=True, timeout=60, env=_signing_env())
+        if completed.returncode != 0:
+            raise ValueError("ssh-keygen could not sign as actor: "
+                             + completed.stderr.strip())
+        with open(mp + ".sig", encoding="utf-8") as f:
+            return f.read()
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def _stamp_actor(cfg, payload, relay_topic, timestamp, harness):
+    """Best-effort: return `payload` with a signed `a` field when actor emission
+    is enabled, else unchanged (byte-identical). The actor key signs the base
+    WITH `a` minus its own sig; the node signature the caller adds NEXT then
+    covers the whole base including `a.sig`. Any failure falls back to node-only
+    -- never blocks the send, never emits an unsigned `a`."""
+    if not _actor_emit_enabled(cfg):
+        return payload
+    if not isinstance(payload, dict) or "a" in payload:
+        return payload
+    ident = _actor_identity(cfg)
+    if ident is None:
+        return payload
+    key_path, pub = ident
+    label = harness if isinstance(harness, str) else ""
+    a = {"v": ACTOR_WIRE_VERSION, "pk": pub, "kind": "",
+         "harness": label[:ACTOR_META_MAX]}
+    base = dict(payload)
+    base["a"] = a  # a-minus-sig: exactly what the actor signs over
+    try:
+        sig = _sign_as_actor(cfg, key_path, relay_topic, timestamp, base)
+    except (ValueError, OSError, subprocess.SubprocessError) as exc:
+        print(f"MESH_WARN: could not sign actor attestation "
+              f"({_single_line(str(exc))}); sent node-only",
+              file=sys.stderr)
+        return payload
+    out = dict(payload)
+    out["a"] = {**a, "sig": sig}
+    return out
+
+
 def _report_verdict(frm, ev, verdict):
     """Surface a non-verified verdict without affecting delivery. Mismatch is
     louder (a pinned peer's signature failed -- forgery or corruption);
@@ -2645,6 +2749,9 @@ def _sign_wrapper_payload(cfg, to, payload, harness=None):
         # revlist-trust rather than tripping the mixed-version rollout.
         payload = _assert_revlist_freshness(cfg, payload)
         relay_topic = topic(cfg, to) if to is not None else ""
+        # #188 Phase 2: add the actor sub-signature BEFORE the node signature so
+        # the node signature covers `a` (with its sig). Default off => no-op.
+        payload = _stamp_actor(cfg, payload, relay_topic, timestamp, harness)
         signature = _sign_as_node(cfg, harness, relay_topic, timestamp,
                                   payload)
     except (ValueError, OSError, subprocess.SubprocessError) as exc:

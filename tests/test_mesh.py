@@ -17995,6 +17995,97 @@ class ActorAttestationReceiveTests(unittest.TestCase):
         self.assertNotIn("a", payload)
 
 
+class ActorAttestationEmitTests(unittest.TestCase):
+    """#188 Phase 2: sender-side actor emission. Default OFF (byte-identical),
+    fleet-gated on `actor_emit`; an emitted frame round-trips through the Phase 1
+    receiver. No surfacing or authorization here."""
+
+    def setUp(self):
+        self._saved_identity = mesh._ACTOR_IDENTITY
+        mesh._ACTOR_IDENTITY = None
+
+    def tearDown(self):
+        cur = mesh._ACTOR_IDENTITY
+        if cur is not None:
+            shutil.rmtree(cur[0], ignore_errors=True)
+        mesh._ACTOR_IDENTITY = self._saved_identity
+
+    def _cfg(self):
+        cfg = make_cfg(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, cfg["_dir"], ignore_errors=True)
+        mesh._ensure_node_key(cfg, "alpha", "claude")
+        return cfg
+
+    def _send(self, cfg):
+        return mesh._sign_wrapper_payload(
+            cfg, "beta", {"mw": "message", "f": "alpha", "x": "hi"},
+            harness="claude")
+
+    def test_default_off_emits_no_actor_field(self):
+        cfg = self._cfg()  # actor_emit unset
+        _ts, payload = self._send(cfg)
+        self.assertNotIn("a", payload)
+
+    def test_enabled_emits_parseable_signed_actor(self):
+        cfg = self._cfg()
+        cfg["actor_emit"] = True
+        _ts, payload = self._send(cfg)
+        self.assertIn("a", payload)
+        self.assertIsNotNone(mesh._parse_actor(payload["a"]))
+        self.assertEqual(payload["a"]["harness"], "claude")
+
+    def test_emitted_frame_round_trips_through_phase1_receiver(self):
+        cfg = self._cfg()
+        cfg["actor_emit"] = True
+        ts, payload = self._send(cfg)
+        base = mesh._base_payload(payload)
+        topic = mesh.topic(cfg, "beta")
+        self.assertTrue(mesh._verify_actor(cfg, base, topic, ts))
+        rcfg = dict(cfg)
+        rcfg["actor_receive"] = True
+        state, fpr = mesh._actor_verdict(
+            rcfg, mesh.FRAME_VERIFIED, base, topic, ts)
+        self.assertEqual(state, "verified")
+        self.assertTrue(fpr and fpr.startswith("SHA256:"))
+
+    def test_node_signature_covers_actor_and_partitions_old_receiver(self):
+        cfg = self._cfg()
+        cfg["actor_emit"] = True
+        ts, payload = self._send(cfg)
+        base = mesh._base_payload(payload)
+        topic = mesh.topic(cfg, "beta")
+        pub = mesh._own_node_pubkey(cfg, "claude")
+        # current (all-field) reconstruction verifies the node signature
+        self.assertTrue(mesh._verify_node_sig(
+            cfg, "alpha", pub, topic, ts, base, payload["s"]))
+        # a fixed-template receiver that drops `a` mismatches -> why emission
+        # must stay fleet-gated until receivers are proven to parse `a`.
+        without_a = {k: v for k, v in base.items() if k != "a"}
+        self.assertFalse(mesh._verify_node_sig(
+            cfg, "alpha", pub, topic, ts, without_a, payload["s"]))
+
+    def test_actor_sign_failure_falls_back_to_node_only(self):
+        cfg = self._cfg()
+        cfg["actor_emit"] = True
+        with mock.patch.object(mesh, "_sign_as_actor",
+                               side_effect=OSError("boom")), \
+             contextlib.redirect_stderr(io.StringIO()):
+            _ts, payload = self._send(cfg)
+        self.assertNotIn("a", payload)   # no actor field emitted
+        self.assertIn("s", payload)      # but the node signature is intact
+
+    def test_ephemeral_key_reused_within_process_and_new_on_restart(self):
+        cfg = self._cfg()
+        first = mesh._actor_identity(cfg)
+        self.assertIsNotNone(first)
+        self.assertEqual(mesh._actor_identity(cfg), first)   # reused
+        # a "restart" (fresh process) yields a new fingerprint
+        shutil.rmtree(mesh._ACTOR_IDENTITY[0], ignore_errors=True)
+        mesh._ACTOR_IDENTITY = None
+        second = mesh._actor_identity(cfg)
+        self.assertNotEqual(second[1], first[1])
+
+
 class AgentLivenessWireTests(unittest.TestCase):
     """inc2: presence frames also carry the sender's agent-liveness (raw
     active/idle) so a peer's wake-state is visible fleet-wide, not just local.
