@@ -2302,6 +2302,78 @@ class WatchTests(MembershipCmdTests):
         return {"event": "message", "id": eid, "time": t,
                 "message": mesh.encrypt(cfg, json.dumps(payload))}
 
+    def _make_beta(self, cfg):
+        """A remote sender sharing the mesh key/id, pinned so its frames verify."""
+        beta = make_cfg(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, beta["_dir"], ignore_errors=True)
+        beta["id"], beta["key"], beta["mesh"] = cfg["id"], cfg["key"], cfg["mesh"]
+        beta_pub = mesh._ensure_node_key(beta, "beta", "claude")
+        recv = dict(cfg)
+        recv["_dir"] = os.getcwd()
+        recv["_path"] = os.path.abspath(".meshwire.json")
+        mesh._bind_peer(recv, "beta", beta_pub)
+        return beta
+
+    def _actor_event(self, cfg, beta, body, eid, emit_actor):
+        b = dict(beta)
+        if emit_actor:
+            b["actor_emit"] = True
+            b["_actor_context"] = True
+        ts, signed = mesh._sign_wrapper_payload(
+            b, "alpha", {"f": "beta", "t": "alpha", "b": body}, harness="claude")
+        wire = mesh.encrypt(cfg, json.dumps(signed), to="alpha", timestamp=ts)
+        return {"event": "message", "id": eid, "time": ts,
+                "topic": mesh.topic(cfg, "alpha"), "message": wire}
+
+    def _run_watch(self, ev):
+        with open(".meshwire.cursor-alpha", "w") as f:
+            json.dump({"since": 0, "seen": []}, f)
+        out = io.StringIO()
+        saved = mesh._ACTOR_IDENTITY
+        mesh._ACTOR_IDENTITY = None
+        try:
+            with mock.patch.object(mesh, "_stream_events",
+                                   return_value=iter([ev])), \
+                 mock.patch.object(mesh, "_post", lambda *a, **k: {"id": "x"}), \
+                 contextlib.redirect_stdout(out), \
+                 contextlib.redirect_stderr(io.StringIO()):
+                mesh.cmd_watch(argparse.Namespace(
+                    timeout=60, as_node=None, follow=False))
+        finally:
+            cur = mesh._ACTOR_IDENTITY
+            if cur is not None:
+                shutil.rmtree(cur[0], ignore_errors=True)
+            mesh._ACTOR_IDENTITY = saved
+        return out.getvalue()
+
+    def test_direct_watch_surfaces_verified_actor(self):
+        # #188 Phase 2b end-to-end through _cmd_watch_owned. Load-bearing: this
+        # fails if either direct-watch `actor=actor_fpr` propagation is removed.
+        cfg = self._setup_mesh()
+        cfg["actor_receive"] = True
+        with open(".meshwire.json", "w") as f:
+            json.dump(cfg, f)
+        beta = self._make_beta(cfg)
+        output = self._run_watch(
+            self._actor_event(cfg, beta, "hello there", "e-actor", True))
+        self.assertIn("actor=SHA256:", output)
+        self.assertIn('"actor": "SHA256:', output)
+
+    def test_direct_watch_output_byte_identical_without_surfacing(self):
+        # A frame that carries an actor but is not surfaced (actor_receive off)
+        # yields byte-for-byte the same stdout as the same frame with no actor.
+        cfg = self._setup_mesh()
+        cfg["actor_receive"] = False
+        with open(".meshwire.json", "w") as f:
+            json.dump(cfg, f)
+        beta = self._make_beta(cfg)
+        with_a = self._run_watch(
+            self._actor_event(cfg, beta, "same body", "same-id", True))
+        without_a = self._run_watch(
+            self._actor_event(cfg, beta, "same body", "same-id", False))
+        self.assertNotIn("actor", with_a)
+        self.assertEqual(with_a, without_a)
+
     def _assert_invalid_event_precedes_valid_delivery(self, cfg, invalid):
         evs = [invalid,
                self._msg_event(cfg, "beta", "real message", "valid", 201)]
