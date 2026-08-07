@@ -2372,6 +2372,8 @@ def _actor_verdict(cfg, verdict, base_payload, relay_topic, timestamp):
 _ACTOR_IDENTITY = None  # (dir, key_path, normalized_pub): one ephemeral actor
                         # key per PROCESS. A same-UID process can read this key;
                         # that ceiling is documented, not solved (#188).
+_ACTOR_IDENTITY_LOCK = threading.Lock()  # serialize first-time key creation so
+                        # concurrent sends never mint two keys in one process.
 
 
 def _actor_emit_enabled(cfg):
@@ -2388,28 +2390,31 @@ def _actor_identity(cfg):
     global _ACTOR_IDENTITY
     if _ACTOR_IDENTITY is not None:
         return _ACTOR_IDENTITY[1], _ACTOR_IDENTITY[2]
-    try:
-        binary = _ssh_keygen_binary()
-        d = tempfile.mkdtemp(prefix="mw-actor-")
-    except (OSError, ValueError):
-        return None
-    key_path = os.path.join(d, "k")
-    try:
-        completed = subprocess.run(
-            [binary, "-t", "ed25519", "-N", "", "-q", "-f", key_path,
-             "-C", "a2acast-actor"],
-            capture_output=True, text=True, timeout=60, env=_signing_env())
-        if completed.returncode != 0:
+    with _ACTOR_IDENTITY_LOCK:
+        if _ACTOR_IDENTITY is not None:      # re-check under the lock
+            return _ACTOR_IDENTITY[1], _ACTOR_IDENTITY[2]
+        try:
+            binary = _ssh_keygen_binary()
+            d = tempfile.mkdtemp(prefix="mw-actor-")
+        except (OSError, ValueError):
+            return None
+        key_path = os.path.join(d, "k")
+        try:
+            completed = subprocess.run(
+                [binary, "-t", "ed25519", "-N", "", "-q", "-f", key_path,
+                 "-C", "a2acast-actor"],
+                capture_output=True, text=True, timeout=60, env=_signing_env())
+            if completed.returncode != 0:
+                shutil.rmtree(d, ignore_errors=True)
+                return None
+            with open(key_path + ".pub", encoding="utf-8") as f:
+                pub = _normalize_pubkey(f.read())
+        except (OSError, ValueError, subprocess.SubprocessError):
             shutil.rmtree(d, ignore_errors=True)
             return None
-        with open(key_path + ".pub", encoding="utf-8") as f:
-            pub = _normalize_pubkey(f.read())
-    except (OSError, ValueError, subprocess.SubprocessError):
-        shutil.rmtree(d, ignore_errors=True)
-        return None
-    _ACTOR_IDENTITY = (d, key_path, pub)
-    atexit.register(shutil.rmtree, d, True)  # remove on clean exit (best-effort)
-    return key_path, pub
+        _ACTOR_IDENTITY = (d, key_path, pub)
+        atexit.register(shutil.rmtree, d, True)  # remove at clean exit
+        return key_path, pub
 
 
 def _sign_as_actor(cfg, key_path, relay_topic, timestamp, base_minus_asig):
@@ -2437,13 +2442,21 @@ def _sign_as_actor(cfg, key_path, relay_topic, timestamp, base_minus_asig):
 
 def _stamp_actor(cfg, payload, relay_topic, timestamp, harness):
     """Best-effort: return `payload` with a signed `a` field when actor emission
-    is enabled, else unchanged (byte-identical). The actor key signs the base
+    is enabled AND this is a genuine agent-originated message with an explicit
+    actor context, else unchanged (byte-identical). The actor key signs the base
     WITH `a` minus its own sig; the node signature the caller adds NEXT then
     covers the whole base including `a.sig`. Any failure falls back to node-only
-    -- never blocks the send, never emits an unsigned `a`."""
+    -- never blocks the send, never emits an unsigned `a`.
+
+    #188: infrastructure control traffic (carries `c`) and manual CLI sends
+    (no `_actor_context`) stay node-scoped. An actor is NEVER manufactured for
+    them -- attribution requires an integration to assert `cfg['_actor_context']`
+    for a real agent session, never a lazily-created key on any outbound frame."""
     if not _actor_emit_enabled(cfg):
         return payload
     if not isinstance(payload, dict) or "a" in payload:
+        return payload
+    if payload.get("c") is not None or cfg.get("_actor_context") is not True:
         return payload
     ident = _actor_identity(cfg)
     if ident is None:
@@ -2762,6 +2775,11 @@ def _sign_wrapper_payload(cfg, to, payload, harness=None):
         print(f"MESH_WARN: could not sign this frame "
               f"({_single_line(str(exc))}); sent UNSIGNED",
               file=sys.stderr)
+        # #188: an actor field is only meaningful under the node signature that
+        # binds it. If node signing failed after _stamp_actor ran, drop `a` --
+        # never ship actor metadata on an unsigned frame.
+        if isinstance(payload, dict) and "a" in payload:
+            payload = {k: v for k, v in payload.items() if k != "a"}
         return timestamp, payload
     signed = dict(payload)
     signed["s"] = signature
