@@ -2322,7 +2322,10 @@ class WatchTests(MembershipCmdTests):
         ts, signed = mesh._sign_wrapper_payload(
             b, "alpha", {"f": "beta", "t": "alpha", "b": body}, harness="claude")
         wire = mesh.encrypt(cfg, json.dumps(signed), to="alpha", timestamp=ts)
-        return {"event": "message", "id": eid, "time": ts,
+        # Fixed relay time so two runs are byte-comparable regardless of when
+        # they execute (the wire's signed timestamp, used for verification, is
+        # the real one inside `wire`; ev["time"] only drives cursor + display).
+        return {"event": "message", "id": eid, "time": 1000,
                 "topic": mesh.topic(cfg, "alpha"), "message": wire}
 
     def _run_watch(self, ev):
