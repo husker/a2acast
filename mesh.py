@@ -4766,6 +4766,18 @@ def _ago(ts):
     return f"{d // 86400}d ago"
 
 
+def _short_age(seconds):
+    """Compact age with no 'ago' suffix, for inline use like 'stale(47m)'."""
+    d = max(0, int(seconds))
+    if d < 60:
+        return f"{d}s"
+    if d < 3600:
+        return f"{d // 60}m"
+    if d < 86400:
+        return f"{d // 3600}h"
+    return f"{d // 86400}d"
+
+
 # ---------------------------------------------------------------- crypto
 #
 # End-to-end encryption with only the stdlib. Standard constructions:
@@ -11691,6 +11703,27 @@ def cmd_status(args):
               f"of traffic){hint}")
 
 
+def _fleet_health_cell(value, seen, now, states):
+    """Render one stamped health field (recv/agent/wake) for the fleet table.
+
+    A stored self-report is evidence only while fresh; past RECV_STALL_SECONDS
+    its CURRENT state is genuinely unknown. But #182: an aged report is NOT the
+    same as never having heard -- collapsing both to 'unknown' made every quiet
+    healthy node read as offline, since natural mesh gaps routinely exceed the
+    window. Render an expired-but-present report as 'stale(<age>)' -- distinct
+    from 'unknown' (never reported, or unparseable) -- so readers stop reading
+    quiet as dead. Display-only; the on-wire vocabulary (`states`) is unchanged.
+    """
+    if not (isinstance(value, str) and value in states and type(seen) is int):
+        return "unknown"
+    age = now - seen
+    if age < 0:
+        return "unknown"  # future-stamped -> clock skew, not trustworthy
+    if age > RECV_STALL_SECONDS:
+        return f"stale({_short_age(age)})"
+    return value
+
+
 def cmd_fleet(args):
     """Print a compact, read-only view of locally observed fleet health."""
     cfg = load_config()
@@ -11739,17 +11772,8 @@ def cmd_fleet(args):
             peer = peers.get(node)
             peer = peer if isinstance(peer, dict) else {}
             seen_at = peer.get("seen")
-            receiver = peer.get("recv")
-            recv_seen = peer.get("recv_seen")
-            if (isinstance(receiver, str) and receiver in RECV_STATES
-                    and type(recv_seen) is int):
-                report_age = now - recv_seen
-                # A stored self-report is evidence only while it is recent;
-                # after the local stall window its current state is unknown.
-                if report_age < 0 or report_age > RECV_STALL_SECONDS:
-                    receiver = "unknown"
-            else:
-                receiver = "unknown"
+            receiver = _fleet_health_cell(
+                peer.get("recv"), peer.get("recv_seen"), now, RECV_STATES)
             status = peer.get("status")
             if not (isinstance(status, str) and status in PRESENCE_STATES):
                 status = "unknown"
@@ -11759,26 +11783,10 @@ def cmd_fleet(args):
             else:
                 posture = "unknown"
             posture_status = f"{posture}/{status}"
-            agent = peer.get("agent")
-            agent_seen = peer.get("agent_seen")
-            if (isinstance(agent, str) and agent in AGENT_STATES
-                    and type(agent_seen) is int):
-                # advisory only while fresh; mirror recv's report-staleness window
-                agent_report_age = now - agent_seen
-                if agent_report_age < 0 or agent_report_age > RECV_STALL_SECONDS:
-                    agent = "unknown"
-            else:
-                agent = "unknown"
-            wake = peer.get("wake")
-            wake_seen = peer.get("wake_seen")
-            if (isinstance(wake, str) and wake in WAKE_STATES
-                    and type(wake_seen) is int):
-                # advisory only while fresh; mirror recv's report-staleness window
-                wake_report_age = now - wake_seen
-                if wake_report_age < 0 or wake_report_age > RECV_STALL_SECONDS:
-                    wake = "unknown"
-            else:
-                wake = "unknown"
+            agent = _fleet_health_cell(
+                peer.get("agent"), peer.get("agent_seen"), now, AGENT_STATES)
+            wake = _fleet_health_cell(
+                peer.get("wake"), peer.get("wake_seen"), now, WAKE_STATES)
 
         last_seen = _ago(seen_at) if type(seen_at) is int else "never"
         rows.append((_single_line(node), last_seen, posture_status, receiver, agent, wake))
