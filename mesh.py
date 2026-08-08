@@ -5691,7 +5691,7 @@ def save_task(cfg, task_id, **fields):
 
 
 def _record_received_task(cfg, kind, task_id, context_id, state, peer,
-                          text, rpc_id=None, local_node=None):
+                          text, rpc_id=None, local_node=None, actor=None):
     """Atomically record a request/result and return its disposition.
 
     A result is correlated only when this node already has the task recorded
@@ -5722,6 +5722,10 @@ def _record_received_task(cfg, kind, task_id, context_id, state, peer,
             }
             if local_node is not None:
                 fields["local_node"] = local_node
+            # #188 Phase 3: persist the VERIFIED actor fingerprint (or nothing).
+            # It is only consulted for auth when require_actor_for_exec is on.
+            if isinstance(actor, str) and actor:
+                fields["actor"] = actor
             handled = (
                 isinstance(local_node, str)
                 and task_id in _load_handled(cfg, local_node)
@@ -5827,6 +5831,21 @@ def _mark_handled(cfg, node, task_id):
         pass
 
 
+def _actor_authorized(cfg, peer, actor_fpr):
+    """#188 Phase 3: True iff `actor_fpr` is an operator-authorized actor for
+    `peer` in cfg["actor_allow"] (an exact {node: [fingerprint, ...]} map,
+    curated via `mesh actor-allow`). A missing/blank actor is NEVER authorized,
+    and an actor authorized for one peer does not authorize another -- the grant
+    is the exact (node, actor_fpr) tuple. Fails closed."""
+    if not (isinstance(actor_fpr, str) and actor_fpr):
+        return False
+    store = cfg.get("actor_allow")
+    if not isinstance(store, dict):
+        return False
+    allowed = store.get(peer)
+    return isinstance(allowed, list) and actor_fpr in allowed
+
+
 def _supervise_pending(cfg, node, allow_legacy=True):
     """Inbound tasks from an exec-allowlisted peer awaiting `mesh
     codex-supervise` action, oldest first, skipping ones already marked
@@ -5837,9 +5856,16 @@ def _supervise_pending(cfg, node, allow_legacy=True):
     sender to cfg["nodes"], so gating auto-exec on the roster would let
     that sender run code. exec_allow defaults to empty -- nothing auto-runs
     until the operator explicitly trusts a peer.
+
+    #188 Phase 3: when cfg["require_actor_for_exec"] is on (default OFF), a task
+    is additionally required to carry a VERIFIED actor fingerprint authorized
+    for its exact peer via cfg["actor_allow"]. Node-wide exec_allow stays the
+    coarse boundary; this narrows it to (node, actor). Default off => the actor
+    condition is vacuously true and eligibility is byte-identical to today.
     """
     handled = _load_handled(cfg, node)
     tasks = load_tasks(cfg)
+    require_actor = cfg.get("require_actor_for_exec") is True
     pending = [
         (task_id, t) for task_id, t in tasks.items()
         if t.get("direction") == "inbound"
@@ -5849,6 +5875,10 @@ def _supervise_pending(cfg, node, allow_legacy=True):
         and (
             t.get("local_node") == node
             or (allow_legacy and t.get("local_node") is None)
+        )
+        and (
+            not require_actor
+            or _actor_authorized(cfg, t.get("peer"), t.get("actor"))
         )
     ]
     pending.sort(key=lambda item: item[1].get("updated", 0))
@@ -9367,8 +9397,11 @@ def _single_line_preview(value, limit):
     return _single_line(_sanitize_delivery_text(text))[:limit]
 
 
-def _record_delivery_task(cfg, me, frm, body, recipient=None):
-    """Durably classify a valid A2A task before transport checkpointing."""
+def _record_delivery_task(cfg, me, frm, body, recipient=None, actor=None):
+    """Durably classify a valid A2A task before transport checkpointing.
+
+    #188 Phase 3: `actor` is the verified actor fingerprint (or None) for this
+    frame; it is persisted on the task so require_actor_for_exec can gate on it."""
     body = _sanitize_delivery_text(body)
     env = _parse_envelope(body)
     if not env:
@@ -9383,7 +9416,7 @@ def _record_delivery_task(cfg, me, frm, body, recipient=None):
         return _TASK_RECORD_UNSET
     disposition = _record_received_task(
         cfg, kind, task_id, ctx, state, frm, text, env.get("id"),
-        local_node=authority_to)
+        local_node=authority_to, actor=actor)
     return kind, disposition
 
 
@@ -9934,7 +9967,7 @@ def _cmd_watch_owned(args, cfg, me):
         while True:
             try:
                 task_record = _record_delivery_task(
-                    cfg, me, frm, body, recipient=recipient)
+                    cfg, me, frm, body, recipient=recipient, actor=actor_fpr)
                 break
             except TaskLedgerBusy as exc:
                 print(f"MESH_WARN: {exc}; retrying same event",
@@ -10665,7 +10698,7 @@ class MeshMCPServer:
             # frame survives the shared verdict/refusal gate, and still must
             # complete before the transport checkpoint advances.
             task_record = _record_delivery_task(
-                cfg, me, frm, body, recipient=recipient)
+                cfg, me, frm, body, recipient=recipient, actor=actor_fpr)
             checkpoint()
             note_peer(cfg, frm, "message")
             _send_ack(cfg, me, frm, ev)
@@ -14489,6 +14522,59 @@ def cmd_codex_allow(args):
     print(f"exec_allow: {', '.join(allow) if allow else '(empty)'}")
 
 
+def cmd_actor_allow(args):
+    """Curate cfg["actor_allow"], the exact (node, actor_fpr) grants that gate
+    auto-exec when `require_actor_for_exec` is on (see _supervise_pending).
+
+    This NARROWS exec_allow, it never widens it: the node must ALSO be in
+    exec_allow. Both this map and require_actor_for_exec start off, so nothing
+    changes until the operator opts in.
+    """
+    cfg = load_config()
+    if args.list:
+        store = cfg.get("actor_allow")
+        store = store if isinstance(store, dict) else {}
+        if not store:
+            print("(empty)")
+            return
+        for node in sorted(store):
+            entries = store[node] if isinstance(store[node], list) else []
+            for fpr in entries:
+                print(f"{node} {fpr}")
+        return
+    if not args.node or not args.actor:
+        sys.exit("error: actor-allow needs <node> and --actor <fingerprint> "
+                 "(or --list)")
+    node, fpr = args.node, args.actor
+    if args.revoke:
+        def _revoke(latest):
+            store = latest.get("actor_allow")
+            if not isinstance(store, dict):
+                return
+            entries = store.get(node)
+            if isinstance(entries, list) and fpr in entries:
+                entries.remove(fpr)
+            if store.get(node) == []:
+                store.pop(node, None)
+            if not store:
+                latest.pop("actor_allow", None)
+        _mutate_config(cfg, _revoke)
+        print(f"actor_allow: revoked {node} {fpr}")
+        return
+
+    def _add(latest):
+        store = latest.setdefault("actor_allow", {})
+        if not isinstance(store, dict):
+            raise ValueError("actor_allow must be an object")
+        entries = store.setdefault(node, [])
+        if not isinstance(entries, list):
+            raise ValueError("actor_allow entries must be a list")
+        if fpr not in entries:
+            entries.append(fpr)
+    _mutate_config(cfg, _add)
+    print(f"actor_allow: {node} {fpr}")
+
+
 _INTEGRATE_GUIDE = """\
 # a2acast — connect this machine to the mesh
 
@@ -15053,6 +15139,18 @@ def main():
     p.add_argument("--list", action="store_true",
                    help="print the current exec-allowlist")
     p.set_defaults(fn=cmd_codex_allow)
+
+    p = sub.add_parser("actor-allow",
+                       help="authorize an exact (node, actor) for auto-exec "
+                            "when require_actor_for_exec is on (#188)")
+    p.add_argument("node", nargs="?",
+                   help="node the actor belongs to (must also be in exec_allow)")
+    p.add_argument("--actor", help="actor fingerprint, e.g. SHA256:...")
+    p.add_argument("--revoke", action="store_true",
+                   help="remove the (node, actor) grant")
+    p.add_argument("--list", action="store_true",
+                   help="print current (node, actor) grants")
+    p.set_defaults(fn=cmd_actor_allow)
 
     args = ap.parse_args()
     try:

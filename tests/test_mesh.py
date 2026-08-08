@@ -2377,6 +2377,30 @@ class WatchTests(MembershipCmdTests):
         self.assertNotIn("actor", with_a)
         self.assertEqual(with_a, without_a)
 
+    def test_direct_watch_persists_actor_and_authorizes(self):
+        # #188 Phase 3 end-to-end (direct watch). Load-bearing: fails if the
+        # direct-watch receive-loop actor propagation is removed.
+        cfg = self._setup_mesh()
+        cfg["actor_receive"] = True
+        cfg["exec_allow"] = ["beta"]
+        cfg["require_actor_for_exec"] = True
+        with open(".meshwire.json", "w") as f:
+            json.dump(cfg, f)
+        beta = self._make_beta(cfg)
+        env = mesh.make_send_envelope("beta", "alpha", "work",
+                                      task_id="t1", context_id="c1")
+        self._run_watch(self._actor_event(cfg, beta, json.dumps(env),
+                                          "e-task", True))
+        loaded = mesh.load_config()
+        task = mesh.load_tasks(loaded).get("t1")
+        self.assertIsNotNone(task)
+        fpr = task.get("actor")
+        self.assertTrue(fpr and fpr.startswith("SHA256:"))
+        self.assertEqual(mesh._supervise_pending(loaded, "alpha"), [])
+        loaded["actor_allow"] = {"beta": [fpr]}
+        self.assertEqual(
+            [t for t, _ in mesh._supervise_pending(loaded, "alpha")], ["t1"])
+
     def _assert_invalid_event_precedes_valid_delivery(self, cfg, invalid):
         evs = [invalid,
                self._msg_event(cfg, "beta", "real message", "valid", 201)]
@@ -10213,6 +10237,71 @@ class VerifyWireTests(unittest.TestCase):
         with contextlib.redirect_stdout(none_actor):
             mesh._emit_message(self.cfg, "alpha", "beta", "hi", ev)
         self.assertNotIn("actor", none_actor.getvalue())
+
+    def _run_actor_task(self, require=True, receive=True, pin=True,
+                        emit=True, bad_actor_sig=False):
+        """#188 Phase 3 end-to-end (MCP): deliver a signed task from beta
+        through the real receive loop; return the persisted task record."""
+        self.cfg["actor_receive"] = receive
+        self.cfg["exec_allow"] = ["beta"]
+        if require:
+            self.cfg["require_actor_for_exec"] = True
+        if pin:
+            mesh._bind_peer(self.cfg, "beta", self.beta_pub)
+        if emit:
+            self.beta["actor_emit"] = True
+            self.beta["_actor_context"] = True
+        env = mesh.make_send_envelope("beta", "alpha", "work",
+                                      task_id="t1", context_id="c1")
+        saved = mesh._ACTOR_IDENTITY
+        mesh._ACTOR_IDENTITY = None
+        ctx = (mock.patch.object(mesh, "_sign_as_actor", return_value="bad-sig")
+               if bad_actor_sig else contextlib.nullcontext())
+        try:
+            with ctx:
+                self._run(self._signed_event(
+                    self.beta, body=json.dumps(env), eid="e-task"))
+        finally:
+            cur = mesh._ACTOR_IDENTITY
+            if cur is not None:
+                shutil.rmtree(cur[0], ignore_errors=True)
+            mesh._ACTOR_IDENTITY = saved
+        return mesh.load_tasks(self.cfg).get("t1")
+
+    def test_receive_loop_persists_actor_and_authorizes(self):
+        # Load-bearing: fails if the MCP receive-loop actor propagation is
+        # removed (the persisted fingerprint would then be absent).
+        task = self._run_actor_task()
+        self.assertIsNotNone(task)
+        fpr = task.get("actor")
+        self.assertTrue(fpr and fpr.startswith("SHA256:"))
+        self.assertEqual(mesh._supervise_pending(self.cfg, "alpha"), [])
+        self.cfg["actor_allow"] = {"beta": [fpr]}
+        self.assertEqual(
+            [t for t, _ in mesh._supervise_pending(self.cfg, "alpha")], ["t1"])
+        self.cfg["actor_allow"] = {"beta": ["SHA256:other"]}
+        self.assertEqual(mesh._supervise_pending(self.cfg, "alpha"), [])
+
+    def test_no_actor_persisted_when_reception_off(self):
+        task = self._run_actor_task(receive=False)
+        self.assertIsNotNone(task)
+        self.assertNotIn("actor", task)
+        self.cfg["actor_allow"] = {"beta": ["SHA256:anything"]}
+        self.assertEqual(mesh._supervise_pending(self.cfg, "alpha"), [])
+
+    def test_invalid_actor_sig_persists_no_actor(self):
+        # valid node signature, invalid actor signature -> actor unverified ->
+        # no fingerprint persisted, task denied under require_actor.
+        task = self._run_actor_task(bad_actor_sig=True)
+        self.assertIsNotNone(task)
+        self.assertNotIn("actor", task)
+        self.assertEqual(mesh._supervise_pending(self.cfg, "alpha"), [])
+
+    def test_unverified_node_persists_no_actor(self):
+        # first contact (unpinned beta) -> not FRAME_VERIFIED -> no actor.
+        task = self._run_actor_task(pin=False)
+        self.assertIsNotNone(task)
+        self.assertNotIn("actor", task)
 
     def test_first_contact_delivers_and_pins_as_unverified(self):
         delivered, _ = self._run(self._signed_event(self.beta))
@@ -18256,6 +18345,116 @@ class ActorAttestationEmitTests(unittest.TestCase):
             t.join()
         self.assertTrue(all(r is not None for r in results))
         self.assertEqual(len({r[1] for r in results}), 1)  # one key for all
+
+
+class ActorAuthorizationTests(unittest.TestCase):
+    """#188 Phase 3: (node, actor_fpr) auto-exec authorization. Default OFF is
+    byte-identical; when require_actor_for_exec is on the grant is the EXACT
+    (node, actor) tuple and everything else fails closed."""
+
+    def _cfg(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        return {"mesh": "t", "id": "abc", "server": "https://x", "key": "0" * 64,
+                "exec_allow": ["alpha"], "_dir": d,
+                "_path": os.path.join(d, ".meshwire.json")}
+
+    def _task(self, cfg, task_id, actor):
+        mesh._record_received_task(cfg, "request", task_id, "ctx", "submitted",
+                                   "alpha", "do work", "rpc-" + task_id,
+                                   local_node="me", actor=actor)
+
+    def _eligible(self, cfg):
+        return sorted(tid for tid, _ in mesh._supervise_pending(cfg, "me"))
+
+    def test_default_off_is_byte_identical(self):
+        cfg = self._cfg()
+        self._task(cfg, "with-actor", "SHA256:AAA")
+        self._task(cfg, "no-actor", None)
+        # require_actor_for_exec unset => actor is never consulted
+        self.assertEqual(self._eligible(cfg), ["no-actor", "with-actor"])
+
+    def test_require_actor_fails_closed_without_a_grant(self):
+        cfg = self._cfg()
+        cfg["require_actor_for_exec"] = True
+        self._task(cfg, "with-actor", "SHA256:AAA")
+        self._task(cfg, "no-actor", None)
+        # no actor_allow => NOTHING is eligible, even a verified-actor task
+        self.assertEqual(self._eligible(cfg), [])
+
+    def test_exact_grant_authorizes_only_that_tuple(self):
+        cfg = self._cfg()
+        cfg["require_actor_for_exec"] = True
+        cfg["actor_allow"] = {"alpha": ["SHA256:AAA"]}
+        self._task(cfg, "granted", "SHA256:AAA")
+        self._task(cfg, "other-actor", "SHA256:BBB")
+        self._task(cfg, "no-actor", None)
+        self.assertEqual(self._eligible(cfg), ["granted"])
+
+    def test_node_only_task_denied_when_actor_required(self):
+        # The load-bearing fail-closed: an exec_allow peer's node-only task
+        # (no verified actor) must NOT auto-exec once an actor is required.
+        cfg = self._cfg()
+        cfg["require_actor_for_exec"] = True
+        cfg["actor_allow"] = {"alpha": ["SHA256:AAA"]}
+        self._task(cfg, "node-only", None)
+        self.assertEqual(self._eligible(cfg), [])
+
+    def test_actor_grant_does_not_cross_peers(self):
+        # An actor authorized for alpha cannot execute a task from beta.
+        cfg = self._cfg()
+        cfg["exec_allow"] = ["alpha", "beta"]
+        cfg["require_actor_for_exec"] = True
+        cfg["actor_allow"] = {"beta": ["SHA256:AAA"]}
+        # a task from alpha carrying the same fingerprint, authorized only @beta
+        mesh._record_received_task(cfg, "request", "cross", "ctx", "submitted",
+                                   "alpha", "do work", "rpc-x",
+                                   local_node="me", actor="SHA256:AAA")
+        self.assertEqual(self._eligible(cfg), [])
+
+    def test_actor_is_persisted_on_the_task_record(self):
+        cfg = self._cfg()
+        env = mesh.make_send_envelope("alpha", "me", "work",
+                                      task_id="t1", context_id="c1")
+        mesh._record_delivery_task(cfg, "me", "alpha", json.dumps(env),
+                                   recipient="me", actor="SHA256:AAA")
+        self.assertEqual(mesh.load_tasks(cfg)["t1"]["actor"], "SHA256:AAA")
+
+    def test_actor_authorized_rejects_malformed_store(self):
+        for store in (None, [], "x", {"alpha": "not-a-list"}, {"alpha": []}):
+            self.assertFalse(mesh._actor_authorized(
+                {"actor_allow": store}, "alpha", "SHA256:AAA"))
+        self.assertFalse(mesh._actor_authorized(
+            {"actor_allow": {"alpha": ["SHA256:AAA"]}}, "alpha", ""))
+        self.assertTrue(mesh._actor_authorized(
+            {"actor_allow": {"alpha": ["SHA256:AAA"]}}, "alpha", "SHA256:AAA"))
+
+    def test_actor_allow_command_add_list_revoke(self):
+        old = os.getcwd()
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        os.chdir(d)
+        try:
+            cfg = make_cfg()
+            with open(mesh.CONFIG_NAME, "w") as f:
+                json.dump(cfg, f)
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                mesh.cmd_actor_allow(argparse.Namespace(
+                    node="alpha", actor="SHA256:AAA", revoke=False, list=False))
+            self.assertEqual(mesh.load_config().get("actor_allow"),
+                             {"alpha": ["SHA256:AAA"]})
+            list_out = io.StringIO()
+            with contextlib.redirect_stdout(list_out):
+                mesh.cmd_actor_allow(argparse.Namespace(
+                    node=None, actor=None, revoke=False, list=True))
+            self.assertIn("alpha SHA256:AAA", list_out.getvalue())
+            with contextlib.redirect_stdout(io.StringIO()):
+                mesh.cmd_actor_allow(argparse.Namespace(
+                    node="alpha", actor="SHA256:AAA", revoke=True, list=False))
+            self.assertNotIn("actor_allow", mesh.load_config())
+        finally:
+            os.chdir(old)
 
 
 class AgentLivenessWireTests(unittest.TestCase):
