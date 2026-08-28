@@ -1,5 +1,46 @@
 # Changelog
 
+## 0.21.0
+
+Actor attestation lands end-to-end (parse → emit → surface → authorize), the
+owner-signed grant gains a real exec path, and the receive path stops
+persisting task state from frames it has not authenticated. Every new wire
+behaviour is off unless the operator turns it on: `actor_receive`,
+`actor_emit`, and `require_actor_for_exec` are each read with `is True`, so an
+absent key is off and older peers are unaffected.
+
+- **#188 Phases 1–3 — actor attestation.** A frame can now carry which *actor*
+  (harness session) acted, not just which node. Phase 1 parses and verifies the
+  actor field on receive (`actor_receive`, default off); Phase 2 emits it
+  sender-side behind an explicit fleet-capability assertion (`actor_emit`,
+  default off); Phase 2b surfaces the verified actor fingerprint in deliveries;
+  Phase 3 authorizes auto-exec on the `(node, actor)` pair against a curated
+  `actor_allow` map when `require_actor_for_exec` is on (default off). This
+  addresses the #136 boundary that co-located agents share one node key — but
+  only once an operator enables it; shipping the code changes no live posture.
+- **#186/#187 — authenticate frames before task persistence.** The receive path
+  wrote task records before the frame's verdict was established. Task state is
+  now written only after authentication.
+- **#157/#62/#180 — B2b-2b: real exec on an owner-signed grant.** A verified
+  owner-signed grant can execute a curated pipx/pip/uv-tool-pypi upgrade,
+  making the operational half of #62 usable rather than dry-run only. Gated on
+  the existing curated `exec_allow`; the roster is not an authorization source.
+- **#158/#178 — `mesh fleet` WAKE column.** The wake-stall verdict is now
+  reader-assertible fleet-wide instead of local-only.
+- **#177/#179 — presence liveness requires proven delivery.** A live pid is no
+  longer accepted as proof a node will deliver; a wedged hook holding the
+  relay subscription reads as stalled rather than `listening`.
+- **#76 F3/#185 — separate auto-discovery roster budget.** Auto-discovery no
+  longer consumes the operator-seeded roster budget.
+- **#182/#192 — aged fleet-health reports render as `stale(<age>)`,** not
+  `unknown`, so a report that arrived and aged is distinguishable from one that
+  never arrived.
+- **#136/#189, #183/#184 — docs.** The node-identity boundary (one node key per
+  machine, shared by co-located agents) and what the mesh health signals do and
+  do not prove.
+- **#190 and iam-rename test hermeticity.** Two tests depended on wall-clock
+  polling and ambient node identity; both are now deterministic.
+
 ## 0.20.0
 
 Fleet-wide liveness truth: every stall mode of a receiver is now detectable,
